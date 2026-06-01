@@ -1,0 +1,62 @@
+name: Integration
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  integration:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev libglib2.0-dev dbus gnome-keyring libsecret-tools python3-pip
+
+      - name: Install Python keyring
+        if: runner.os == 'Linux'
+        run: pip install keyring
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run Linux integration tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dbus-run-session -- bash -lc '
+            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
+            bash tests/integration.sh
+            bash tests/python_interop.sh
+          '
+
+      - name: Run macOS integration tests
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          KC="$RUNNER_TEMP/test.keychain-db"
+          cleanup() {
+            security delete-keychain "$KC" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          security create-keychain -p '' "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p '' "$KC"
+          security default-keychain -s "$KC"
+          security list-keychains -s "$KC"
+          bash tests/integration.sh
+
+      - name: Run Windows integration tests
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash tests/integration.sh

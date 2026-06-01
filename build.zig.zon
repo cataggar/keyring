@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .keyring_zig = .{
-            .url = "https://github.com/cataggar/keyring-zig/archive/refs/heads/main.tar.gz",
-            .hash = "keyring_zig-0.0.0-Lil_CGB_AACSFQLKtnwfQNM8KWvCdT4Xqr7EeJ443cDn",
+            .url = "https://github.com/cataggar/keyring-zig/archive/8b5498df3bc2905b04387504129b9a6fd0eac692.tar.gz",
+            .hash = "keyring_zig-0.0.0-Lil_CFaxAACEGwPq4I7DzNdKE-xZBXW_-tnLl7bxbDWv",
         },
     },
     .paths = .{

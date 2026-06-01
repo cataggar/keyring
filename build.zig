@@ -5,6 +5,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const keyring_zig = b.dependency("keyring_zig", .{ .target = target });
+    const keyring_zig_module = keyring_zig.module("keyring_zig");
+    if (target.result.os.tag == .macos) {
+        keyring_zig_module.addCMacro("XPC_NONNULL_ARRAY", "");
+    }
 
     const exe = b.addExecutable(.{
         .name = "keyring",
@@ -14,7 +18,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("keyring_zig", keyring_zig.module("keyring_zig"));
+    exe.root_module.addImport("keyring_zig", keyring_zig_module);
 
     b.installArtifact(exe);
 
@@ -33,7 +37,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    unit_tests.root_module.addImport("keyring_zig", keyring_zig.module("keyring_zig"));
+    unit_tests.root_module.addImport("keyring_zig", keyring_zig_module);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

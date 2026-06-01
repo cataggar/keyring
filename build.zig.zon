@@ -1,0 +1,19 @@
+.{
+    .name = .keyring,
+    .version = "0.0.0",
+    .fingerprint = 0x16bef15c85a03555, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .keyring_zig = .{
+            .url = "https://github.com/cataggar/keyring-zig/archive/refs/heads/main.tar.gz",
+            .hash = "keyring_zig-0.0.0-Lil_CGB_AACSFQLKtnwfQNM8KWvCdT4Xqr7EeJ443cDn",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "LICENSE",
+        "README.md",
+        "src",
+    },
+}

@@ -1,7 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const keyring_zig = @import("keyring_zig");
+const color = @import("color.zig");
 const term = @import("term.zig");
+
+var runtime_env_map: ?*std.process.Environ.Map = null;
 
 const version = "0.0.0";
 const usage =
@@ -19,6 +22,12 @@ const usage =
     \\  del <service> <user>          Delete a password.
     \\
     \\Backends: secret_service, keychain, win_credential, null_backend (or null)
+    \\
+    \\Environment:
+    \\  KEYRING_BACKEND               Override backend: secret_service | keychain | win_credential | null
+    \\  KEYRING_PROPERTY_<NAME>       Backend-specific properties (e.g. KEYRING_PROPERTY_KEYCHAIN, KEYRING_PROPERTY_COLLECTION, KEYRING_PROPERTY_APPID)
+    \\  NO_COLOR                      Disable ANSI colors in diagnostic output
+    \\  CLICOLOR_FORCE                Force ANSI colors even when stdout is not a TTY
     \\
 ;
 
@@ -41,6 +50,8 @@ pub const ParsedArgs = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    runtime_env_map = init.environ_map;
+
     const arena = init.arena.allocator();
     const raw_args = try init.minimal.args.toSlice(arena);
     const args = try arena.alloc([]const u8, raw_args.len);
@@ -224,12 +235,13 @@ fn parseBackendArg(name: []const u8) ?keyring_zig.Backend {
 }
 
 fn listBackends(stdout: *std.Io.Writer) !void {
+    const colors = color.Color.detect(getEnvVar, term.isStdoutTty());
     var buffer: [4]keyring_zig.Backend = undefined;
     const available = keyring_zig.availableBackends(&buffer);
     const current = keyring_zig.currentBackend();
     for (available) |backend| {
         if (backend == current) {
-            try stdout.print("*{s} (default)\n", .{backendName(backend)});
+            try stdout.print("{s}*{s}{s} {s}(default){s}\n", .{ colors.green(), colors.reset(), backendName(backend), colors.green(), colors.reset() });
         } else {
             try stdout.print("{s}\n", .{backendName(backend)});
         }
@@ -238,23 +250,29 @@ fn listBackends(stdout: *std.Io.Writer) !void {
 }
 
 fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
+    const colors = color.Color.detect(getEnvVar, term.isStdoutTty());
     const current = keyring_zig.currentBackend();
     var buffer: [4]keyring_zig.Backend = undefined;
     const available = keyring_zig.availableBackends(&buffer);
 
-    try stdout.print("current backend: {s}\n", .{backendName(current)});
+    try stdout.print("current backend: {s}{s}{s}\n", .{ colors.green(), backendName(current), colors.reset() });
     try stdout.writeAll("available backends: ");
     for (available, 0..) |backend, index| {
         if (index != 0) try stdout.writeAll(", ");
-        try stdout.writeAll(backendName(backend));
+        if (backend == current) {
+            try stdout.print("{s}{s}{s}{s}", .{ colors.bold(), colors.green(), backendName(backend), colors.reset() });
+        } else {
+            try stdout.writeAll(backendName(backend));
+        }
     }
     try stdout.writeByte('\n');
 
     if (try getEnvVarOwned(arena, "KEYRING_BACKEND")) |value| {
-        try stdout.print("KEYRING_BACKEND env: {s}\n", .{value});
+        try stdout.print("KEYRING_BACKEND env: {s}{s}{s}\n", .{ colors.bold(), value, colors.reset() });
     } else {
         try stdout.writeAll("KEYRING_BACKEND env: unset\n");
     }
+    try diagnoseProperties(arena, stdout);
 
     if (builtin.os.tag == .linux) {
         const service = "keyring-cli-diagnose-service-that-should-not-exist";
@@ -262,13 +280,48 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
         if (keyring_zig.getAlloc(arena, service, user)) |password| {
             _ = password;
         } else |err| switch (err) {
-            error.NoStorageAccess => try stdout.writeAll("note: no Secret Service daemon detected. Try installing oo7-daemon (https://github.com/linux-credentials/oo7) or run dbus-run-session with gnome-keyring-daemon.\n"),
+            error.NoStorageAccess => try stdout.print("{s}note: no Secret Service daemon detected. Try installing oo7-daemon (https://github.com/linux-credentials/oo7) or run dbus-run-session with gnome-keyring-daemon.{s}\n", .{ colors.yellow(), colors.reset() }),
             else => {},
         }
     } else {
         try stdout.print("native backend: {s}\n", .{backendName(nativeBackend())});
     }
     try stdout.flush();
+}
+
+fn diagnoseProperties(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
+    const properties = [_]struct {
+        name: []const u8,
+        env_name: []const u8,
+    }{
+        .{ .name = "keychain", .env_name = "KEYRING_PROPERTY_KEYCHAIN" },
+        .{ .name = "collection", .env_name = "KEYRING_PROPERTY_COLLECTION" },
+        .{ .name = "appid", .env_name = "KEYRING_PROPERTY_APPID" },
+        .{ .name = "file_path", .env_name = "KEYRING_PROPERTY_FILE_PATH" },
+    };
+
+    var any_set = false;
+    for (properties) |property| {
+        if (try keyring_zig.getProperty(arena, property.name)) |value| {
+            try stdout.print("{s}: {s}\n", .{ property.env_name, value });
+            any_set = true;
+        }
+    }
+    if (!any_set) try stdout.writeAll("KEYRING_PROPERTY_*: none set\n");
+}
+
+fn getEnvVar(name: []const u8) ?[]const u8 {
+    if (runtime_env_map) |env_map| return env_map.get(name);
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return null;
+
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const item = std.mem.span(entry);
+        if (item.len >= name.len + 1 and item[name.len] == '=' and std.mem.eql(u8, item[0..name.len], name)) {
+            return item[name.len + 1 ..];
+        }
+    }
+    return null;
 }
 
 fn getEnvVarOwned(gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
@@ -422,4 +475,48 @@ test "exit code mapping" {
     try std.testing.expectEqual(@as(u8, 1), exitCodeFor(error.InputTooLong));
     try std.testing.expectEqual(@as(u8, 1), exitCodeFor(error.BufferTooSmall));
     try std.testing.expectEqual(@as(u8, 1), exitCodeFor(error.InvalidUtf8));
+}
+
+const ColorTestEnv = struct {
+    fn none(_: []const u8) ?[]const u8 {
+        return null;
+    }
+
+    fn noColorEmpty(name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, name, "NO_COLOR")) return "";
+        return null;
+    }
+
+    fn noColorZero(name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, name, "NO_COLOR")) return "0";
+        return null;
+    }
+
+    fn forceOne(name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, name, "CLICOLOR_FORCE")) return "1";
+        return null;
+    }
+
+    fn forceZero(name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, name, "CLICOLOR_FORCE")) return "0";
+        return null;
+    }
+};
+
+test "Color.detect honors color environment" {
+    try std.testing.expect(!color.Color.detect(ColorTestEnv.noColorEmpty, true).enabled);
+    try std.testing.expect(!color.Color.detect(ColorTestEnv.noColorZero, true).enabled);
+    try std.testing.expect(color.Color.detect(ColorTestEnv.forceOne, false).enabled);
+    try std.testing.expect(!color.Color.detect(ColorTestEnv.forceZero, false).enabled);
+    try std.testing.expect(color.Color.detect(ColorTestEnv.none, true).enabled);
+    try std.testing.expect(!color.Color.detect(ColorTestEnv.none, false).enabled);
+}
+
+test "disabled Color methods are empty" {
+    const disabled = color.Color{ .enabled = false };
+    try std.testing.expectEqualStrings("", disabled.green());
+    try std.testing.expectEqualStrings("", disabled.yellow());
+    try std.testing.expectEqualStrings("", disabled.red());
+    try std.testing.expectEqualStrings("", disabled.bold());
+    try std.testing.expectEqualStrings("", disabled.reset());
 }

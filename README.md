@@ -4,7 +4,7 @@
 
 ## Status
 
-Phase B implements the core Python-compatible CLI surface for storing, reading, deleting, listing, and diagnosing keyring backends.
+Phases A-C are complete; Phase D adds headless Linux ergonomics and diagnostics. The file backend remains planned, not implemented.
 
 ## Usage
 
@@ -14,16 +14,16 @@ keyring --version
 keyring --list-backends
 keyring diagnose
 
-# Prompt for a password and store it.
+# Prompt for a password and store it; exits 0 on success.
 keyring set my-service alice
 
-# Store a password from stdin.
+# Store a password from stdin; exits 0 on success.
 echo TOKEN | keyring set my-service alice
 
-# Print the password with no trailing newline.
+# Print the password with no trailing newline; exits 3 when not found.
 keyring get my-service alice
 
-# Delete an entry.
+# Delete an entry; exits 3 when not found.
 keyring del my-service alice
 
 # Use a one-shot backend override.
@@ -53,7 +53,35 @@ KEYRING_BACKEND=null keyring get svc user # exits 3 when the entry is not found
 KEYRING_PROPERTY_COLLECTION=default keyring diagnose
 ```
 
-### Exit codes
+## Using `keyring` on headless Linux
+
+On a graphical Linux desktop, `gnome-keyring-daemon` is usually started by the session manager and exposes the Secret Service API. In SSH-only, container, or CI environments, no Secret Service daemon may be running, so `keyring` can return `NoStorageAccess` until you start one.
+
+### Option A: oo7-daemon (recommended for headless servers + CI)
+
+[`oo7-daemon`](https://github.com/linux-credentials/oo7) is a pure-Rust, MIT-licensed Secret Service daemon that is friendly to headless environments. Follow the install instructions in the [oo7 README](https://github.com/linux-credentials/oo7), then run it on a session bus and point clients at that bus:
+
+```sh
+export DBUS_SESSION_BUS_ADDRESS=unix:path="$XDG_RUNTIME_DIR/bus"
+oo7-daemon &
+keyring diagnose
+```
+
+### Option B: GNOME stack
+
+If you already have the GNOME Secret Service stack available, start it under a D-Bus session. This is the pattern used by `cataggar/keyring-zig` CI tests:
+
+```sh
+dbus-run-session -- bash -lc 'eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"; keyring diagnose'
+```
+
+### Option C: file backend
+
+`KEYRING_BACKEND=file` is planned but not implemented yet; track it in [cataggar/keyring-zig#4](https://github.com/cataggar/keyring-zig/issues/4).
+
+`keyring diagnose` detects the missing Secret Service daemon and prints these recommendations.
+
+## Exit codes
 
 | Code | Meaning |
 |---|---|
@@ -63,9 +91,14 @@ KEYRING_PROPERTY_COLLECTION=default keyring diagnose
 | 3 | entry not found from `get` or `del` |
 | 4 | no storage access or backend unavailable |
 
-### Compatibility with Python `keyring`
+## Compatibility with Python `keyring`
 
-The CLI follows Python `keyring` command shapes for `set`, `get`, and `del`. Entries written by Python's `keyring set svc user` are readable with `keyring get svc user`, and vice versa, when both commands use the same native backend.
+The CLI follows Python `keyring` command shapes and the native backend schema/TargetName conventions aligned in [cataggar/keyring-zig#9](https://github.com/cataggar/keyring-zig/issues/9), so entries can be shared with Python `keyring` when both commands use the same backend.
+
+```sh
+python3 -m keyring set github me
+keyring get github me
+```
 
 ## Links
 

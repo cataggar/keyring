@@ -1,0 +1,130 @@
+name: Release
+
+"on":
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux-gnu
+            binary: keyring
+          - os: ubuntu-24.04-arm
+            target: aarch64-linux-gnu
+            binary: keyring
+          - os: macos-latest
+            target: aarch64-macos
+            binary: keyring
+          - os: macos-13
+            target: x86_64-macos
+            binary: keyring
+          - os: windows-latest
+            target: x86_64-windows
+            binary: keyring.exe
+          - os: windows-11-arm
+            target: aarch64-windows
+            binary: keyring.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev libglib2.0-dev
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Package binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          artifact="keyring-${{ github.ref_name }}-${{ matrix.target }}"
+          cp "zig-out/bin/${{ matrix.binary }}" "$artifact"
+          shasum -a 256 "$artifact" > "$artifact.sha256"
+
+      - name: Package binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $artifact = "keyring-${{ github.ref_name }}-${{ matrix.target }}.exe"
+          Copy-Item "zig-out/bin/${{ matrix.binary }}" $artifact
+          $hash = Get-FileHash -Algorithm SHA256 $artifact |
+            Select-Object -ExpandProperty Hash
+          "$hash  $artifact" | Out-File -FilePath "$artifact.sha256" -Encoding ascii
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keyring-${{ matrix.target }}
+          path: |
+            keyring-${{ github.ref_name }}-${{ matrix.target }}*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Log release tag
+        run: echo "Releasing ${{ github.ref_name }}"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: keyring-*
+          merge-multiple: true
+          path: ./dist
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd dist
+          find . -maxdepth 1 -name '*.sha256' -print |
+            sort |
+            xargs cat > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          cat > release-notes.txt <<'NOTES'
+          Linux binaries are dynamically linked and require the libsecret-1
+          and glib-2.0 runtime libraries to be installed on the target system.
+          NOTES
+
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file release-notes.txt
+            gh release upload "${GITHUB_REF_NAME}" ./dist/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" ./dist/* \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file release-notes.txt
+          fi

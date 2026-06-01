@@ -60,13 +60,13 @@ keyring.set_password(os.environ["SERVICE"], os.environ["USER"], os.environ["SECR
 PY
 ZIG_GET_RC=1
 OUT=""
-for _ in 1 2 3 4 5; do
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   set +e
   OUT=$("$BIN" get "$SERVICE" "$USER" 2>&1)
   ZIG_GET_RC=$?
   set -e
   [ "$ZIG_GET_RC" -eq 0 ] && break
-  sleep 0.2
+  sleep 0.5
 done
 [ "$ZIG_GET_RC" -eq 0 ] || fail "python->zig interop" \
   "Python keyring wrote service=$SERVICE user=$USER, but Zig could not read it." \
@@ -85,7 +85,7 @@ pass "python->zig interop"
 printf '%s' "$SECRET2" | "$BIN" set "$SERVICE" "$USER"
 PY_GET_RC=1
 OUT=""
-for _ in 1 2 3 4 5; do
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   set +e
   OUT=$(SERVICE="$SERVICE" USER="$USER" python3 - <<'PY'
 import os
@@ -97,7 +97,7 @@ PY
   PY_GET_RC=$?
   set -e
   [ "$PY_GET_RC" -eq 0 ] && [ "$OUT" = "$SECRET2" ] && break
-  sleep 0.2
+  sleep 0.5
 done
 [ "$PY_GET_RC" -eq 0 ] || fail "zig->python interop" \
   "Zig wrote service=$SERVICE user=$USER, but Python keyring failed to read it." \

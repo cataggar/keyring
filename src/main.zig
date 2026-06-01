@@ -280,13 +280,28 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
         if (keyring_zig.getAlloc(arena, service, user)) |password| {
             _ = password;
         } else |err| switch (err) {
-            error.NoStorageAccess => try stdout.print("{s}note: no Secret Service daemon detected. Try installing oo7-daemon (https://github.com/linux-credentials/oo7) or run dbus-run-session with gnome-keyring-daemon.{s}\n", .{ colors.yellow(), colors.reset() }),
+            error.NoStorageAccess => try printLinuxNoStorageAccessHint(stdout, colors),
             else => {},
         }
     } else {
-        try stdout.print("native backend: {s}\n", .{backendName(nativeBackend())});
+        const service = "keyring-cli-diagnose-service-that-should-not-exist";
+        const user = "keyring-cli-diagnose-user-that-should-not-exist";
+        if (keyring_zig.getAlloc(arena, service, user)) |password| {
+            _ = password;
+            try stdout.writeAll("backend reachable: yes\n");
+        } else |err| switch (err) {
+            error.EntryNotFound => try stdout.writeAll("backend reachable: yes\n"),
+            else => try stdout.print("backend reachable: no ({s})\n", .{@errorName(err)}),
+        }
     }
     try stdout.flush();
+}
+
+fn printLinuxNoStorageAccessHint(stdout: *std.Io.Writer, colors: color.Color) !void {
+    try stdout.print("{s}note:{s} no Secret Service daemon detected.\n", .{ colors.yellow(), colors.reset() });
+    try stdout.print("{s}note:{s} install oo7-daemon (pure Rust, MIT, headless-friendly): https://github.com/linux-credentials/oo7\n", .{ colors.yellow(), colors.reset() });
+    try stdout.print("{s}note:{s} or start GNOME Secrets with gnome-keyring-daemon --unlock --components=secrets under dbus-run-session.\n", .{ colors.yellow(), colors.reset() });
+    try stdout.print("{s}note:{s} KEYRING_BACKEND=file is planned, not implemented: https://github.com/cataggar/keyring-zig/issues/4\n", .{ colors.yellow(), colors.reset() });
 }
 
 fn diagnoseProperties(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
@@ -416,6 +431,39 @@ test "parseArgs recognizes simple commands" {
     try expectCommandTag(.version, parseArgs(&.{ "keyring", "-v" }));
     try expectCommandTag(.list_backends, parseArgs(&.{ "keyring", "--list-backends" }));
     try expectCommandTag(.diagnose, parseArgs(&.{ "keyring", "diagnose" }));
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
+
+test "runCommand dispatches help list-backends diagnose" {
+    try keyring_zig.setDefaultBackend(.null_backend);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer stderr.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(.help, allocator, undefined, &stdout.writer, &stderr.writer));
+    const help_output = try stdout.toOwnedSlice();
+    defer std.testing.allocator.free(help_output);
+    try expectContains(help_output, "usage: keyring");
+
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(.list_backends, allocator, undefined, &stdout.writer, &stderr.writer));
+    const backends_output = try stdout.toOwnedSlice();
+    defer std.testing.allocator.free(backends_output);
+    try expectContains(backends_output, "null_backend");
+
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(.diagnose, allocator, undefined, &stdout.writer, &stderr.writer));
+    const diagnose_output = try stdout.toOwnedSlice();
+    defer std.testing.allocator.free(diagnose_output);
+    try expectContains(diagnose_output, "current backend: null_backend");
+    try expectContains(diagnose_output, "KEYRING_BACKEND env:");
 }
 
 test "parseArgs recognizes set get del" {

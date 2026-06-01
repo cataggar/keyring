@@ -35,6 +35,7 @@ jobs:
         shell: bash
         run: |
           dbus-run-session -- bash -lc '
+            set -euo pipefail
             eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
             bash tests/integration.sh
             bash tests/python_interop.sh

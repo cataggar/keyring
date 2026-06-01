@@ -21,6 +21,14 @@ const windows_api = if (builtin.os.tag == .windows) struct {
     ) callconv(.winapi) std.os.windows.BOOL;
 } else struct {};
 
+pub fn isStdoutTty() bool {
+    return switch (builtin.os.tag) {
+        .linux, .macos => std.c.isatty(1) != 0,
+        .windows => false,
+        else => false,
+    };
+}
+
 pub fn readPassword(
     gpa: std.mem.Allocator,
     io: std.Io,

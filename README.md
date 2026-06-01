@@ -37,6 +37,22 @@ keyring --disable get my-service alice
 
 Backends are `secret_service`, `keychain`, `win_credential`, and `null_backend` (`null` is accepted as an alias for `null_backend`).
 
+## Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `KEYRING_BACKEND` | Override the backend: `secret_service`, `keychain`, `win_credential`, or `null`. |
+| `KEYRING_PROPERTY_<NAME>` | Backend-specific properties, such as `KEYRING_PROPERTY_KEYCHAIN`, `KEYRING_PROPERTY_COLLECTION`, or `KEYRING_PROPERTY_APPID`. |
+| `NO_COLOR` | Disable ANSI colors in diagnostic output. |
+| `CLICOLOR_FORCE` | Force ANSI colors even when stdout is not a TTY. |
+
+Examples:
+
+```sh
+KEYRING_BACKEND=null keyring get svc user # exits 3 when the entry is not found
+KEYRING_PROPERTY_COLLECTION=default keyring diagnose
+```
+
 ### Exit codes
 
 | Code | Meaning |

@@ -13,6 +13,12 @@ else
   exit 1
 fi
 
+export PYTHON_KEYRING_BACKEND="${PYTHON_KEYRING_BACKEND:-keyring.backends.SecretService.Keyring}"
+python3 - <<'PY'
+import keyring
+print(f"Python keyring backend: {keyring.get_keyring()}")
+PY
+
 SUFFIX="$(date +%s)-$$-$RANDOM"
 SERVICE="keyring-py-it-svc-$SUFFIX"
 USER="keyring-py-it-usr-$SUFFIX"

@@ -4,7 +4,7 @@
 
 ## Status
 
-Phases A-C are complete; Phase D adds headless Linux ergonomics and diagnostics. The file backend remains planned, not implemented.
+Phases A-C are complete; Phase D adds headless Linux ergonomics and diagnostics. The file backend is now available through the upstream keyring-zig package.
 
 ## Usage
 
@@ -35,13 +35,13 @@ keyring --disable
 keyring --disable get my-service alice
 ```
 
-Backends are `secret_service`, `keychain`, `win_credential`, and `null_backend` (`null` is accepted as an alias for `null_backend`).
+Backends are `secret_service`, `keychain`, `win_credential`, `file`, and `null_backend` (`null` is accepted as an alias for `null_backend`).
 
 ## Environment variables
 
 | Variable | Purpose |
 |---|---|
-| `KEYRING_BACKEND` | Override the backend: `secret_service`, `keychain`, `win_credential`, or `null`. |
+| `KEYRING_BACKEND` | Override the backend: `secret_service`, `keychain`, `win_credential`, `file`, or `null`. |
 | `KEYRING_PROPERTY_<NAME>` | Backend-specific properties, such as `KEYRING_PROPERTY_KEYCHAIN`, `KEYRING_PROPERTY_COLLECTION`, or `KEYRING_PROPERTY_APPID`. |
 | `NO_COLOR` | Disable ANSI colors in diagnostic output. |
 | `CLICOLOR_FORCE` | Force ANSI colors even when stdout is not a TTY. |
@@ -77,7 +77,7 @@ dbus-run-session -- bash -lc 'eval "$(printf "\n" | gnome-keyring-daemon --unloc
 
 ### Option C: file backend
 
-`KEYRING_BACKEND=file` is planned but not implemented yet; track it in [cataggar/keyring-zig#4](https://github.com/cataggar/keyring-zig/issues/4).
+`KEYRING_BACKEND=file` uses the upstream file backend for encrypted on-disk credentials when you do not want to rely on a secret-service daemon.
 
 `keyring diagnose` detects the missing Secret Service daemon and prints these recommendations.
 

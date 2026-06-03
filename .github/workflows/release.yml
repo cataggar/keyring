@@ -113,18 +113,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          cat > release-notes.txt <<'NOTES'
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          cat > release-notes.txt <<NOTES
+          **Install:**
+
+          \`\`\`
+          ghr install cataggar/keyring@${tag}
+          \`\`\`
+
           Linux binaries are dynamically linked and require the libsecret-1
           and glib-2.0 runtime libraries to be installed on the target system.
           NOTES
 
+          release_flags=()
+          if [[ "$version" == *dev* ]]; then
+            release_flags+=(--prerelease)
+          fi
+
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release edit "${GITHUB_REF_NAME}" \
-              --title "${GITHUB_REF_NAME}" \
+              --title "keyring ${version}" \
               --notes-file release-notes.txt
             gh release upload "${GITHUB_REF_NAME}" ./dist/* --clobber
           else
             gh release create "${GITHUB_REF_NAME}" ./dist/* \
-              --title "${GITHUB_REF_NAME}" \
-              --notes-file release-notes.txt
+              --title "keyring ${version}" \
+              --notes-file release-notes.txt \
+              "${release_flags[@]}"
           fi

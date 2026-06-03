@@ -21,10 +21,10 @@ const usage =
     \\  get <service> <user>          Read a password to stdout.
     \\  del <service> <user>          Delete a password.
     \\
-    \\Backends: secret_service, keychain, win_credential, null_backend (or null)
+    \\Backends: secret_service, keychain, win_credential, file, null_backend (or null)
     \\
     \\Environment:
-    \\  KEYRING_BACKEND               Override backend: secret_service | keychain | win_credential | null
+    \\  KEYRING_BACKEND               Override backend: secret_service | keychain | win_credential | file | null
     \\  KEYRING_PROPERTY_<NAME>       Backend-specific properties (e.g. KEYRING_PROPERTY_KEYCHAIN, KEYRING_PROPERTY_COLLECTION, KEYRING_PROPERTY_APPID)
     \\  NO_COLOR                      Disable ANSI colors in diagnostic output
     \\  CLICOLOR_FORCE                Force ANSI colors even when stdout is not a TTY
@@ -230,13 +230,14 @@ fn parseBackendArg(name: []const u8) ?keyring_zig.Backend {
     if (std.mem.eql(u8, name, "secret_service")) return .secret_service;
     if (std.mem.eql(u8, name, "keychain")) return .keychain;
     if (std.mem.eql(u8, name, "win_credential")) return .win_credential;
+    if (std.mem.eql(u8, name, "file")) return .file;
     if (std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "null_backend")) return .null_backend;
     return null;
 }
 
 fn listBackends(stdout: *std.Io.Writer) !void {
     const colors = color.Color.detect(getEnvVar, term.isStdoutTty());
-    var buffer: [4]keyring_zig.Backend = undefined;
+    var buffer: [5]keyring_zig.Backend = undefined;
     const available = keyring_zig.availableBackends(&buffer);
     const current = keyring_zig.currentBackend();
     for (available) |backend| {
@@ -252,7 +253,7 @@ fn listBackends(stdout: *std.Io.Writer) !void {
 fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     const colors = color.Color.detect(getEnvVar, term.isStdoutTty());
     const current = keyring_zig.currentBackend();
-    var buffer: [4]keyring_zig.Backend = undefined;
+    var buffer: [5]keyring_zig.Backend = undefined;
     const available = keyring_zig.availableBackends(&buffer);
 
     try stdout.print("current backend: {s}{s}{s}\n", .{ colors.green(), backendName(current), colors.reset() });
@@ -301,7 +302,7 @@ fn printLinuxNoStorageAccessHint(stdout: *std.Io.Writer, colors: color.Color) !v
     try stdout.print("{s}note:{s} no Secret Service daemon detected.\n", .{ colors.yellow(), colors.reset() });
     try stdout.print("{s}note:{s} install oo7-daemon (pure Rust, MIT, headless-friendly): https://github.com/linux-credentials/oo7\n", .{ colors.yellow(), colors.reset() });
     try stdout.print("{s}note:{s} or start GNOME Secrets with gnome-keyring-daemon --unlock --components=secrets under dbus-run-session.\n", .{ colors.yellow(), colors.reset() });
-    try stdout.print("{s}note:{s} KEYRING_BACKEND=file is planned, not implemented: https://github.com/cataggar/keyring-zig/issues/4\n", .{ colors.yellow(), colors.reset() });
+    try stdout.print("{s}note:{s} or use KEYRING_BACKEND=file for encrypted on-disk credentials.\n", .{ colors.yellow(), colors.reset() });
 }
 
 fn diagnoseProperties(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
@@ -376,6 +377,7 @@ fn backendName(backend: keyring_zig.Backend) []const u8 {
         .secret_service => "secret_service",
         .keychain => "keychain",
         .win_credential => "win_credential",
+        .file => "file",
         .null_backend => "null_backend",
     };
 }
@@ -491,6 +493,10 @@ test "parseArgs recognizes backend flag" {
     const parsed_long = parseArgs(&.{ "keyring", "-b", "secret_service", "set", "svc", "user" });
     try std.testing.expectEqual(keyring_zig.Backend.secret_service, parsed_long.backend.?);
     try expectCommandTag(.set, parsed_long);
+
+    const parsed_file = parseArgs(&.{ "keyring", "-b", "file", "get", "svc", "user" });
+    try std.testing.expectEqual(keyring_zig.Backend.file, parsed_file.backend.?);
+    try expectCommandTag(.get, parsed_file);
 }
 
 test "parseArgs recognizes disable" {

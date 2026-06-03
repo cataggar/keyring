@@ -1,6 +1,7 @@
 # Integration tests
 
 These tests exercise the built `keyring` CLI against the native OS keychain.
+They also verify that the compiled-in `ado` backend is listed and short-circuits non-Azure-DevOps URLs without starting interactive auth.
 
 ## Prerequisites
 

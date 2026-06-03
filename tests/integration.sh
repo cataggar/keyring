@@ -98,7 +98,8 @@ case "$(uname -s)" in
 esac
 printf '%s\n' "$BACKENDS" | grep -Eq "$NATIVE_PATTERN" || fail "--list-backends includes native" "pattern: $NATIVE_PATTERN" "output: $BACKENDS"
 printf '%s\n' "$BACKENDS" | grep -Eq 'null' || fail "--list-backends includes null" "output: $BACKENDS"
-pass "--list-backends includes native + null"
+printf '%s\n' "$BACKENDS" | grep -Eq 'ado' || fail "--list-backends includes ado" "output: $BACKENDS"
+pass "--list-backends includes native + null + ado"
 
 # 6. diagnose exits 0 and contains current backend
 set +e
@@ -125,3 +126,11 @@ RC=$?
 set -e
 [ "$RC" -eq 2 ] || fail "bad arity exits 2" "expected rc: 2" "actual rc: $RC" "output: $BAD_ARITY_OUT"
 pass "bad arity exits 2"
+
+# 9. ADO backend ignores non-Azure-DevOps URLs without opening a browser.
+set +e
+ADO_MISS_OUT=$("$BIN" -b ado get "https://pypi.org/simple/" VssSessionToken 2>&1)
+RC=$?
+set -e
+[ "$RC" -eq 3 ] || fail "ado backend non-DevOps URL exits 3" "expected rc: 3" "actual rc: $RC" "output: $ADO_MISS_OUT"
+pass "ado backend non-DevOps URL exits 3"

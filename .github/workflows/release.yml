@@ -32,7 +32,7 @@ jobs:
             target: aarch64-macos
             zig_target: native
             binary: keyring
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-macos
             zig_target: native
             binary: keyring
@@ -40,7 +40,7 @@ jobs:
             target: x86_64-windows
             zig_target: x86_64-windows
             binary: keyring.exe
-          - os: windows-11-arm
+          - os: windows-latest
             target: aarch64-windows
             zig_target: aarch64-windows
             binary: keyring.exe

@@ -17,25 +17,32 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-linux-gnu
+            zig_target: x86_64-linux-gnu
             binary: keyring
           - os: ubuntu-24.04-arm
             target: aarch64-linux-gnu
+            zig_target: aarch64-linux-gnu
             binary: keyring
           - os: macos-latest
             target: aarch64-macos
+            zig_target: native
             binary: keyring
           - os: macos-13
             target: x86_64-macos
+            zig_target: native
             binary: keyring
           - os: windows-latest
             target: x86_64-windows
+            zig_target: x86_64-windows
             binary: keyring.exe
           - os: windows-11-arm
             target: aarch64-windows
+            zig_target: aarch64-windows
             binary: keyring.exe
 
     steps:
@@ -54,7 +61,13 @@ jobs:
           sudo apt-get install -y libsecret-1-dev libglib2.0-dev
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+        shell: bash
+        run: |
+          if [ "${{ matrix.zig_target }}" = "native" ]; then
+            zig build -Doptimize=ReleaseSafe
+          else
+            zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.zig_target }}
+          fi
 
       - name: Package binary
         if: runner.os != 'Windows'

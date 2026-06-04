@@ -10,7 +10,7 @@ Phases A-C are complete; Phase D adds headless Linux ergonomics and diagnostics.
 
 ```sh
 keyring --help
-keyring --version
+keyring version
 keyring --list-backends
 keyring diagnose
 

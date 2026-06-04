@@ -16,7 +16,7 @@ const usage =
     \\
     \\Commands:
     \\  --help, -h, help              Show this help.
-    \\  --version, -v                 Show version.
+    \\  version                       Show version.
     \\  --list-backends               List available backends.
     \\  diagnose                      Show backend diagnostics.
     \\  --disable                     Use the null backend for this process.
@@ -212,7 +212,7 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
         return parsed;
     }
 
-    if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
+    if (std.mem.eql(u8, command, "version")) {
         parsed.command = if (rest.len == 0) .version else .{ .usage_error = "wrong number of arguments" };
         return parsed;
     }
@@ -510,8 +510,7 @@ test "parseArgs recognizes simple commands" {
     try expectCommandTag(.help, parseArgs(&.{ "keyring", "--help" }));
     try expectCommandTag(.help, parseArgs(&.{ "keyring", "-h" }));
     try expectCommandTag(.help, parseArgs(&.{ "keyring", "help" }));
-    try expectCommandTag(.version, parseArgs(&.{ "keyring", "--version" }));
-    try expectCommandTag(.version, parseArgs(&.{ "keyring", "-v" }));
+    try expectCommandTag(.version, parseArgs(&.{ "keyring", "version" }));
     try expectCommandTag(.list_backends, parseArgs(&.{ "keyring", "--list-backends" }));
     try expectCommandTag(.diagnose, parseArgs(&.{ "keyring", "diagnose" }));
 }

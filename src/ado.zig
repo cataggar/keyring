@@ -192,7 +192,12 @@ fn browserAuth(gpa: Allocator, stderr: *Io.Writer) Error!std.json.Parsed(TokenRe
     defer server.deinit(io);
 
     const bound_port = server.socket.address.getPort();
-    const redirect_uri = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{bound_port});
+    // Use "localhost" rather than "127.0.0.1": Entra ID treats http://localhost
+    // as a special loopback redirect (any port allowed) for public clients,
+    // matching what the Azure CLI app registration accepts. http://127.0.0.1
+    // requires an exact-match registered redirect URI and fails with
+    // AADSTS50011 for the Azure CLI client id we use.
+    const redirect_uri = try std.fmt.allocPrint(gpa, "http://localhost:{d}", .{bound_port});
     defer gpa.free(redirect_uri);
 
     const url = try buildAuthorizeUrl(gpa, redirect_uri, &challenge, state);

@@ -147,14 +147,14 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
                 break :code 1;
             };
             setPassword(arena, cmd.service, cmd.user, password) catch |err| {
-                try printAppError(stderr, err);
+                try printAppError(stderr, err, cmd.service, cmd.user);
                 break :code exitCodeFor(err);
             };
             break :code 0;
         },
         .get => |cmd| code: {
             const password = getPassword(arena, stderr, cmd.service, cmd.user) catch |err| {
-                try printAppError(stderr, err);
+                try printAppError(stderr, err, cmd.service, cmd.user);
                 break :code exitCodeFor(err);
             };
             try stdout.writeAll(password);
@@ -163,7 +163,7 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
         },
         .del => |cmd| code: {
             deletePassword(arena, cmd.service, cmd.user) catch |err| {
-                try printAppError(stderr, err);
+                try printAppError(stderr, err, cmd.service, cmd.user);
                 break :code exitCodeFor(err);
             };
             break :code 0;
@@ -404,12 +404,23 @@ fn getEnvVarOwned(gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
 }
 
 fn currentBackend() Backend {
+    return effectiveBackend(null);
+}
+
+/// Pick the backend for an operation. When the caller did not pick a backend
+/// explicitly (no `-b`, no `--disable`, no `KEYRING_BACKEND` env var) and the
+/// service string looks like an Azure DevOps URL, route to the `ado` backend
+/// so tools like uv "just work" against ADO package feeds.
+fn effectiveBackend(service: ?[]const u8) Backend {
     if (app_backend_override) |backend| return backend;
     if (!app_env_backend_checked) {
         app_env_backend = readAppEnvBackend();
         app_env_backend_checked = true;
     }
     if (app_env_backend) |backend| return backend;
+    if (service) |s| {
+        if (ado.isDevOpsUrl(s)) return .ado;
+    }
     return .{ .keyring = keyring_zig.currentBackend() };
 }
 
@@ -433,21 +444,21 @@ fn backendName(backend: Backend) []const u8 {
 }
 
 fn getPassword(arena: std.mem.Allocator, stderr: *std.Io.Writer, service: []const u8, user: []const u8) (keyring_zig.Error || ado.Error)![]u8 {
-    return switch (currentBackend()) {
+    return switch (effectiveBackend(service)) {
         .ado => ado.getPassword(arena, stderr, service, user),
         .keyring => keyring_zig.getAlloc(arena, service, user),
     };
 }
 
 fn setPassword(arena: std.mem.Allocator, service: []const u8, user: []const u8, password: []const u8) (keyring_zig.Error || ado.Error)!void {
-    return switch (currentBackend()) {
+    return switch (effectiveBackend(service)) {
         .ado => ado.setPassword(arena, service, user, password),
         .keyring => keyring_zig.setAlloc(arena, service, user, password),
     };
 }
 
 fn deletePassword(arena: std.mem.Allocator, service: []const u8, user: []const u8) (keyring_zig.Error || ado.Error)!void {
-    return switch (currentBackend()) {
+    return switch (effectiveBackend(service)) {
         .ado => ado.deletePassword(arena),
         .keyring => keyring_zig.deleteAlloc(arena, service, user),
     };
@@ -473,9 +484,26 @@ pub fn exitCodeFor(err: anyerror) u8 {
     };
 }
 
-fn printAppError(stderr: *std.Io.Writer, err: anyerror) !void {
-    try stderr.print("keyring: {s}\n", .{errorMessage(err)});
+fn printAppError(stderr: *std.Io.Writer, err: anyerror, service: ?[]const u8, user: ?[]const u8) !void {
+    const msg = errorMessage(err);
+    if (entryErrorContext(err) and service != null and user != null) {
+        try stderr.print("keyring: {s}: service='{s}' user='{s}'\n", .{ msg, service.?, user.? });
+    } else {
+        try stderr.print("keyring: {s}\n", .{msg});
+    }
     try stderr.flush();
+}
+
+fn entryErrorContext(err: anyerror) bool {
+    return switch (err) {
+        error.EntryNotFound,
+        error.Locked,
+        error.Ambiguous,
+        error.AuthenticationFailed,
+        error.Unsupported,
+        => true,
+        else => false,
+    };
 }
 
 fn errorMessage(err: anyerror) []const u8 {

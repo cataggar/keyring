@@ -448,7 +448,7 @@ fn saveCache(gpa: Allocator, cache: *const Cache, org: []const u8, token: []cons
     const path = try cachePath(gpa);
     defer gpa.free(path);
     const parent = std.fs.path.dirname(path) orelse return error.CacheFailure;
-    _ = std.Io.Dir.cwd().createDirPathStatus(io, parent, .fromMode(0o700)) catch return error.CacheFailure;
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, parent, cacheDirPermissions()) catch return error.CacheFailure;
 
     var out = std.Io.Writer.Allocating.init(gpa);
     defer out.deinit();
@@ -457,11 +457,19 @@ fn saveCache(gpa: Allocator, cache: *const Cache, org: []const u8, token: []cons
     const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
     defer gpa.free(tmp);
     {
-        var file = std.Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true, .permissions = .fromMode(0o600) }) catch return error.CacheFailure;
+        var file = std.Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true, .permissions = cacheFilePermissions() }) catch return error.CacheFailure;
         defer file.close(io);
         file.writeStreamingAll(io, out.written()) catch return error.CacheFailure;
     }
     std.Io.Dir.renameAbsolute(tmp, path, io) catch return error.CacheFailure;
+}
+
+fn cacheDirPermissions() std.Io.File.Permissions {
+    return if (builtin.os.tag == .windows) .default_dir else .fromMode(0o700);
+}
+
+fn cacheFilePermissions() std.Io.File.Permissions {
+    return if (builtin.os.tag == .windows) .default_file else .fromMode(0o600);
 }
 
 fn writeCacheJson(gpa: Allocator, writer: *Io.Writer, cache: *const Cache, org: []const u8, token: []const u8, expires_at: i64) Error!void {

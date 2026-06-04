@@ -1,10 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const keyring_zig = @import("keyring_zig");
+const ado = @import("ado.zig");
 const color = @import("color.zig");
 const term = @import("term.zig");
 
 var runtime_env_map: ?*std.process.Environ.Map = null;
+var app_backend_override: ?Backend = null;
+var app_env_backend_checked = false;
+var app_env_backend: ?Backend = null;
 
 const version = "0.0.0";
 const usage =
@@ -21,10 +25,10 @@ const usage =
     \\  get <service> <user>          Read a password to stdout.
     \\  del <service> <user>          Delete a password.
     \\
-    \\Backends: secret_service, keychain, win_credential, file, null_backend (or null)
+    \\Backends: secret_service, keychain, win_credential, file, ado, null_backend (or null)
     \\
     \\Environment:
-    \\  KEYRING_BACKEND               Override backend: secret_service | keychain | win_credential | file | null
+    \\  KEYRING_BACKEND               Override backend: secret_service | keychain | win_credential | file | ado | null
     \\  KEYRING_PROPERTY_<NAME>       Backend-specific properties (e.g. KEYRING_PROPERTY_KEYCHAIN, KEYRING_PROPERTY_COLLECTION, KEYRING_PROPERTY_APPID)
     \\  NO_COLOR                      Disable ANSI colors in diagnostic output
     \\  CLICOLOR_FORCE                Force ANSI colors even when stdout is not a TTY
@@ -45,9 +49,24 @@ pub const Command = union(enum) {
 
 pub const ParsedArgs = struct {
     command: Command,
-    backend: ?keyring_zig.Backend = null,
+    backend: ?Backend = null,
     disable: bool = false,
 };
+
+pub const Backend = union(enum) {
+    keyring: keyring_zig.Backend,
+    ado,
+};
+
+fn backendEql(a: Backend, b: Backend) bool {
+    return switch (a) {
+        .ado => b == .ado,
+        .keyring => |ak| switch (b) {
+            .keyring => |bk| ak == bk,
+            .ado => false,
+        },
+    };
+}
 
 pub fn main(init: std.process.Init) !void {
     runtime_env_map = init.environ_map;
@@ -69,13 +88,19 @@ pub fn main(init: std.process.Init) !void {
 
     const parsed = parseArgs(args);
     if (parsed.backend) |backend| {
-        keyring_zig.setDefaultBackend(backend) catch |err| switch (err) {
-            error.BackendUnavailable => {
-                try stderr.print("keyring: backend '{s}' not available on this platform\n", .{backendName(backend)});
-                try stderr.flush();
-                std.process.exit(4);
+        switch (backend) {
+            .ado => app_backend_override = .ado,
+            .keyring => |keyring_backend| {
+                keyring_zig.setDefaultBackend(keyring_backend) catch |err| switch (err) {
+                    error.BackendUnavailable => {
+                        try stderr.print("keyring: backend '{s}' not available on this platform\n", .{backendName(backend)});
+                        try stderr.flush();
+                        std.process.exit(4);
+                    },
+                };
+                app_backend_override = backend;
             },
-        };
+        }
     }
     if (parsed.disable) {
         keyring_zig.setDefaultBackend(.null_backend) catch {
@@ -83,6 +108,7 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
             std.process.exit(4);
         };
+        app_backend_override = .{ .keyring = .null_backend };
     }
 
     const exit_code = try runCommand(parsed.command, arena, init.io, stdout, stderr);
@@ -120,15 +146,15 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
                 try stderr.flush();
                 break :code 1;
             };
-            keyring_zig.setAlloc(arena, cmd.service, cmd.user, password) catch |err| {
-                try printKeyringError(stderr, err);
+            setPassword(arena, cmd.service, cmd.user, password) catch |err| {
+                try printAppError(stderr, err);
                 break :code exitCodeFor(err);
             };
             break :code 0;
         },
         .get => |cmd| code: {
-            const password = keyring_zig.getAlloc(arena, cmd.service, cmd.user) catch |err| {
-                try printKeyringError(stderr, err);
+            const password = getPassword(arena, stderr, cmd.service, cmd.user) catch |err| {
+                try printAppError(stderr, err);
                 break :code exitCodeFor(err);
             };
             try stdout.writeAll(password);
@@ -136,8 +162,8 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
             break :code 0;
         },
         .del => |cmd| code: {
-            keyring_zig.deleteAlloc(arena, cmd.service, cmd.user) catch |err| {
-                try printKeyringError(stderr, err);
+            deletePassword(arena, cmd.service, cmd.user) catch |err| {
+                try printAppError(stderr, err);
                 break :code exitCodeFor(err);
             };
             break :code 0;
@@ -226,12 +252,13 @@ fn usageError(message: []const u8, parsed: ParsedArgs) ParsedArgs {
     return result;
 }
 
-fn parseBackendArg(name: []const u8) ?keyring_zig.Backend {
-    if (std.mem.eql(u8, name, "secret_service")) return .secret_service;
-    if (std.mem.eql(u8, name, "keychain")) return .keychain;
-    if (std.mem.eql(u8, name, "win_credential")) return .win_credential;
-    if (std.mem.eql(u8, name, "file")) return .file;
-    if (std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "null_backend")) return .null_backend;
+fn parseBackendArg(name: []const u8) ?Backend {
+    if (std.mem.eql(u8, name, "secret_service")) return .{ .keyring = .secret_service };
+    if (std.mem.eql(u8, name, "keychain")) return .{ .keyring = .keychain };
+    if (std.mem.eql(u8, name, "win_credential")) return .{ .keyring = .win_credential };
+    if (std.mem.eql(u8, name, "file")) return .{ .keyring = .file };
+    if (std.mem.eql(u8, name, "ado") or std.mem.eql(u8, name, "azure_devops")) return .ado;
+    if (std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "null_backend")) return .{ .keyring = .null_backend };
     return null;
 }
 
@@ -239,20 +266,26 @@ fn listBackends(stdout: *std.Io.Writer) !void {
     const colors = color.Color.detect(getEnvVar, term.isStdoutTty());
     var buffer: [5]keyring_zig.Backend = undefined;
     const available = keyring_zig.availableBackends(&buffer);
-    const current = keyring_zig.currentBackend();
+    const current = currentBackend();
     for (available) |backend| {
-        if (backend == current) {
-            try stdout.print("{s}*{s}{s} {s}(default){s}\n", .{ colors.green(), colors.reset(), backendName(backend), colors.green(), colors.reset() });
+        const app_backend = Backend{ .keyring = backend };
+        if (backendEql(app_backend, current)) {
+            try stdout.print("{s}*{s}{s} {s}(default){s}\n", .{ colors.green(), colors.reset(), backendName(app_backend), colors.green(), colors.reset() });
         } else {
-            try stdout.print("{s}\n", .{backendName(backend)});
+            try stdout.print("{s}\n", .{backendName(app_backend)});
         }
+    }
+    if (backendEql(.ado, current)) {
+        try stdout.print("{s}*{s}ado {s}(default){s}\n", .{ colors.green(), colors.reset(), colors.green(), colors.reset() });
+    } else {
+        try stdout.writeAll("ado\n");
     }
     try stdout.flush();
 }
 
 fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     const colors = color.Color.detect(getEnvVar, term.isStdoutTty());
-    const current = keyring_zig.currentBackend();
+    const current = currentBackend();
     var buffer: [5]keyring_zig.Backend = undefined;
     const available = keyring_zig.availableBackends(&buffer);
 
@@ -260,11 +293,18 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     try stdout.writeAll("available backends: ");
     for (available, 0..) |backend, index| {
         if (index != 0) try stdout.writeAll(", ");
-        if (backend == current) {
-            try stdout.print("{s}{s}{s}{s}", .{ colors.bold(), colors.green(), backendName(backend), colors.reset() });
+        const app_backend = Backend{ .keyring = backend };
+        if (backendEql(app_backend, current)) {
+            try stdout.print("{s}{s}{s}{s}", .{ colors.bold(), colors.green(), backendName(app_backend), colors.reset() });
         } else {
-            try stdout.writeAll(backendName(backend));
+            try stdout.writeAll(backendName(app_backend));
         }
+    }
+    if (available.len != 0) try stdout.writeAll(", ");
+    if (backendEql(.ado, current)) {
+        try stdout.print("{s}{s}ado{s}", .{ colors.bold(), colors.green(), colors.reset() });
+    } else {
+        try stdout.writeAll("ado");
     }
     try stdout.writeByte('\n');
 
@@ -278,7 +318,7 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     if (builtin.os.tag == .linux) {
         const service = "keyring-cli-diagnose-service-that-should-not-exist";
         const user = "keyring-cli-diagnose-user-that-should-not-exist";
-        if (keyring_zig.getAlloc(arena, service, user)) |password| {
+        if (getPassword(arena, stdout, service, user)) |password| {
             _ = password;
         } else |err| switch (err) {
             error.NoStorageAccess => try printLinuxNoStorageAccessHint(stdout, colors),
@@ -287,7 +327,7 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     } else {
         const service = "keyring-cli-diagnose-service-that-should-not-exist";
         const user = "keyring-cli-diagnose-user-that-should-not-exist";
-        if (keyring_zig.getAlloc(arena, service, user)) |password| {
+        if (getPassword(arena, stdout, service, user)) |password| {
             _ = password;
             try stdout.writeAll("backend reachable: yes\n");
         } else |err| switch (err) {
@@ -363,26 +403,57 @@ fn getEnvVarOwned(gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
     return null;
 }
 
-fn nativeBackend() keyring_zig.Backend {
-    return switch (builtin.os.tag) {
-        .linux => .secret_service,
-        .macos => .keychain,
-        .windows => .win_credential,
-        else => .null_backend,
-    };
+fn currentBackend() Backend {
+    if (app_backend_override) |backend| return backend;
+    if (!app_env_backend_checked) {
+        app_env_backend = readAppEnvBackend();
+        app_env_backend_checked = true;
+    }
+    if (app_env_backend) |backend| return backend;
+    return .{ .keyring = keyring_zig.currentBackend() };
 }
 
-fn backendName(backend: keyring_zig.Backend) []const u8 {
+fn readAppEnvBackend() ?Backend {
+    const value = getEnvVar("KEYRING_BACKEND") orelse return null;
+    if (std.mem.eql(u8, value, "ado") or std.mem.eql(u8, value, "azure_devops")) return .ado;
+    return null;
+}
+
+fn backendName(backend: Backend) []const u8 {
     return switch (backend) {
-        .secret_service => "secret_service",
-        .keychain => "keychain",
-        .win_credential => "win_credential",
-        .file => "file",
-        .null_backend => "null_backend",
+        .ado => "ado",
+        .keyring => |keyring_backend| switch (keyring_backend) {
+            .secret_service => "secret_service",
+            .keychain => "keychain",
+            .win_credential => "win_credential",
+            .file => "file",
+            .null_backend => "null_backend",
+        },
     };
 }
 
-pub fn exitCodeFor(err: keyring_zig.Error) u8 {
+fn getPassword(arena: std.mem.Allocator, stderr: *std.Io.Writer, service: []const u8, user: []const u8) (keyring_zig.Error || ado.Error)![]u8 {
+    return switch (currentBackend()) {
+        .ado => ado.getPassword(arena, stderr, service, user),
+        .keyring => keyring_zig.getAlloc(arena, service, user),
+    };
+}
+
+fn setPassword(arena: std.mem.Allocator, service: []const u8, user: []const u8, password: []const u8) (keyring_zig.Error || ado.Error)!void {
+    return switch (currentBackend()) {
+        .ado => ado.setPassword(arena, service, user, password),
+        .keyring => keyring_zig.setAlloc(arena, service, user, password),
+    };
+}
+
+fn deletePassword(arena: std.mem.Allocator, service: []const u8, user: []const u8) (keyring_zig.Error || ado.Error)!void {
+    return switch (currentBackend()) {
+        .ado => ado.deletePassword(arena),
+        .keyring => keyring_zig.deleteAlloc(arena, service, user),
+    };
+}
+
+pub fn exitCodeFor(err: anyerror) u8 {
     return switch (err) {
         error.EntryNotFound => 3,
         error.NoStorageAccess => 4,
@@ -393,16 +464,21 @@ pub fn exitCodeFor(err: keyring_zig.Error) u8 {
         error.InputTooLong,
         error.BufferTooSmall,
         error.InvalidUtf8,
+        error.Unsupported,
+        error.AuthenticationFailed,
+        error.NetworkFailure,
+        error.CacheFailure,
         => 1,
+        else => 1,
     };
 }
 
-fn printKeyringError(stderr: *std.Io.Writer, err: keyring_zig.Error) !void {
+fn printAppError(stderr: *std.Io.Writer, err: anyerror) !void {
     try stderr.print("keyring: {s}\n", .{errorMessage(err)});
     try stderr.flush();
 }
 
-fn errorMessage(err: keyring_zig.Error) []const u8 {
+fn errorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.EntryNotFound => "entry not found",
         error.NoStorageAccess => "no storage access",
@@ -413,6 +489,11 @@ fn errorMessage(err: keyring_zig.Error) []const u8 {
         error.InputTooLong => "input too long",
         error.BufferTooSmall => "buffer too small",
         error.InvalidUtf8 => "invalid utf8",
+        error.Unsupported => "operation unsupported by backend",
+        error.AuthenticationFailed => "authentication failed",
+        error.NetworkFailure => "network failure",
+        error.CacheFailure => "cache failure",
+        else => "platform failure",
     };
 }
 
@@ -460,6 +541,7 @@ test "runCommand dispatches help list-backends diagnose" {
     const backends_output = try stdout.toOwnedSlice();
     defer std.testing.allocator.free(backends_output);
     try expectContains(backends_output, "null_backend");
+    try expectContains(backends_output, "ado");
 
     try std.testing.expectEqual(@as(u8, 0), try runCommand(.diagnose, allocator, undefined, &stdout.writer, &stderr.writer));
     const diagnose_output = try stdout.toOwnedSlice();
@@ -487,16 +569,20 @@ test "parseArgs recognizes set get del" {
 
 test "parseArgs recognizes backend flag" {
     const parsed = parseArgs(&.{ "keyring", "-b", "null", "get", "svc", "user" });
-    try std.testing.expectEqual(keyring_zig.Backend.null_backend, parsed.backend.?);
+    try std.testing.expect(backendEql(.{ .keyring = .null_backend }, parsed.backend.?));
     try expectCommandTag(.get, parsed);
 
     const parsed_long = parseArgs(&.{ "keyring", "-b", "secret_service", "set", "svc", "user" });
-    try std.testing.expectEqual(keyring_zig.Backend.secret_service, parsed_long.backend.?);
+    try std.testing.expect(backendEql(.{ .keyring = .secret_service }, parsed_long.backend.?));
     try expectCommandTag(.set, parsed_long);
 
     const parsed_file = parseArgs(&.{ "keyring", "-b", "file", "get", "svc", "user" });
-    try std.testing.expectEqual(keyring_zig.Backend.file, parsed_file.backend.?);
+    try std.testing.expect(backendEql(.{ .keyring = .file }, parsed_file.backend.?));
     try expectCommandTag(.get, parsed_file);
+
+    const parsed_ado = parseArgs(&.{ "keyring", "-b", "ado", "get", "https://pkgs.dev.azure.com/org/_packaging/feed/pypi/simple/", "VssSessionToken" });
+    try std.testing.expect(backendEql(.ado, parsed_ado.backend.?));
+    try expectCommandTag(.get, parsed_ado);
 }
 
 test "parseArgs recognizes disable" {

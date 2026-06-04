@@ -200,7 +200,7 @@ fn browserAuth(gpa: Allocator, stderr: *Io.Writer) Error!std.json.Parsed(TokenRe
 
     log(stderr, "{s} Opening browser for Azure DevOps authentication...\n", .{log_prefix});
     log(stderr, "{s} If the browser does not open, visit:\n{s}\n", .{ log_prefix, url });
-    try openBrowser(gpa, url);
+    try openBrowser(gpa, stderr, url);
 
     var stream = server.accept(io) catch return error.AuthenticationFailed;
     defer stream.socket.close(io);
@@ -371,20 +371,32 @@ fn sendHtml(io: Io, stream: std.Io.net.Stream, html: []const u8) Error!void {
     writer.interface.flush() catch return error.NetworkFailure;
 }
 
-fn openBrowser(gpa: Allocator, url: []const u8) Error!void {
-    const io = std.Io.Threaded.global_single_threaded.io();
+fn openBrowser(gpa: Allocator, stderr: *Io.Writer, url: []const u8) Error!void {
+    // global_single_threaded uses a failing allocator, which makes
+    // std.process.spawn return OutOfMemory. Initialize our own Threaded
+    // instance backed by `gpa` for process spawning.
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const attempts = browserAttempts();
     for (attempts) |argv_prefix| {
         const argv = try appendUrlArg(gpa, argv_prefix, url);
         defer gpa.free(argv);
-        const result = std.process.run(gpa, io, .{
+        var child = std.process.spawn(io, .{
             .argv = argv,
-            .stdout_limit = .limited(32 * 1024),
-            .stderr_limit = .limited(32 * 1024),
-        }) catch continue;
-        defer gpa.free(result.stdout);
-        defer gpa.free(result.stderr);
-        if (result.term == .exited and result.term.exited == 0) return;
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }) catch |err| {
+            log(stderr, "{s} browser spawn '{s}' failed: {s}\n", .{ log_prefix, argv[0], @errorName(err) });
+            continue;
+        };
+        const term = child.wait(io) catch |err| {
+            log(stderr, "{s} browser wait '{s}' failed: {s}\n", .{ log_prefix, argv[0], @errorName(err) });
+            continue;
+        };
+        if (term == .exited and term.exited == 0) return;
+        log(stderr, "{s} browser command '{s}' exited non-zero: {any}\n", .{ log_prefix, argv[0], term });
     }
     return error.NoStorageAccess;
 }

@@ -10,7 +10,7 @@ var app_backend_override: ?Backend = null;
 var app_env_backend_checked = false;
 var app_env_backend: ?Backend = null;
 
-const version = "0.0.0";
+const version = @import("app_build_options").version;
 const usage =
     \\usage: keyring [--disable] [-b <backend>] <command> [args]
     \\

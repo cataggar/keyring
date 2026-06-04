@@ -6,9 +6,6 @@ pub fn build(b: *std.Build) void {
 
     const keyring_zig = b.dependency("keyring_zig", .{ .target = target });
     const keyring_zig_module = keyring_zig.module("keyring_zig");
-    if (target.result.os.tag == .macos) {
-        keyring_zig_module.addCMacro("__has_feature(x)", "0");
-    }
 
     const exe = b.addExecutable(.{
         .name = "keyring",

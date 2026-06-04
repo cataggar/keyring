@@ -63,10 +63,11 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          version="${GITHUB_REF_NAME#v}"
           if [ "${{ matrix.zig_target }}" = "native" ]; then
-            zig build -Doptimize=ReleaseSafe
+            zig build -Doptimize=ReleaseSafe -Dversion="$version"
           else
-            zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.zig_target }}
+            zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.zig_target }} -Dversion="$version"
           fi
 
       - name: Package binary

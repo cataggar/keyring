@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const version = b.option([]const u8, "version", "Version string baked into the binary (no 'v' prefix)") orelse "0.0.0-dev";
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    const build_options_module = build_options.createModule();
+
     const keyring_zig = b.dependency("keyring_zig", .{ .target = target });
     const keyring_zig_module = keyring_zig.module("keyring_zig");
 
@@ -16,6 +22,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("keyring_zig", keyring_zig_module);
+    exe.root_module.addImport("app_build_options", build_options_module);
 
     b.installArtifact(exe);
 
@@ -35,6 +42,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     unit_tests.root_module.addImport("keyring_zig", keyring_zig_module);
+    unit_tests.root_module.addImport("app_build_options", build_options_module);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

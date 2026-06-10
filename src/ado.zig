@@ -72,22 +72,15 @@ pub fn getCredential(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8
     var token_parsed: ?std.json.Parsed(TokenResponse) = null;
     defer if (token_parsed) |*parsed| parsed.deinit();
 
-    if (cache.access_token == null or cache.expires_at <= now + 60) {
-        if (cache.refresh_token) |refresh_token| {
-            log(stderr, "{s} Refreshing access token...\n", .{log_prefix});
-            token_parsed = refreshAccessToken(gpa, refresh_token) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => blk: {
-                    log(stderr, "{s} Refresh failed ({s}), falling back to browser\n", .{ log_prefix, @errorName(err) });
-                    break :blk try browserAuth(gpa, stderr);
-                },
-            };
-        } else {
-            if (isNonInteractive()) return error.NoStorageAccess;
-            log(stderr, "{s} No cached token, starting browser auth...\n", .{log_prefix});
-            token_parsed = try browserAuth(gpa, stderr);
-        }
+    // Tracks whether the access token we are about to use was just obtained via a
+    // fresh refresh/browser auth in this invocation (as opposed to loaded from the
+    // on-disk cache). A cached token may have been revoked or invalidated by clock
+    // skew even though its recorded expiry has not yet passed.
+    var fresh_auth = false;
 
+    if (cache.access_token == null or cache.expires_at <= now + 60) {
+        token_parsed = try acquireAccessToken(gpa, stderr, cache.refresh_token);
+        fresh_auth = true;
         if (token_parsed) |parsed| {
             cache.access_token = parsed.value.access_token;
             cache.refresh_token = parsed.value.refresh_token;
@@ -95,19 +88,56 @@ pub fn getCredential(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8
         }
     }
 
-    const access_token = cache.access_token orelse return error.AuthenticationFailed;
+    var access_token = cache.access_token orelse return error.AuthenticationFailed;
     log(stderr, "{s} Exchanging for VssSessionToken ({s})...\n", .{ log_prefix, org });
-    var session_parsed = try getSessionToken(gpa, access_token, org);
+
+    var retry_parsed: ?std.json.Parsed(TokenResponse) = null;
+    defer if (retry_parsed) |*parsed| parsed.deinit();
+
+    var session_parsed = getSessionToken(gpa, access_token, org) catch |err| reauth: {
+        // The cached access token was rejected by Azure DevOps. Re-authenticate
+        // (refresh first, then browser) and retry the exchange once. If the access
+        // token was already freshly acquired in this call, the failure is real.
+        if (fresh_auth) return err;
+        log(stderr, "{s} Cached credentials rejected, re-authenticating...\n", .{log_prefix});
+        retry_parsed = try acquireAccessToken(gpa, stderr, cache.refresh_token);
+        if (retry_parsed) |parsed| {
+            cache.access_token = parsed.value.access_token;
+            cache.refresh_token = parsed.value.refresh_token;
+            cache.expires_at = now + parsed.value.expires_in;
+        }
+        access_token = cache.access_token orelse return error.AuthenticationFailed;
+        break :reauth try getSessionToken(gpa, access_token, org);
+    };
     defer session_parsed.deinit();
 
     const token = session_parsed.value.token;
     const owned_token = try gpa.dupe(u8, token);
     errdefer gpa.free(owned_token);
 
-    try saveCache(gpa, &cache, org, token, now + 3000);
+    try saveCache(gpa, &cache, org, owned_token, now + 3000);
 
     log(stderr, "{s} Authenticated to '{s}'\n", .{ log_prefix, org });
     return .{ .username = session_username, .password = owned_token };
+}
+
+/// Obtain a fresh Entra access token, preferring a silent refresh-token grant and
+/// falling back to interactive browser auth. Used both for the initial acquisition
+/// and to recover when a cached access token is rejected by Azure DevOps.
+fn acquireAccessToken(gpa: Allocator, stderr: *Io.Writer, refresh_token: ?[]const u8) Error!std.json.Parsed(TokenResponse) {
+    if (refresh_token) |rt| {
+        log(stderr, "{s} Refreshing access token...\n", .{log_prefix});
+        return refreshAccessToken(gpa, rt) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log(stderr, "{s} Refresh failed ({s}), falling back to browser\n", .{ log_prefix, @errorName(err) });
+                return browserAuth(gpa, stderr);
+            },
+        };
+    }
+    if (isNonInteractive()) return error.NoStorageAccess;
+    log(stderr, "{s} No cached token, starting browser auth...\n", .{log_prefix});
+    return browserAuth(gpa, stderr);
 }
 
 pub fn getPassword(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8, username: []const u8) Error![]u8 {
@@ -141,10 +171,26 @@ pub fn isDevOpsUrl(url: []const u8) bool {
 }
 
 pub fn extractOrg(service_url: []const u8) ?[]const u8 {
-    const parsed = std.Uri.parse(service_url) catch return null;
-    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host_name = parsed.getHost(&host_buffer) catch return null;
-    const host = host_name.bytes;
+    // Slice the host and path directly out of `service_url` rather than going
+    // through std.Uri.getHost, which copies the host into a caller-provided
+    // stack buffer. Returning a slice into such a buffer yields a dangling
+    // pointer once this function returns and the stack frame is reused (e.g. by
+    // a subsequent loadCache JSON parse), corrupting the org name. All slices
+    // returned here point into `service_url`, which outlives the call.
+    const scheme_sep = std.mem.indexOf(u8, service_url, "://") orelse return null;
+    const after_scheme = service_url[scheme_sep + 3 ..];
+
+    var host_end: usize = after_scheme.len;
+    for (after_scheme, 0..) |c, i| {
+        if (c == '/' or c == '?' or c == '#') {
+            host_end = i;
+            break;
+        }
+    }
+
+    var host = after_scheme[0..host_end];
+    if (std.mem.lastIndexOfScalar(u8, host, '@')) |at| host = host[at + 1 ..];
+    if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
 
     if (std.mem.endsWith(u8, host, "visualstudio.com") or
         std.mem.endsWith(u8, host, "vsts.me") or
@@ -155,12 +201,12 @@ pub fn extractOrg(service_url: []const u8) ?[]const u8 {
     }
 
     if (std.mem.indexOf(u8, host, "dev.azure.com") != null) {
-        const path = parsed.path.percent_encoded;
+        const path = after_scheme[host_end..];
         var start: usize = 0;
         while (start < path.len and path[start] == '/') start += 1;
         if (start >= path.len) return null;
         var end = start;
-        while (end < path.len and path[end] != '/') end += 1;
+        while (end < path.len and (path[end] != '/' and path[end] != '?' and path[end] != '#')) end += 1;
         return if (end == start) null else path[start..end];
     }
 
@@ -457,7 +503,16 @@ fn loadCache(gpa: Allocator) Error!?std.json.Parsed(Cache) {
         else => return null,
     };
     defer gpa.free(bytes);
-    return std.json.parseFromSlice(Cache, gpa, bytes, .{ .ignore_unknown_fields = true }) catch null;
+    // Use .alloc_always so every parsed string is copied into the Parsed value's
+    // own arena. The default (.alloc_if_needed) slices unescaped strings directly
+    // out of `bytes`, which is freed when this function returns — leaving the
+    // returned Cache (access/refresh tokens, session tokens, and org keys)
+    // pointing at freed memory. That use-after-free made cached session tokens
+    // unreadable, forcing a browser re-authentication on every invocation.
+    return std.json.parseFromSlice(Cache, gpa, bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch null;
 }
 
 fn saveCache(gpa: Allocator, cache: *const Cache, org: []const u8, token: []const u8, expires_at: i64) Error!void {
@@ -471,7 +526,15 @@ fn saveCache(gpa: Allocator, cache: *const Cache, org: []const u8, token: []cons
     defer out.deinit();
     try writeCacheJson(gpa, &out.writer, cache, org, token, expires_at);
 
-    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
+    // Use a unique temp filename per write. uv (and other consumers) spawn many
+    // keyring processes concurrently; a shared "{path}.tmp" name causes them to
+    // race on the same file, producing a corrupt cache that fails to parse and
+    // forces a re-authentication on every subsequent call. A per-process random
+    // suffix keeps each writer's temp file private before the atomic rename.
+    var suffix_bytes: [8]u8 = undefined;
+    std.Io.Threaded.global_single_threaded.io().random(&suffix_bytes);
+    const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.{s}.tmp", .{ path, suffix_hex });
     defer gpa.free(tmp);
     {
         var file = std.Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true, .permissions = cacheFilePermissions() }) catch return error.CacheFailure;
@@ -490,6 +553,7 @@ fn cacheFilePermissions() std.Io.File.Permissions {
 }
 
 fn writeCacheJson(gpa: Allocator, writer: *Io.Writer, cache: *const Cache, org: []const u8, token: []const u8, expires_at: i64) Error!void {
+    _ = gpa;
     writer.writeAll("{\n  \"access_token\": ") catch return error.CacheFailure;
     try writeJsonOptionalString(writer, cache.access_token);
     writer.writeAll(",\n  \"refresh_token\": ") catch return error.CacheFailure;
@@ -510,7 +574,6 @@ fn writeCacheJson(gpa: Allocator, writer: *Io.Writer, cache: *const Cache, org: 
     }
 
     if (!first) writer.writeAll(",") catch return error.CacheFailure;
-    _ = gpa;
     writer.writeAll("\n    ") catch return error.CacheFailure;
     try writeJsonString(writer, org);
     writer.writeAll(": { \"token\": ") catch return error.CacheFailure;
@@ -626,4 +689,51 @@ test "parses OAuth callback" {
     defer std.testing.allocator.free(code);
     try std.testing.expectEqualStrings("abc 123", code);
     try std.testing.expectError(error.AuthenticationFailed, parseOAuthCallback(std.testing.allocator, "/?code=abc&state=no", "ok"));
+}
+
+test "extractOrg result survives a subsequent stack-clobbering call" {
+    // Regression test: extractOrg previously returned a slice into a local stack
+    // buffer (via std.Uri.getHost). After returning, the next function call could
+    // reuse that stack region and corrupt the org name. Capture the org, then run
+    // an unrelated call that allocates a large stack frame, and confirm the org
+    // bytes are unchanged.
+    const org = extractOrg("https://msazure.pkgs.visualstudio.com/One/_packaging/feed/pypi/simple/").?;
+    var scratch: [4096]u8 = undefined;
+    for (&scratch, 0..) |*b, i| b.* = @intCast(i & 0xff);
+    std.mem.doNotOptimizeAway(&scratch);
+    try std.testing.expectEqualStrings("msazure", org);
+}
+
+test "cache JSON round-trips the session token after the source buffer is freed" {
+    // Regression test for a use-after-free: loadCache frees the file buffer after
+    // parsing, so the parsed Cache must own its strings. We emulate that by
+    // serializing into a heap buffer, parsing with the same options loadCache
+    // uses, freeing the source buffer, and only then reading the session token.
+    const gpa = std.testing.allocator;
+    var cache: Cache = .{
+        .access_token = "access-abc",
+        .refresh_token = "refresh-xyz",
+        .expires_at = 1_000_000,
+    };
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    try writeCacheJson(gpa, &out.writer, &cache, "msazure", "session-token-123", 2_000_000);
+
+    // Copy the JSON onto its own heap buffer and free `out` so that any slice that
+    // still references the original bytes would be reading freed memory.
+    const bytes = try gpa.dupe(u8, out.written());
+    out.deinit();
+
+    var parsed = try std.json.parseFromSlice(Cache, gpa, bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    gpa.free(bytes);
+
+    const session = parsed.value.session_tokens.map.get("msazure") orelse return error.SessionTokenMissing;
+    try std.testing.expectEqualStrings("session-token-123", session.token);
+    try std.testing.expectEqual(@as(i64, 2_000_000), session.expires_at);
+    try std.testing.expectEqualStrings("access-abc", parsed.value.access_token.?);
+    try std.testing.expectEqualStrings("refresh-xyz", parsed.value.refresh_token.?);
 }

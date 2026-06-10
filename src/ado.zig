@@ -61,12 +61,13 @@ const Cache = struct {
 };
 
 /// The long-lived portion of the cache persisted in the Windows Credential
-/// Manager (issue #15). Per-org session tokens are kept separately in a
-/// non-secret file.
+/// Manager (issue #15). Only the OAuth refresh token is stored: the matching
+/// access token is short-lived (~1 hour) and trivially re-derived from the
+/// refresh token, and including it pushes the credential blob past
+/// `CRED_MAX_CREDENTIAL_BLOB_SIZE` (5*512 bytes), making `CredWriteW` fail.
+/// Per-org session tokens are kept separately in a non-secret file.
 const LongLived = struct {
-    access_token: ?[]const u8 = null,
     refresh_token: ?[]const u8 = null,
-    expires_at: i64 = 0,
 };
 
 /// An owned, mutable cache backed by a private arena so callers do not need to
@@ -486,6 +487,17 @@ fn sendHtml(io: Io, stream: std.Io.net.Stream, html: []const u8) Error!void {
 }
 
 fn openBrowser(gpa: Allocator, stderr: *Io.Writer, url: []const u8) Error!void {
+    if (builtin.os.tag == .windows) {
+        // Call ShellExecuteW("open", url, ...) directly. Going through a shell
+        // (cmd /c start, powershell Start-Process) truncates the URL at the
+        // first `&` (cmd command separator / PowerShell call operator).
+        // Spawning rundll32 with url.dll's FileProtocolHandler from a hidden
+        // console exits 0 but never actually launches the browser. ShellExecuteW
+        // is the Win32 primitive every other launcher ultimately calls.
+        if (shellExecuteOpen(gpa, url)) return;
+        log(stderr, "{s} ShellExecuteW failed to open browser\n", .{log_prefix});
+        return error.NoStorageAccess;
+    }
     // global_single_threaded uses a failing allocator, which makes
     // std.process.spawn return OutOfMemory. Initialize our own Threaded
     // instance backed by `gpa` for process spawning.
@@ -515,12 +527,32 @@ fn openBrowser(gpa: Allocator, stderr: *Io.Writer, url: []const u8) Error!void {
     return error.NoStorageAccess;
 }
 
+const SW_SHOWNORMAL: i32 = 1;
+
+extern "shell32" fn ShellExecuteW(
+    hwnd: ?*anyopaque,
+    lpOperation: ?[*:0]const u16,
+    lpFile: ?[*:0]const u16,
+    lpParameters: ?[*:0]const u16,
+    lpDirectory: ?[*:0]const u16,
+    nShowCmd: i32,
+) callconv(.winapi) ?*anyopaque;
+
+fn shellExecuteOpen(gpa: Allocator, url: []const u8) bool {
+    const op = std.unicode.utf8ToUtf16LeAllocZ(gpa, "open") catch return false;
+    defer gpa.free(op);
+    const file = std.unicode.utf8ToUtf16LeAllocZ(gpa, url) catch return false;
+    defer gpa.free(file);
+    const result = ShellExecuteW(null, op.ptr, file.ptr, null, null, SW_SHOWNORMAL);
+    // ShellExecuteW returns an HINSTANCE cast to a pointer. Per MSDN, values
+    // <= 32 are error codes; success returns a value > 32.
+    const code: usize = @intFromPtr(result);
+    return code > 32;
+}
+
 fn browserAttempts() []const []const []const u8 {
     if (builtin.os.tag == .macos) {
         return &.{&.{"open"}};
-    }
-    if (builtin.os.tag == .windows) {
-        return &.{ &.{ "cmd", "/c", "start", "" }, &.{ "powershell", "-NoProfile", "-Command", "Start-Process" } };
     }
     if (isWsl()) {
         return &.{
@@ -581,17 +613,17 @@ fn emptyArena(gpa: Allocator) *std.heap.ArenaAllocator {
     return arena;
 }
 
-/// Windows: read the long-lived tokens from the Credential Manager, migrating a
-/// legacy plaintext JSON cache on first run, then load the session-token file.
+/// Windows: read the long-lived refresh token from the Credential Manager,
+/// migrating a legacy plaintext JSON cache on first run, then load the
+/// session-token file. The access token is intentionally not persisted (see
+/// `LongLived`); it stays in memory for the lifetime of this process.
 fn loadWindows(a: Allocator, cache: *Cache) void {
     if (wincred.get(a, wcm_service)) |blob| {
         if (std.json.parseFromSliceLeaky(LongLived, a, blob, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         })) |ll| {
-            cache.access_token = ll.access_token;
             cache.refresh_token = ll.refresh_token;
-            cache.expires_at = ll.expires_at;
         } else |_| {}
     } else |_| {
         migrateLegacyWindows(a, cache);
@@ -666,11 +698,9 @@ fn saveLongLivedWindows(gpa: Allocator, cache: *const Cache) Error!void {
 }
 
 fn writeLongLivedJson(writer: *Io.Writer, cache: *const Cache) Error!void {
-    writer.writeAll("{\"access_token\":") catch return error.CacheFailure;
-    try writeJsonOptionalString(writer, cache.access_token);
-    writer.writeAll(",\"refresh_token\":") catch return error.CacheFailure;
+    writer.writeAll("{\"refresh_token\":") catch return error.CacheFailure;
     try writeJsonOptionalString(writer, cache.refresh_token);
-    writer.print(",\"expires_at\":{d}}}", .{cache.expires_at}) catch return error.CacheFailure;
+    writer.writeAll("}") catch return error.CacheFailure;
 }
 
 /// Write the non-secret session-token file. When `org`/`token` are non-null the
@@ -920,7 +950,7 @@ test "cache JSON round-trips the session token after the source buffer is freed"
     try std.testing.expectEqualStrings("refresh-xyz", parsed.value.refresh_token.?);
 }
 
-test "long-lived JSON round-trips and excludes session tokens" {
+test "long-lived JSON round-trips refresh token only and excludes session tokens" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -938,9 +968,10 @@ test "long-lived JSON round-trips and excludes session tokens" {
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     });
-    try std.testing.expectEqualStrings("access-abc", parsed.access_token.?);
+    // Only the refresh token is persisted to WCM; the access token is omitted
+    // so the blob stays under CRED_MAX_CREDENTIAL_BLOB_SIZE (issue #15 fix).
     try std.testing.expectEqualStrings("refresh-xyz", parsed.refresh_token.?);
-    try std.testing.expectEqual(@as(i64, 1_700_000_000), parsed.expires_at);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "access-abc") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "session") == null);
 }
 

@@ -2,7 +2,13 @@ name: Integration
 
 on:
   push:
+    branches: [main]
+    tags: ['*']
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   integration:
@@ -37,6 +43,29 @@ jobs:
           dbus-run-session -- bash -lc '
             set -euo pipefail
             eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
+
+            # Force the default Secret Service collection to be created and
+            # unlocked before the interop tests. gnome-keyring-daemon coming up
+            # does not by itself guarantee the "default" alias exists, which is
+            # what Python keyring writes through. Without this warm-up the
+            # interop test intermittently fails because the write lands in a
+            # location that subsequent reads from a separate process cannot
+            # find (issue #23). secret-tool ships with libsecret-tools and uses
+            # the same libsecret path Python keyring ends up on, so a successful
+            # round-trip here proves the environment is ready.
+            for i in $(seq 1 40); do
+              if printf "%s" warmup | secret-tool store --label=keyring-ci-warmup app keyring-ci 2>/dev/null \
+                 && [ "$(secret-tool lookup app keyring-ci 2>/dev/null)" = "warmup" ]; then
+                secret-tool clear app keyring-ci 2>/dev/null || true
+                break
+              fi
+              if [ "$i" = "40" ]; then
+                echo "Secret Service default collection not ready after warmup"
+                exit 1
+              fi
+              sleep 0.25
+            done
+
             bash tests/integration.sh
             bash tests/python_interop.sh
           '

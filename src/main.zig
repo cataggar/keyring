@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const keyring_zig = @import("keyring_zig");
 const ado = @import("ado.zig");
+const msal_cache = @import("msal_cache.zig");
 const color = @import("color.zig");
 const term = @import("term.zig");
 
@@ -335,6 +336,7 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
             else => try stdout.print("backend reachable: no ({s})\n", .{@errorName(err)}),
         }
     }
+    msal_cache.diagnose(arena, stdout) catch {};
     try stdout.flush();
 }
 

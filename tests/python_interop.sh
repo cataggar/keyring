@@ -55,8 +55,33 @@ trap cleanup EXIT
 # 1. Python writes, Zig reads
 SERVICE="$SERVICE" USER="$USER" SECRET="$SECRET" python3 - <<'PY'
 import os
+import sys
+import time
 import keyring
-keyring.set_password(os.environ["SERVICE"], os.environ["USER"], os.environ["SECRET"])
+
+service = os.environ["SERVICE"]
+user = os.environ["USER"]
+secret = os.environ["SECRET"]
+keyring.set_password(service, user, secret)
+
+# Self-readback. If Python cannot read what Python just wrote, the problem is
+# the Secret Service environment (e.g. default collection readiness, issue #23)
+# and not a schema mismatch with keyring-zig. Fail loudly here so the
+# subsequent zig-side failure message does not blame Zig for an env issue.
+got = None
+for _ in range(40):
+    got = keyring.get_password(service, user)
+    if got == secret:
+        break
+    time.sleep(0.25)
+else:
+    sys.stderr.write(
+        f"python self-readback failed for service={service} user={user}: "
+        f"got={got!r} expected={secret!r}. "
+        "Python keyring's SecretService backend could not read back what it "
+        "just wrote — the default collection is likely not ready.\n"
+    )
+    sys.exit(1)
 PY
 ZIG_GET_RC=1
 OUT=""

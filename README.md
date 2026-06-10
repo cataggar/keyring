@@ -44,6 +44,8 @@ Backends are `secret_service`, `keychain`, `win_credential`, `file`, `ado`, and 
 |---|---|
 | `KEYRING_BACKEND` | Override the backend: `secret_service`, `keychain`, `win_credential`, `file`, `ado`, or `null`. |
 | `ADO_KEYRING_NONINTERACTIVE` | When set to `true` or `1`, the `ado` backend fails instead of opening a browser if cached credentials are unavailable. |
+| `KEYRING_ADO_MSAL_CACHE` | When set to `false` or `0`, the `ado` backend will not read the shared MSAL token cache for `az login` SSO. Defaults to on. |
+| `ARTIFACTS_CREDENTIALPROVIDER_MSAL_FILECACHE_LOCATION` | Path to an additional MSAL cache file the `ado` backend should consult (parity with `artifacts-credprovider`). |
 | `KEYRING_PROPERTY_<NAME>` | Backend-specific properties, such as `KEYRING_PROPERTY_KEYCHAIN`, `KEYRING_PROPERTY_COLLECTION`, or `KEYRING_PROPERTY_APPID`. |
 | `NO_COLOR` | Disable ANSI colors in diagnostic output. |
 | `CLICOLOR_FORCE` | Force ANSI colors even when stdout is not a TTY. |
@@ -60,7 +62,11 @@ KEYRING_PROPERTY_COLLECTION=default keyring diagnose
 
 The compiled-in `ado` backend authenticates Azure DevOps package feed URLs using the browser OAuth2 + PKCE flow from [`ado-keyring`](https://github.com/cataggar/ado-keyring). It returns a `VssSessionToken` password for Azure Artifacts feed URLs on `dev.azure.com`, `*.pkgs.visualstudio.com`, `pkgs.codedev.ms`, and `pkgs.vsts.me`.
 
-Tokens are cached in `~/.ado-keyring/token-cache.json`. The backend is read-only: `get` authenticates or returns a cached token, `set` is unsupported, and `del` clears the token cache.
+Tokens are cached per platform. On Windows, the long-lived OAuth refresh token is stored in the **Windows Credential Manager** under the target `ado-keyring` (inspect with `cmdkey /list:ado-keyring`, remove with `cmdkey /delete:ado-keyring`), and short-lived per-org session tokens live in `~/.ado-keyring/session-cache.json`. On macOS and Linux all tokens are cached in `~/.ado-keyring/token-cache.json`. A pre-existing `token-cache.json` is migrated into the Credential Manager automatically on first run on Windows. The backend is read-only: `get` authenticates or returns a cached token, `set` is unsupported, and `del` clears the cached tokens.
+
+### SSO with `az login`
+
+On Windows, the `ado` backend can reuse a refresh token already issued to first-party Microsoft developer tools (Azure CLI, Visual Studio, git-credential-manager) via the shared MSAL token cache and the Family of Client IDs (FOCI) mechanism, so authenticating with `az login` lets `keyring` acquire Azure DevOps tokens without a separate browser prompt. It is read-only — the MSAL cache is never modified — and falls back to the browser flow when no usable token is found. On macOS and Linux only plaintext MSAL caches are readable. Disable with `KEYRING_ADO_MSAL_CACHE=false`. Run `keyring diagnose` to see which caches were found and whether a usable token is present.
 
 ## Using `keyring` on headless Linux
 

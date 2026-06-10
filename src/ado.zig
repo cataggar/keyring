@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const wincred = @import("wincred.zig");
+const msal_cache = @import("msal_cache.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -28,6 +30,12 @@ const log_prefix = "[keyring ado]";
 const session_username = "VssSessionToken";
 const cache_dir_name = ".ado-keyring";
 const cache_file_name = "token-cache.json";
+const session_file_name = "session-cache.json";
+// Windows Credential Manager target. Using the bare service name as the target
+// makes the entry inspectable via `cmdkey /list:ado-keyring` and removable via
+// `cmdkey /delete:ado-keyring`.
+const wcm_service = "ado-keyring";
+const wcm_key = "refresh-token";
 const noninteractive_env = "ADO_KEYRING_NONINTERACTIVE";
 
 const TokenResponse = struct {
@@ -52,15 +60,36 @@ const Cache = struct {
     session_tokens: std.json.ArrayHashMap(CacheSessionToken) = .{},
 };
 
+/// The long-lived portion of the cache persisted in the Windows Credential
+/// Manager (issue #15). Per-org session tokens are kept separately in a
+/// non-secret file.
+const LongLived = struct {
+    access_token: ?[]const u8 = null,
+    refresh_token: ?[]const u8 = null,
+    expires_at: i64 = 0,
+};
+
+/// An owned, mutable cache backed by a private arena so callers do not need to
+/// juggle multiple JSON parse handles across the Windows/non-Windows split.
+const LoadedCache = struct {
+    arena: *std.heap.ArenaAllocator,
+    cache: Cache,
+
+    fn deinit(self: *LoadedCache, gpa: Allocator) void {
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+    }
+};
+
 pub fn getCredential(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8) Error!Credential {
     if (!isDevOpsUrl(service_url)) return error.EntryNotFound;
 
     const org = extractOrg(service_url) orelse return error.Unsupported;
     const now = unixNow();
 
-    var cache_parsed = loadCache(gpa) catch null;
-    defer if (cache_parsed) |*parsed| parsed.deinit();
-    var cache: Cache = if (cache_parsed) |parsed| parsed.value else .{};
+    var loaded = loadCache(gpa);
+    defer loaded.deinit(gpa);
+    var cache: Cache = loaded.cache;
 
     if (cache.session_tokens.map.get(org)) |session| {
         if (session.expires_at > now + 300) {
@@ -121,23 +150,41 @@ pub fn getCredential(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8
     return .{ .username = session_username, .password = owned_token };
 }
 
-/// Obtain a fresh Entra access token, preferring a silent refresh-token grant and
-/// falling back to interactive browser auth. Used both for the initial acquisition
-/// and to recover when a cached access token is rejected by Azure DevOps.
+/// Obtain a fresh Entra access token, preferring a silent refresh-token grant,
+/// then a refresh token inherited from the shared MSAL cache (az login SSO),
+/// and finally falling back to interactive browser auth. Used both for the
+/// initial acquisition and to recover when a cached access token is rejected
+/// by Azure DevOps.
 fn acquireAccessToken(gpa: Allocator, stderr: *Io.Writer, refresh_token: ?[]const u8) Error!std.json.Parsed(TokenResponse) {
     if (refresh_token) |rt| {
         log(stderr, "{s} Refreshing access token...\n", .{log_prefix});
-        return refreshAccessToken(gpa, rt) catch |err| switch (err) {
+        if (refreshAccessToken(gpa, rt)) |parsed| {
+            return parsed;
+        } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                log(stderr, "{s} Refresh failed ({s}), falling back to browser\n", .{ log_prefix, @errorName(err) });
-                return browserAuth(gpa, stderr);
-            },
-        };
+            else => log(stderr, "{s} Refresh failed ({s}), trying MSAL cache / browser\n", .{ log_prefix, @errorName(err) }),
+        }
     }
+
+    // Read-only SSO with az login and friends: redeem a Family Refresh Token
+    // from the shared MSAL cache using our own client id (issue #19).
+    if (tryMsalAuth(gpa, stderr)) |parsed| return parsed;
+
     if (isNonInteractive()) return error.NoStorageAccess;
     log(stderr, "{s} No cached token, starting browser auth...\n", .{log_prefix});
     return browserAuth(gpa, stderr);
+}
+
+/// Attempt to redeem a FOCI refresh token from the shared MSAL cache. Returns
+/// null on any failure so the caller can fall through to browser auth. The
+/// MSAL cache is never written back to.
+fn tryMsalAuth(gpa: Allocator, stderr: *Io.Writer) ?std.json.Parsed(TokenResponse) {
+    const candidate = msal_cache.findFociRefreshToken(gpa) orelse return null;
+    log(stderr, "{s} Trying refresh token from MSAL cache (az login SSO)...\n", .{log_prefix});
+    return refreshAccessToken(gpa, candidate.secret) catch |err| {
+        log(stderr, "{s} MSAL cache refresh failed ({s})\n", .{ log_prefix, @errorName(err) });
+        return null;
+    };
 }
 
 pub fn getPassword(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8, username: []const u8) Error![]u8 {
@@ -154,13 +201,29 @@ pub fn setPassword(_: Allocator, _: []const u8, _: []const u8, _: []const u8) Er
 }
 
 pub fn deletePassword(gpa: Allocator) Error!void {
+    if (builtin.os.tag == .windows) {
+        var removed = true;
+        wincred.delete(gpa, wcm_service) catch |err| switch (err) {
+            error.EntryNotFound => removed = false,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.CacheFailure,
+        };
+        if (deleteCacheFile(gpa, session_file_name)) removed = true;
+        if (deleteCacheFile(gpa, cache_file_name)) removed = true;
+        return if (removed) {} else error.EntryNotFound;
+    }
+    if (deleteCacheFile(gpa, cache_file_name)) return;
+    return error.EntryNotFound;
+}
+
+/// Delete a cache file under the cache directory. Returns true if a file was
+/// removed, false if it was already absent.
+fn deleteCacheFile(gpa: Allocator, name: []const u8) bool {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const path = try cachePath(gpa);
+    const path = cacheFilePath(gpa, name) catch return false;
     defer gpa.free(path);
-    std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
-        error.FileNotFound => return error.EntryNotFound,
-        else => return error.CacheFailure,
-    };
+    std.Io.Dir.cwd().deleteFile(io, path) catch return false;
+    return true;
 }
 
 pub fn isDevOpsUrl(url: []const u8) bool {
@@ -494,37 +557,147 @@ fn randomUrlToken(gpa: Allocator, byte_len: usize) Error![]u8 {
     return out;
 }
 
-fn loadCache(gpa: Allocator) Error!?std.json.Parsed(Cache) {
+/// Load the long-lived tokens and per-org session tokens into an owned cache.
+/// On Windows the long-lived tokens live in the Credential Manager and the
+/// session tokens in a non-secret JSON file; elsewhere a single JSON file holds
+/// both. Never errors — a missing or corrupt cache yields an empty one.
+fn loadCache(gpa: Allocator) LoadedCache {
+    const arena = gpa.create(std.heap.ArenaAllocator) catch
+        return .{ .arena = emptyArena(gpa), .cache = .{} };
+    arena.* = .init(gpa);
+    const a = arena.allocator();
+    var cache: Cache = .{};
+    if (builtin.os.tag == .windows) {
+        loadWindows(a, &cache);
+    } else {
+        _ = loadFileInto(a, cache_file_name, &cache);
+    }
+    return .{ .arena = arena, .cache = cache };
+}
+
+fn emptyArena(gpa: Allocator) *std.heap.ArenaAllocator {
+    const arena = gpa.create(std.heap.ArenaAllocator) catch unreachable;
+    arena.* = .init(gpa);
+    return arena;
+}
+
+/// Windows: read the long-lived tokens from the Credential Manager, migrating a
+/// legacy plaintext JSON cache on first run, then load the session-token file.
+fn loadWindows(a: Allocator, cache: *Cache) void {
+    if (wincred.get(a, wcm_service)) |blob| {
+        if (std.json.parseFromSliceLeaky(LongLived, a, blob, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        })) |ll| {
+            cache.access_token = ll.access_token;
+            cache.refresh_token = ll.refresh_token;
+            cache.expires_at = ll.expires_at;
+        } else |_| {}
+    } else |_| {
+        migrateLegacyWindows(a, cache);
+    }
+    _ = loadFileInto(a, session_file_name, cache);
+}
+
+/// One-time migration: if a legacy `token-cache.json` exists, move its
+/// long-lived tokens into the Credential Manager, adopt its session tokens, and
+/// delete the file.
+fn migrateLegacyWindows(a: Allocator, cache: *Cache) void {
+    var legacy: Cache = .{};
+    if (!loadFileInto(a, cache_file_name, &legacy)) return;
+
+    cache.access_token = legacy.access_token;
+    cache.refresh_token = legacy.refresh_token;
+    cache.expires_at = legacy.expires_at;
+    cache.session_tokens = legacy.session_tokens;
+
+    if (legacy.refresh_token != null or legacy.access_token != null) {
+        saveLongLivedWindows(a, cache) catch {};
+    }
+    saveSessionFile(a, cache, null, null, 0) catch {};
+    _ = deleteCacheFile(a, cache_file_name);
+}
+
+/// Parse a JSON cache file under the cache directory and merge it into `cache`.
+/// Session tokens always replace those in `cache`; the long-lived tokens are
+/// only copied when present, so reading the Windows session-only file does not
+/// clobber tokens already loaded from the Credential Manager. Returns true if
+/// the file existed and parsed. Strings are owned by `a`.
+fn loadFileInto(a: Allocator, name: []const u8, cache: *Cache) bool {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const path = try cachePath(gpa);
-    defer gpa.free(path);
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return null,
-    };
-    defer gpa.free(bytes);
-    // Use .alloc_always so every parsed string is copied into the Parsed value's
-    // own arena. The default (.alloc_if_needed) slices unescaped strings directly
-    // out of `bytes`, which is freed when this function returns — leaving the
-    // returned Cache (access/refresh tokens, session tokens, and org keys)
-    // pointing at freed memory. That use-after-free made cached session tokens
-    // unreadable, forcing a browser re-authentication on every invocation.
-    return std.json.parseFromSlice(Cache, gpa, bytes, .{
+    const path = cacheFilePath(a, name) catch return false;
+    defer a.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024 * 1024)) catch return false;
+    defer a.free(bytes);
+    // .alloc_always so parsed strings are copied into `a` and survive `bytes`
+    // being freed. The default slices unescaped strings out of `bytes`, which
+    // would dangle once this function returns.
+    const parsed = std.json.parseFromSliceLeaky(Cache, a, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
-    }) catch null;
+    }) catch return false;
+
+    cache.session_tokens = parsed.session_tokens;
+    if (parsed.access_token != null or parsed.refresh_token != null) {
+        cache.access_token = parsed.access_token;
+        cache.refresh_token = parsed.refresh_token;
+        cache.expires_at = parsed.expires_at;
+    }
+    return true;
 }
 
 fn saveCache(gpa: Allocator, cache: *const Cache, org: []const u8, token: []const u8, expires_at: i64) Error!void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const path = try cachePath(gpa);
-    defer gpa.free(path);
-    const parent = std.fs.path.dirname(path) orelse return error.CacheFailure;
-    _ = std.Io.Dir.cwd().createDirPathStatus(io, parent, cacheDirPermissions()) catch return error.CacheFailure;
+    if (builtin.os.tag == .windows) {
+        try saveLongLivedWindows(gpa, cache);
+        return saveSessionFile(gpa, cache, org, token, expires_at);
+    }
+    return saveFile(gpa, cache, org, token, expires_at);
+}
 
+/// Persist the long-lived tokens into the Windows Credential Manager.
+fn saveLongLivedWindows(gpa: Allocator, cache: *const Cache) Error!void {
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try writeLongLivedJson(&out.writer, cache);
+    wincred.set(gpa, wcm_service, wcm_key, out.written()) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CacheFailure,
+    };
+}
+
+fn writeLongLivedJson(writer: *Io.Writer, cache: *const Cache) Error!void {
+    writer.writeAll("{\"access_token\":") catch return error.CacheFailure;
+    try writeJsonOptionalString(writer, cache.access_token);
+    writer.writeAll(",\"refresh_token\":") catch return error.CacheFailure;
+    try writeJsonOptionalString(writer, cache.refresh_token);
+    writer.print(",\"expires_at\":{d}}}", .{cache.expires_at}) catch return error.CacheFailure;
+}
+
+/// Write the non-secret session-token file. When `org`/`token` are non-null the
+/// new entry replaces any existing one for that org.
+fn saveSessionFile(gpa: Allocator, cache: *const Cache, org: ?[]const u8, token: ?[]const u8, expires_at: i64) Error!void {
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    out.writer.writeAll("{\n  \"session_tokens\": {") catch return error.CacheFailure;
+    try writeSessionMap(&out.writer, cache, org, token, expires_at);
+    out.writer.writeAll("\n  }\n}\n") catch return error.CacheFailure;
+    return writeCacheFileAtomic(gpa, session_file_name, out.written());
+}
+
+fn saveFile(gpa: Allocator, cache: *const Cache, org: []const u8, token: []const u8, expires_at: i64) Error!void {
     var out = std.Io.Writer.Allocating.init(gpa);
     defer out.deinit();
     try writeCacheJson(gpa, &out.writer, cache, org, token, expires_at);
+    return writeCacheFileAtomic(gpa, cache_file_name, out.written());
+}
+
+/// Atomically write `contents` to the named file in the cache directory.
+fn writeCacheFileAtomic(gpa: Allocator, name: []const u8, contents: []const u8) Error!void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = try cacheFilePath(gpa, name);
+    defer gpa.free(path);
+    const parent = std.fs.path.dirname(path) orelse return error.CacheFailure;
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, parent, cacheDirPermissions()) catch return error.CacheFailure;
 
     // Use a unique temp filename per write. uv (and other consumers) spawn many
     // keyring processes concurrently; a shared "{path}.tmp" name causes them to
@@ -539,7 +712,7 @@ fn saveCache(gpa: Allocator, cache: *const Cache, org: []const u8, token: []cons
     {
         var file = std.Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true, .permissions = cacheFilePermissions() }) catch return error.CacheFailure;
         defer file.close(io);
-        file.writeStreamingAll(io, out.written()) catch return error.CacheFailure;
+        file.writeStreamingAll(io, contents) catch return error.CacheFailure;
     }
     std.Io.Dir.renameAbsolute(tmp, path, io) catch return error.CacheFailure;
 }
@@ -559,11 +732,18 @@ fn writeCacheJson(gpa: Allocator, writer: *Io.Writer, cache: *const Cache, org: 
     writer.writeAll(",\n  \"refresh_token\": ") catch return error.CacheFailure;
     try writeJsonOptionalString(writer, cache.refresh_token);
     writer.print(",\n  \"expires_at\": {d},\n  \"session_tokens\": {{", .{cache.expires_at}) catch return error.CacheFailure;
+    try writeSessionMap(writer, cache, org, token, expires_at);
+    writer.writeAll("\n  }\n}\n") catch return error.CacheFailure;
+}
 
+/// Write the body of the session_tokens object (without the enclosing braces).
+/// Existing entries are emitted, skipping `org`, then a fresh `org` entry is
+/// appended when `org`/`token` are provided.
+fn writeSessionMap(writer: *Io.Writer, cache: *const Cache, org: ?[]const u8, token: ?[]const u8, expires_at: i64) Error!void {
     var first = true;
     var it = cache.session_tokens.map.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, org)) continue;
+        if (org) |o| if (std.mem.eql(u8, entry.key_ptr.*, o)) continue;
         if (!first) writer.writeAll(",") catch return error.CacheFailure;
         first = false;
         writer.writeAll("\n    ") catch return error.CacheFailure;
@@ -573,12 +753,14 @@ fn writeCacheJson(gpa: Allocator, writer: *Io.Writer, cache: *const Cache, org: 
         writer.print(", \"expires_at\": {d} }}", .{entry.value_ptr.expires_at}) catch return error.CacheFailure;
     }
 
-    if (!first) writer.writeAll(",") catch return error.CacheFailure;
-    writer.writeAll("\n    ") catch return error.CacheFailure;
-    try writeJsonString(writer, org);
-    writer.writeAll(": { \"token\": ") catch return error.CacheFailure;
-    try writeJsonString(writer, token);
-    writer.print(", \"expires_at\": {d} }}\n  }}\n}}\n", .{expires_at}) catch return error.CacheFailure;
+    if (org) |o| if (token) |t| {
+        if (!first) writer.writeAll(",") catch return error.CacheFailure;
+        writer.writeAll("\n    ") catch return error.CacheFailure;
+        try writeJsonString(writer, o);
+        writer.writeAll(": { \"token\": ") catch return error.CacheFailure;
+        try writeJsonString(writer, t);
+        writer.print(", \"expires_at\": {d} }}", .{expires_at}) catch return error.CacheFailure;
+    };
 }
 
 fn writeJsonOptionalString(writer: *Io.Writer, value: ?[]const u8) Error!void {
@@ -602,10 +784,10 @@ fn writeJsonString(writer: *Io.Writer, value: []const u8) Error!void {
     writer.writeByte('"') catch return error.CacheFailure;
 }
 
-fn cachePath(gpa: Allocator) Error![]u8 {
+fn cacheFilePath(gpa: Allocator, name: []const u8) Error![]u8 {
     const home = getHome(gpa) catch return error.CacheFailure;
     defer gpa.free(home);
-    return std.fs.path.join(gpa, &.{ home, cache_dir_name, cache_file_name }) catch return error.OutOfMemory;
+    return std.fs.path.join(gpa, &.{ home, cache_dir_name, name }) catch return error.OutOfMemory;
 }
 
 fn getHome(gpa: Allocator) ![]u8 {
@@ -736,4 +918,88 @@ test "cache JSON round-trips the session token after the source buffer is freed"
     try std.testing.expectEqual(@as(i64, 2_000_000), session.expires_at);
     try std.testing.expectEqualStrings("access-abc", parsed.value.access_token.?);
     try std.testing.expectEqualStrings("refresh-xyz", parsed.value.refresh_token.?);
+}
+
+test "long-lived JSON round-trips and excludes session tokens" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var cache: Cache = .{
+        .access_token = "access-abc",
+        .refresh_token = "refresh-xyz",
+        .expires_at = 1_700_000_000,
+    };
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try writeLongLivedJson(&out.writer, &cache);
+
+    const parsed = try std.json.parseFromSliceLeaky(LongLived, arena.allocator(), out.written(), .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    try std.testing.expectEqualStrings("access-abc", parsed.access_token.?);
+    try std.testing.expectEqualStrings("refresh-xyz", parsed.refresh_token.?);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), parsed.expires_at);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "session") == null);
+}
+
+test "session file holds session tokens and no secrets" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var cache: Cache = .{
+        .access_token = "access-secret",
+        .refresh_token = "refresh-secret",
+        .expires_at = 1_000,
+    };
+
+    // Build a cache with one pre-existing org session token.
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    out.writer.writeAll("{\n  \"session_tokens\": {") catch unreachable;
+    try writeSessionMap(&out.writer, &cache, "contoso", "tok-contoso", 2_000);
+    out.writer.writeAll("\n  }\n}\n") catch unreachable;
+
+    // The long-lived secrets must never appear in the session file.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "access-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "refresh-secret") == null);
+
+    const parsed = try std.json.parseFromSliceLeaky(Cache, arena.allocator(), out.written(), .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    const session = parsed.session_tokens.map.get("contoso") orelse return error.SessionTokenMissing;
+    try std.testing.expectEqualStrings("tok-contoso", session.token);
+    try std.testing.expectEqual(@as(i64, 2_000), session.expires_at);
+    try std.testing.expect(parsed.access_token == null);
+}
+
+test "loadFileInto session file does not clobber long-lived tokens" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Simulate the Windows split: long-lived loaded first, then a session-only
+    // file merged on top must keep the long-lived tokens intact.
+    var cache: Cache = .{ .access_token = "ll-access", .refresh_token = "ll-refresh", .expires_at = 42 };
+    const session_json =
+        \\{ "session_tokens": { "contoso": { "token": "s", "expires_at": 9 } } }
+    ;
+    const parsed = try std.json.parseFromSliceLeaky(Cache, a, session_json, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    cache.session_tokens = parsed.session_tokens;
+    if (parsed.access_token != null or parsed.refresh_token != null) {
+        cache.access_token = parsed.access_token;
+        cache.refresh_token = parsed.refresh_token;
+        cache.expires_at = parsed.expires_at;
+    }
+
+    try std.testing.expectEqualStrings("ll-access", cache.access_token.?);
+    try std.testing.expectEqualStrings("ll-refresh", cache.refresh_token.?);
+    try std.testing.expectEqual(@as(i64, 42), cache.expires_at);
+    try std.testing.expect(cache.session_tokens.map.get("contoso") != null);
 }

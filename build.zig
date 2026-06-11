@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("keyring_zig", keyring_zig_module);
     exe.root_module.addImport("app_build_options", build_options_module);
+    linkPlatformDeps(exe.root_module, target.result.os.tag);
 
     b.installArtifact(exe);
 
@@ -43,8 +44,20 @@ pub fn build(b: *std.Build) void {
     });
     unit_tests.root_module.addImport("keyring_zig", keyring_zig_module);
     unit_tests.root_module.addImport("app_build_options", build_options_module);
+    linkPlatformDeps(unit_tests.root_module, target.result.os.tag);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+}
+
+/// Link the OS frameworks/libraries that `src/keychain.zig` (macOS Keychain via
+/// Security.framework) needs into the final binary. These are also pulled in
+/// transitively by `keyring_zig`, but the ADO backend references the Security /
+/// CoreFoundation symbols directly, so link them explicitly.
+fn linkPlatformDeps(module: *std.Build.Module, os_tag: std.Target.Os.Tag) void {
+    if (os_tag == .macos) {
+        module.linkFramework("Security", .{});
+        module.linkFramework("CoreFoundation", .{});
+    }
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const wincred = @import("wincred.zig");
+const keychain = @import("keychain.zig");
 const msal_cache = @import("msal_cache.zig");
 
 const Allocator = std.mem.Allocator;
@@ -206,6 +207,18 @@ pub fn deletePassword(gpa: Allocator) Error!void {
         var removed = true;
         wincred.delete(gpa, wcm_service) catch |err| switch (err) {
             error.EntryNotFound => removed = false,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.CacheFailure,
+        };
+        if (deleteCacheFile(gpa, session_file_name)) removed = true;
+        if (deleteCacheFile(gpa, cache_file_name)) removed = true;
+        return if (removed) {} else error.EntryNotFound;
+    }
+    if (builtin.os.tag == .macos) {
+        var removed = true;
+        keychain.delete(wcm_service, wcm_key) catch |err| switch (err) {
+            error.EntryNotFound => removed = false,
+            error.NoStorageAccess => return error.NoStorageAccess,
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.CacheFailure,
         };
@@ -601,6 +614,8 @@ fn loadCache(gpa: Allocator) LoadedCache {
     var cache: Cache = .{};
     if (builtin.os.tag == .windows) {
         loadWindows(a, &cache);
+    } else if (builtin.os.tag == .macos) {
+        loadMacos(a, &cache);
     } else {
         _ = loadFileInto(a, cache_file_name, &cache);
     }
@@ -650,6 +665,42 @@ fn migrateLegacyWindows(a: Allocator, cache: *Cache) void {
     _ = deleteCacheFile(a, cache_file_name);
 }
 
+/// macOS: read the long-lived refresh token from the Keychain, migrating a legacy
+/// plaintext JSON cache on first run, then load the session-token file. The
+/// access token is intentionally not persisted (see `LongLived`); it stays in
+/// memory for the lifetime of this process.
+fn loadMacos(a: Allocator, cache: *Cache) void {
+    if (keychain.get(a, wcm_service, wcm_key)) |blob| {
+        if (std.json.parseFromSliceLeaky(LongLived, a, blob, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        })) |ll| {
+            cache.refresh_token = ll.refresh_token;
+        } else |_| {}
+    } else |_| {
+        migrateLegacyMacos(a, cache);
+    }
+    _ = loadFileInto(a, session_file_name, cache);
+}
+
+/// One-time migration: if a legacy `token-cache.json` exists, move its long-lived
+/// tokens into the Keychain, adopt its session tokens, and delete the file.
+fn migrateLegacyMacos(a: Allocator, cache: *Cache) void {
+    var legacy: Cache = .{};
+    if (!loadFileInto(a, cache_file_name, &legacy)) return;
+
+    cache.access_token = legacy.access_token;
+    cache.refresh_token = legacy.refresh_token;
+    cache.expires_at = legacy.expires_at;
+    cache.session_tokens = legacy.session_tokens;
+
+    if (legacy.refresh_token != null or legacy.access_token != null) {
+        saveLongLivedMacos(a, cache) catch {};
+    }
+    saveSessionFile(a, cache, null, null, 0) catch {};
+    _ = deleteCacheFile(a, cache_file_name);
+}
+
 /// Parse a JSON cache file under the cache directory and merge it into `cache`.
 /// Session tokens always replace those in `cache`; the long-lived tokens are
 /// only copied when present, so reading the Windows session-only file does not
@@ -683,6 +734,10 @@ fn saveCache(gpa: Allocator, cache: *const Cache, org: []const u8, token: []cons
         try saveLongLivedWindows(gpa, cache);
         return saveSessionFile(gpa, cache, org, token, expires_at);
     }
+    if (builtin.os.tag == .macos) {
+        try saveLongLivedMacos(gpa, cache);
+        return saveSessionFile(gpa, cache, org, token, expires_at);
+    }
     return saveFile(gpa, cache, org, token, expires_at);
 }
 
@@ -692,6 +747,18 @@ fn saveLongLivedWindows(gpa: Allocator, cache: *const Cache) Error!void {
     defer out.deinit();
     try writeLongLivedJson(&out.writer, cache);
     wincred.set(gpa, wcm_service, wcm_key, out.written()) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CacheFailure,
+    };
+}
+
+/// Persist the long-lived tokens into the macOS Keychain.
+fn saveLongLivedMacos(gpa: Allocator, cache: *const Cache) Error!void {
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try writeLongLivedJson(&out.writer, cache);
+    keychain.set(wcm_service, wcm_key, out.written()) catch |err| switch (err) {
+        error.NoStorageAccess => return error.NoStorageAccess,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.CacheFailure,
     };

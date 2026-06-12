@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const wincred = @import("wincred.zig");
 const keychain = @import("keychain.zig");
 const msal_cache = @import("msal_cache.zig");
+const dpapi = @import("dpapi.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -29,15 +30,33 @@ const auth_url = "https://login.microsoftonline.com/organizations/oauth2/v2.0/au
 const token_url = "https://login.microsoftonline.com/organizations/oauth2/v2.0/token";
 const log_prefix = "[keyring ado]";
 const session_username = "VssSessionToken";
+// Legacy cleartext cache (issue #14). Read only for one-time migration into the
+// user-protected `refresh.dat`/`session.dat` layout (issue #18) and then deleted.
 const cache_dir_name = ".ado-keyring";
 const cache_file_name = "token-cache.json";
 const session_file_name = "session-cache.json";
+// User-protected cache (issue #18), under `${cache_root}/keyring/`. See
+// `cacheRoot` for how `cache_root` resolves per platform.
+//   refresh.dat — OAuth refresh/access token + expiry (Linux only; on Windows /
+//                 macOS the refresh token lives in the platform secret store).
+//   session.dat — per-org session tokens; DPAPI-encrypted on Windows, 0600 on Unix.
+//   .lock       — empty file held with an exclusive OS lock around each
+//                 read-modify-write so concurrent writers do not lose updates.
+const keyring_subdir = "keyring";
+const refresh_dat_name = "refresh.dat";
+const session_dat_name = "session.dat";
+const lock_file_name = ".lock";
 // Windows Credential Manager target. Using the bare service name as the target
 // makes the entry inspectable via `cmdkey /list:ado-keyring` and removable via
 // `cmdkey /delete:ado-keyring`.
 const wcm_service = "ado-keyring";
 const wcm_key = "refresh-token";
 const noninteractive_env = "ADO_KEYRING_NONINTERACTIVE";
+// Opt-out (mirrors artifacts-credprovider's
+// ARTIFACTS_CREDENTIALPROVIDER_SESSIONTOKENCACHE_ENABLED): when set to a falsey
+// value the backend keeps no persistent cache at all — neither the platform
+// secret store nor the `.dat` files — so every process re-authenticates.
+const disk_cache_env = "KEYRING_ADO_DISK_CACHE";
 
 const TokenResponse = struct {
     access_token: []const u8,
@@ -62,13 +81,28 @@ const Cache = struct {
 };
 
 /// The long-lived portion of the cache persisted in the Windows Credential
-/// Manager (issue #15). Only the OAuth refresh token is stored: the matching
-/// access token is short-lived (~1 hour) and trivially re-derived from the
-/// refresh token, and including it pushes the credential blob past
-/// `CRED_MAX_CREDENTIAL_BLOB_SIZE` (5*512 bytes), making `CredWriteW` fail.
-/// Per-org session tokens are kept separately in a non-secret file.
+/// Manager (issue #15) / macOS Keychain (issue #16). Only the OAuth refresh
+/// token is stored: the matching access token is short-lived (~1 hour) and
+/// trivially re-derived from the refresh token, and including it pushes the
+/// credential blob past `CRED_MAX_CREDENTIAL_BLOB_SIZE` (5*512 bytes), making
+/// `CredWriteW` fail. Per-org session tokens are kept separately in `session.dat`.
 const LongLived = struct {
     refresh_token: ?[]const u8 = null,
+};
+
+/// The long-lived cache persisted in `refresh.dat` on Linux (issue #18). Unlike
+/// the secret-store blob, the access token is included so a fresh process can
+/// reuse a still-valid one without a refresh round-trip. The file is mode 0600.
+const RefreshCache = struct {
+    access_token: ?[]const u8 = null,
+    refresh_token: ?[]const u8 = null,
+    expires_at: i64 = 0,
+};
+
+/// The per-org session tokens persisted in `session.dat` on all platforms
+/// (issue #18). DPAPI-encrypted on Windows, mode 0600 on Unix.
+const SessionCache = struct {
+    session_tokens: std.json.ArrayHashMap(CacheSessionToken) = .{},
 };
 
 /// An owned, mutable cache backed by a private arena so callers do not need to
@@ -203,38 +237,56 @@ pub fn setPassword(_: Allocator, _: []const u8, _: []const u8, _: []const u8) Er
 }
 
 pub fn deletePassword(gpa: Allocator) Error!void {
+    var removed = false;
     if (builtin.os.tag == .windows) {
-        var removed = true;
-        wincred.delete(gpa, wcm_service) catch |err| switch (err) {
-            error.EntryNotFound => removed = false,
+        if (wincred.delete(gpa, wcm_service)) {
+            removed = true;
+        } else |err| switch (err) {
+            error.EntryNotFound => {},
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.CacheFailure,
-        };
-        if (deleteCacheFile(gpa, session_file_name)) removed = true;
-        if (deleteCacheFile(gpa, cache_file_name)) removed = true;
-        return if (removed) {} else error.EntryNotFound;
-    }
-    if (builtin.os.tag == .macos) {
-        var removed = true;
-        keychain.delete(wcm_service, wcm_key) catch |err| switch (err) {
-            error.EntryNotFound => removed = false,
+        }
+    } else if (builtin.os.tag == .macos) {
+        if (keychain.delete(wcm_service, wcm_key)) {
+            removed = true;
+        } else |err| switch (err) {
+            error.EntryNotFound => {},
             error.NoStorageAccess => return error.NoStorageAccess,
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.CacheFailure,
-        };
-        if (deleteCacheFile(gpa, session_file_name)) removed = true;
-        if (deleteCacheFile(gpa, cache_file_name)) removed = true;
-        return if (removed) {} else error.EntryNotFound;
+        }
     }
-    if (deleteCacheFile(gpa, cache_file_name)) return;
-    return error.EntryNotFound;
+    if (deleteAllCacheFiles(gpa)) removed = true;
+    return if (removed) {} else error.EntryNotFound;
 }
 
-/// Delete a cache file under the cache directory. Returns true if a file was
-/// removed, false if it was already absent.
-fn deleteCacheFile(gpa: Allocator, name: []const u8) bool {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const path = cacheFilePath(gpa, name) catch return false;
+/// Remove every cache file we may have written: the user-protected `.dat` files
+/// plus any legacy cleartext files left from before issue #18. Returns true if
+/// at least one file was removed.
+fn deleteAllCacheFiles(gpa: Allocator) bool {
+    var removed = false;
+    if (deleteDatFile(gpa, session_dat_name)) removed = true;
+    if (deleteDatFile(gpa, refresh_dat_name)) removed = true;
+    if (deleteLegacyFile(gpa, session_file_name)) removed = true;
+    if (deleteLegacyFile(gpa, cache_file_name)) removed = true;
+    return removed;
+}
+
+/// Delete a `.dat` file under the keyring cache directory. Returns true if a
+/// file was removed, false if it was already absent.
+fn deleteDatFile(gpa: Allocator, name: []const u8) bool {
+    const io = ioGlobal();
+    const path = datFilePath(gpa, name) catch return false;
+    defer gpa.free(path);
+    std.Io.Dir.cwd().deleteFile(io, path) catch return false;
+    return true;
+}
+
+/// Delete a legacy cleartext file under `~/.ado-keyring/`. Returns true if a
+/// file was removed, false if it was already absent.
+fn deleteLegacyFile(gpa: Allocator, name: []const u8) bool {
+    const io = ioGlobal();
+    const path = legacyFilePath(gpa, name) catch return false;
     defer gpa.free(path);
     std.Io.Dir.cwd().deleteFile(io, path) catch return false;
     return true;
@@ -602,23 +654,42 @@ fn randomUrlToken(gpa: Allocator, byte_len: usize) Error![]u8 {
     return out;
 }
 
+fn ioGlobal() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// Whether the persistent cache is disabled via `KEYRING_ADO_DISK_CACHE`. When
+/// disabled the backend keeps nothing on disk or in the secret store, so each
+/// process re-authenticates from scratch.
+fn diskCacheDisabled() bool {
+    const value = getEnvVarOwned(std.heap.page_allocator, disk_cache_env) orelse return false;
+    defer std.heap.page_allocator.free(value);
+    return std.ascii.eqlIgnoreCase(value, "false") or
+        std.mem.eql(u8, value, "0") or
+        std.ascii.eqlIgnoreCase(value, "no");
+}
+
 /// Load the long-lived tokens and per-org session tokens into an owned cache.
-/// On Windows the long-lived tokens live in the Credential Manager and the
-/// session tokens in a non-secret JSON file; elsewhere a single JSON file holds
-/// both. Never errors — a missing or corrupt cache yields an empty one.
+/// The refresh token lives in the platform secret store on Windows (issue #15)
+/// and macOS (issue #16) and in `refresh.dat` on Linux; per-org session tokens
+/// always live in `session.dat`. Never errors — a missing, corrupt, or disabled
+/// cache yields an empty one.
 fn loadCache(gpa: Allocator) LoadedCache {
     const arena = gpa.create(std.heap.ArenaAllocator) catch
         return .{ .arena = emptyArena(gpa), .cache = .{} };
     arena.* = .init(gpa);
     const a = arena.allocator();
     var cache: Cache = .{};
-    if (builtin.os.tag == .windows) {
-        loadWindows(a, &cache);
-    } else if (builtin.os.tag == .macos) {
-        loadMacos(a, &cache);
-    } else {
-        _ = loadFileInto(a, cache_file_name, &cache);
+    if (diskCacheDisabled()) return .{ .arena = arena, .cache = cache };
+
+    migrateLegacyIfNeeded(a, &cache);
+
+    switch (builtin.os.tag) {
+        .windows => loadRefreshSecretStore(a, &cache, .windows),
+        .macos => loadRefreshSecretStore(a, &cache, .macos),
+        else => loadRefreshDat(a, &cache),
     }
+    loadSessionDat(a, &cache);
     return .{ .arena = arena, .cache = cache };
 }
 
@@ -628,87 +699,115 @@ fn emptyArena(gpa: Allocator) *std.heap.ArenaAllocator {
     return arena;
 }
 
-/// Windows: read the long-lived refresh token from the Credential Manager,
-/// migrating a legacy plaintext JSON cache on first run, then load the
-/// session-token file. The access token is intentionally not persisted (see
-/// `LongLived`); it stays in memory for the lifetime of this process.
-fn loadWindows(a: Allocator, cache: *Cache) void {
-    if (wincred.get(a, wcm_service)) |blob| {
-        if (std.json.parseFromSliceLeaky(LongLived, a, blob, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        })) |ll| {
-            cache.refresh_token = ll.refresh_token;
-        } else |_| {}
-    } else |_| {
-        migrateLegacyWindows(a, cache);
-    }
-    _ = loadFileInto(a, session_file_name, cache);
+/// Read the refresh token from the platform secret store (Windows Credential
+/// Manager / macOS Keychain). The access token is intentionally not persisted
+/// there (see `LongLived`); it stays in memory for the lifetime of this process.
+fn loadRefreshSecretStore(a: Allocator, cache: *Cache, comptime os: std.Target.Os.Tag) void {
+    const blob = switch (os) {
+        .windows => wincred.get(a, wcm_service) catch return,
+        .macos => keychain.get(a, wcm_service, wcm_key) catch return,
+        else => return,
+    };
+    if (std.json.parseFromSliceLeaky(LongLived, a, blob, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    })) |ll| {
+        cache.refresh_token = ll.refresh_token;
+    } else |_| {}
 }
 
-/// One-time migration: if a legacy `token-cache.json` exists, move its
-/// long-lived tokens into the Credential Manager, adopt its session tokens, and
-/// delete the file.
-fn migrateLegacyWindows(a: Allocator, cache: *Cache) void {
-    var legacy: Cache = .{};
-    if (!loadFileInto(a, cache_file_name, &legacy)) return;
+/// Read `refresh.dat` (Linux) into `cache`. A missing or corrupt file leaves the
+/// cache empty so the caller re-authenticates instead of crashing.
+fn loadRefreshDat(a: Allocator, cache: *Cache) void {
+    const json = readDatFile(a, refresh_dat_name) orelse return;
+    defer a.free(json);
+    const parsed = std.json.parseFromSliceLeaky(RefreshCache, a, json, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return;
+    cache.access_token = parsed.access_token;
+    cache.refresh_token = parsed.refresh_token;
+    cache.expires_at = parsed.expires_at;
+}
 
+/// Read `session.dat` (all platforms) into `cache.session_tokens`. A missing or
+/// corrupt file leaves the session map empty.
+fn loadSessionDat(a: Allocator, cache: *Cache) void {
+    const json = readDatFile(a, session_dat_name) orelse return;
+    defer a.free(json);
+    const parsed = std.json.parseFromSliceLeaky(SessionCache, a, json, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return;
+    cache.session_tokens = parsed.session_tokens;
+}
+
+/// Read and unprotect a `.dat` file, returning its plaintext JSON bytes owned by
+/// `a`, or null if the file is absent or fails to decrypt (a corrupt cache,
+/// which the caller treats as empty and rewrites from scratch).
+fn readDatFile(a: Allocator, name: []const u8) ?[]u8 {
+    const io = ioGlobal();
+    const path = datFilePath(a, name) catch return null;
+    defer a.free(path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024 * 1024)) catch return null;
+    defer a.free(raw);
+    return unprotectBytes(a, raw);
+}
+
+/// One-time migration from the legacy cleartext layout (issue #14) to the
+/// user-protected `.dat` files (issue #18). Runs only when `session.dat` does
+/// not yet exist; once a successful migration creates it, this is a no-op
+/// forever. The legacy refresh token is moved to the secret store
+/// (Windows/macOS) or `refresh.dat` (Linux) and the legacy session tokens to
+/// `session.dat`.
+///
+/// The legacy tokens are also seeded into `cache` so the current process keeps
+/// working even if a destination write fails (matching the pre-#18 in-memory
+/// fallback); `loadCache` only overwrites them when the destination actually
+/// holds data. Legacy files are deleted **only after** every destination write
+/// succeeds, so a transient failure (e.g. a locked Keychain) leaves the cleartext
+/// cache in place to be retried on the next run rather than losing the token.
+fn migrateLegacyIfNeeded(a: Allocator, cache: *Cache) void {
+    if (datExists(a, session_dat_name)) return;
+
+    var legacy: Cache = .{};
+    const had_json = loadLegacyInto(a, cache_file_name, &legacy);
+    const had_session = loadLegacyInto(a, session_file_name, &legacy);
+    if (!had_json and !had_session) return;
+
+    // In-memory fallback for this process. Overwritten by loadCache's reads when
+    // the destination write below succeeded; preserved when it failed.
     cache.access_token = legacy.access_token;
     cache.refresh_token = legacy.refresh_token;
     cache.expires_at = legacy.expires_at;
     cache.session_tokens = legacy.session_tokens;
 
+    // Persist the refresh token first; if it cannot be saved, abort without
+    // creating session.dat or deleting anything so a later run retries.
     if (legacy.refresh_token != null or legacy.access_token != null) {
-        saveLongLivedWindows(a, cache) catch {};
+        const saved = switch (builtin.os.tag) {
+            .windows => saveLongLivedWindows(a, &legacy),
+            .macos => saveLongLivedMacos(a, &legacy),
+            else => saveRefreshDat(a, &legacy),
+        };
+        saved catch return;
     }
-    saveSessionFile(a, cache, null, null, 0) catch {};
-    _ = deleteCacheFile(a, cache_file_name);
+
+    // Persist the session tokens; abort before deleting if this fails.
+    migrateSessions(a, &legacy) catch return;
+
+    _ = deleteLegacyFile(a, cache_file_name);
+    _ = deleteLegacyFile(a, session_file_name);
 }
 
-/// macOS: read the long-lived refresh token from the Keychain, migrating a legacy
-/// plaintext JSON cache on first run, then load the session-token file. The
-/// access token is intentionally not persisted (see `LongLived`); it stays in
-/// memory for the lifetime of this process.
-fn loadMacos(a: Allocator, cache: *Cache) void {
-    if (keychain.get(a, wcm_service, wcm_key)) |blob| {
-        if (std.json.parseFromSliceLeaky(LongLived, a, blob, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        })) |ll| {
-            cache.refresh_token = ll.refresh_token;
-        } else |_| {}
-    } else |_| {
-        migrateLegacyMacos(a, cache);
-    }
-    _ = loadFileInto(a, session_file_name, cache);
-}
-
-/// One-time migration: if a legacy `token-cache.json` exists, move its long-lived
-/// tokens into the Keychain, adopt its session tokens, and delete the file.
-fn migrateLegacyMacos(a: Allocator, cache: *Cache) void {
-    var legacy: Cache = .{};
-    if (!loadFileInto(a, cache_file_name, &legacy)) return;
-
-    cache.access_token = legacy.access_token;
-    cache.refresh_token = legacy.refresh_token;
-    cache.expires_at = legacy.expires_at;
-    cache.session_tokens = legacy.session_tokens;
-
-    if (legacy.refresh_token != null or legacy.access_token != null) {
-        saveLongLivedMacos(a, cache) catch {};
-    }
-    saveSessionFile(a, cache, null, null, 0) catch {};
-    _ = deleteCacheFile(a, cache_file_name);
-}
-
-/// Parse a JSON cache file under the cache directory and merge it into `cache`.
-/// Session tokens always replace those in `cache`; the long-lived tokens are
-/// only copied when present, so reading the Windows session-only file does not
-/// clobber tokens already loaded from the Credential Manager. Returns true if
-/// the file existed and parsed. Strings are owned by `a`.
-fn loadFileInto(a: Allocator, name: []const u8, cache: *Cache) bool {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const path = cacheFilePath(a, name) catch return false;
+/// Parse a legacy cleartext JSON file under `~/.ado-keyring/` and merge it into
+/// `cache`. Session tokens always replace those in `cache`; the long-lived
+/// tokens are only copied when present, so reading the session-only legacy file
+/// does not clobber a refresh token read from `token-cache.json`. Returns true
+/// if the file existed and parsed. Strings are owned by `a`.
+fn loadLegacyInto(a: Allocator, name: []const u8, cache: *Cache) bool {
+    const io = ioGlobal();
+    const path = legacyFilePath(a, name) catch return false;
     defer a.free(path);
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024 * 1024)) catch return false;
     defer a.free(bytes);
@@ -729,16 +828,21 @@ fn loadFileInto(a: Allocator, name: []const u8, cache: *Cache) bool {
     return true;
 }
 
+fn datExists(a: Allocator, name: []const u8) bool {
+    const path = datFilePath(a, name) catch return false;
+    defer a.free(path);
+    std.Io.Dir.cwd().access(ioGlobal(), path, .{}) catch return false;
+    return true;
+}
+
 fn saveCache(gpa: Allocator, cache: *const Cache, org: []const u8, token: []const u8, expires_at: i64) Error!void {
-    if (builtin.os.tag == .windows) {
-        try saveLongLivedWindows(gpa, cache);
-        return saveSessionFile(gpa, cache, org, token, expires_at);
+    if (diskCacheDisabled()) return;
+    switch (builtin.os.tag) {
+        .windows => try saveLongLivedWindows(gpa, cache),
+        .macos => try saveLongLivedMacos(gpa, cache),
+        else => try saveRefreshDat(gpa, cache),
     }
-    if (builtin.os.tag == .macos) {
-        try saveLongLivedMacos(gpa, cache);
-        return saveSessionFile(gpa, cache, org, token, expires_at);
-    }
-    return saveFile(gpa, cache, org, token, expires_at);
+    return saveSessionDat(gpa, org, token, expires_at);
 }
 
 /// Persist the long-lived tokens into the Windows Credential Manager.
@@ -770,29 +874,112 @@ fn writeLongLivedJson(writer: *Io.Writer, cache: *const Cache) Error!void {
     writer.writeAll("}") catch return error.CacheFailure;
 }
 
-/// Write the non-secret session-token file. When `org`/`token` are non-null the
-/// new entry replaces any existing one for that org.
-fn saveSessionFile(gpa: Allocator, cache: *const Cache, org: ?[]const u8, token: ?[]const u8, expires_at: i64) Error!void {
+/// Persist the long-lived tokens into `refresh.dat` (Linux), under an exclusive
+/// cross-process lock. Includes the access token so a fresh process can reuse a
+/// still-valid one without a refresh round-trip.
+fn saveRefreshDat(gpa: Allocator, cache: *const Cache) Error!void {
+    var lock = acquireCacheLock(gpa);
+    defer lock.release();
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    out.writer.writeAll("{\n  \"access_token\": ") catch return error.CacheFailure;
+    try writeJsonOptionalString(&out.writer, cache.access_token);
+    out.writer.writeAll(",\n  \"refresh_token\": ") catch return error.CacheFailure;
+    try writeJsonOptionalString(&out.writer, cache.refresh_token);
+    out.writer.print(",\n  \"expires_at\": {d}\n}}\n", .{cache.expires_at}) catch return error.CacheFailure;
+
+    try writeProtectedDat(gpa, refresh_dat_name, out.written());
+}
+
+/// Persist the per-org session tokens into `session.dat` (all platforms). Holds
+/// an exclusive cross-process lock for the whole read-modify-write so concurrent
+/// writers minting tokens for different orgs do not lose each other's entries:
+/// the current on-disk map is re-read under the lock and the new `org`/`token`
+/// entry merged into it before the atomic rewrite.
+fn saveSessionDat(gpa: Allocator, org: ?[]const u8, token: ?[]const u8, expires_at: i64) Error!void {
+    var lock = acquireCacheLock(gpa);
+    defer lock.release();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var disk: Cache = .{};
+    loadSessionDat(arena.allocator(), &disk);
+
+    return writeSessionDatUnlocked(gpa, &disk, org, token, expires_at);
+}
+
+/// One-time migration of the legacy session tokens into `session.dat`, under the
+/// cross-process lock. To stay safe inside the first-run window where two
+/// processes can both observe `session.dat` absent, this re-reads the current
+/// on-disk map under the lock and only adds legacy entries for orgs not already
+/// present, so it never clobbers a token another process just wrote.
+fn migrateSessions(gpa: Allocator, legacy: *const Cache) Error!void {
+    var lock = acquireCacheLock(gpa);
+    defer lock.release();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var disk: Cache = .{};
+    loadSessionDat(a, &disk);
+
+    var it = legacy.session_tokens.map.iterator();
+    while (it.next()) |entry| {
+        if (disk.session_tokens.map.contains(entry.key_ptr.*)) continue;
+        disk.session_tokens.map.put(a, entry.key_ptr.*, entry.value_ptr.*) catch return error.CacheFailure;
+    }
+    return writeSessionDatUnlocked(gpa, &disk, null, null, 0);
+}
+
+/// Serialize `base`'s session map plus an optional new `org`/`token` entry and
+/// write it to `session.dat`. The caller must already hold the cache lock.
+fn writeSessionDatUnlocked(gpa: Allocator, base: *const Cache, org: ?[]const u8, token: ?[]const u8, expires_at: i64) Error!void {
     var out = std.Io.Writer.Allocating.init(gpa);
     defer out.deinit();
     out.writer.writeAll("{\n  \"session_tokens\": {") catch return error.CacheFailure;
-    try writeSessionMap(&out.writer, cache, org, token, expires_at);
+    try writeSessionMap(&out.writer, base, org, token, expires_at);
     out.writer.writeAll("\n  }\n}\n") catch return error.CacheFailure;
-    return writeCacheFileAtomic(gpa, session_file_name, out.written());
+    try writeProtectedDat(gpa, session_dat_name, out.written());
 }
 
-fn saveFile(gpa: Allocator, cache: *const Cache, org: []const u8, token: []const u8, expires_at: i64) Error!void {
-    var out = std.Io.Writer.Allocating.init(gpa);
-    defer out.deinit();
-    try writeCacheJson(gpa, &out.writer, cache, org, token, expires_at);
-    return writeCacheFileAtomic(gpa, cache_file_name, out.written());
-}
-
-/// Atomically write `contents` to the named file in the cache directory.
-fn writeCacheFileAtomic(gpa: Allocator, name: []const u8, contents: []const u8) Error!void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const path = try cacheFilePath(gpa, name);
+/// Protect `contents` (DPAPI on Windows, identity on Unix) and atomically write
+/// it to the named `.dat` file in the keyring cache directory.
+fn writeProtectedDat(gpa: Allocator, name: []const u8, contents: []const u8) Error!void {
+    const protected = try protectBytes(gpa, contents);
+    defer gpa.free(protected);
+    const path = try datFilePath(gpa, name);
     defer gpa.free(path);
+    try writeFileAtomic(gpa, path, protected);
+}
+
+/// Protect a plaintext byte slice for at-rest storage. DPAPI (current-user) on
+/// Windows; an owned copy of the input on Unix, where mode 0600 is the only
+/// protection (the design floor per issue #18). Caller owns the result.
+fn protectBytes(gpa: Allocator, data: []const u8) Error![]u8 {
+    if (builtin.os.tag == .windows) {
+        return dpapi.protect(gpa, data) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.CacheFailure,
+        };
+    }
+    return gpa.dupe(u8, data) catch error.OutOfMemory;
+}
+
+/// Reverse `protectBytes`. Returns null when the bytes cannot be decrypted
+/// (a corrupt or foreign DPAPI blob), which the caller treats as an empty cache.
+fn unprotectBytes(a: Allocator, data: []const u8) ?[]u8 {
+    if (builtin.os.tag == .windows) {
+        return dpapi.unprotect(a, data) catch return null;
+    }
+    return a.dupe(u8, data) catch null;
+}
+
+/// Atomically write `contents` to the absolute `path`, creating the parent
+/// directory if needed. Uses a per-process random temp suffix + rename so
+/// concurrent writers never observe a partial file.
+fn writeFileAtomic(gpa: Allocator, path: []const u8, contents: []const u8) Error!void {
+    const io = ioGlobal();
     const parent = std.fs.path.dirname(path) orelse return error.CacheFailure;
     _ = std.Io.Dir.cwd().createDirPathStatus(io, parent, cacheDirPermissions()) catch return error.CacheFailure;
 
@@ -802,7 +989,7 @@ fn writeCacheFileAtomic(gpa: Allocator, name: []const u8, contents: []const u8) 
     // forces a re-authentication on every subsequent call. A per-process random
     // suffix keeps each writer's temp file private before the atomic rename.
     var suffix_bytes: [8]u8 = undefined;
-    std.Io.Threaded.global_single_threaded.io().random(&suffix_bytes);
+    io.random(&suffix_bytes);
     const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
     const tmp = try std.fmt.allocPrint(gpa, "{s}.{s}.tmp", .{ path, suffix_hex });
     defer gpa.free(tmp);
@@ -814,23 +1001,53 @@ fn writeCacheFileAtomic(gpa: Allocator, name: []const u8, contents: []const u8) 
     std.Io.Dir.renameAbsolute(tmp, path, io) catch return error.CacheFailure;
 }
 
+/// An exclusive cross-process lock over the cache directory, held for the
+/// duration of a read-modify-write. `held` is false when locking was
+/// unavailable, in which case callers proceed lock-free (the atomic rename still
+/// prevents a torn file; only the lost-update guarantee is relaxed) rather than
+/// failing authentication.
+const CacheLock = struct {
+    file: std.Io.File = undefined,
+    held: bool = false,
+
+    fn release(self: *CacheLock) void {
+        if (!self.held) return;
+        const io = ioGlobal();
+        self.file.unlock(io);
+        self.file.close(io);
+        self.held = false;
+    }
+};
+
+fn acquireCacheLock(gpa: Allocator) CacheLock {
+    const io = ioGlobal();
+    ensureKeyringDir(gpa) catch return .{};
+    const path = datFilePath(gpa, lock_file_name) catch return .{};
+    defer gpa.free(path);
+    const file = std.Io.Dir.cwd().createFile(io, path, .{
+        .truncate = false,
+        .read = true,
+        .permissions = cacheFilePermissions(),
+    }) catch return .{};
+    file.lock(io, .exclusive) catch {
+        file.close(io);
+        return .{};
+    };
+    return .{ .file = file, .held = true };
+}
+
+fn ensureKeyringDir(gpa: Allocator) Error!void {
+    const dir = keyringDir(gpa) catch return error.CacheFailure;
+    defer gpa.free(dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(ioGlobal(), dir, cacheDirPermissions()) catch return error.CacheFailure;
+}
+
 fn cacheDirPermissions() std.Io.File.Permissions {
     return if (builtin.os.tag == .windows) .default_dir else .fromMode(0o700);
 }
 
 fn cacheFilePermissions() std.Io.File.Permissions {
     return if (builtin.os.tag == .windows) .default_file else .fromMode(0o600);
-}
-
-fn writeCacheJson(gpa: Allocator, writer: *Io.Writer, cache: *const Cache, org: []const u8, token: []const u8, expires_at: i64) Error!void {
-    _ = gpa;
-    writer.writeAll("{\n  \"access_token\": ") catch return error.CacheFailure;
-    try writeJsonOptionalString(writer, cache.access_token);
-    writer.writeAll(",\n  \"refresh_token\": ") catch return error.CacheFailure;
-    try writeJsonOptionalString(writer, cache.refresh_token);
-    writer.print(",\n  \"expires_at\": {d},\n  \"session_tokens\": {{", .{cache.expires_at}) catch return error.CacheFailure;
-    try writeSessionMap(writer, cache, org, token, expires_at);
-    writer.writeAll("\n  }\n}\n") catch return error.CacheFailure;
 }
 
 /// Write the body of the session_tokens object (without the enclosing braces).
@@ -881,10 +1098,90 @@ fn writeJsonString(writer: *Io.Writer, value: []const u8) Error!void {
     writer.writeByte('"') catch return error.CacheFailure;
 }
 
-fn cacheFilePath(gpa: Allocator, name: []const u8) Error![]u8 {
+/// Resolve the platform cache root that holds the `keyring/` subdirectory
+/// (issue #18). Honors `$XDG_DATA_HOME` (when absolute) on Linux/macOS.
+///   Linux:   `$XDG_DATA_HOME`, else `~/.local/share`
+///   macOS:   `$XDG_DATA_HOME`, else `~/Library/Application Support`
+///   Windows: `%LocalAppData%`, else `%USERPROFILE%\AppData\Local`
+fn cacheRoot(gpa: Allocator) ![]u8 {
+    if (cache_root_override) |root| return gpa.dupe(u8, root);
+
+    if (builtin.os.tag == .windows) {
+        if (getEnvVarOwned(gpa, "LOCALAPPDATA")) |value| return value;
+        if (getEnvVarOwned(gpa, "USERPROFILE")) |profile| {
+            defer gpa.free(profile);
+            return std.fs.path.join(gpa, &.{ profile, "AppData", "Local" }) catch return error.OutOfMemory;
+        }
+        return error.EnvironmentVariableNotFound;
+    }
+
+    if (getEnvVarOwned(gpa, "XDG_DATA_HOME")) |value| {
+        // Per the XDG spec a relative path is invalid and must be ignored.
+        if (value.len > 0 and value[0] == '/') return value;
+        gpa.free(value);
+    }
+    const home = getEnvVarOwned(gpa, "HOME") orelse return error.EnvironmentVariableNotFound;
+    defer gpa.free(home);
+    if (builtin.os.tag == .macos) {
+        return std.fs.path.join(gpa, &.{ home, "Library", "Application Support" }) catch return error.OutOfMemory;
+    }
+    return std.fs.path.join(gpa, &.{ home, ".local", "share" }) catch return error.OutOfMemory;
+}
+
+/// Test-only override for `cacheRoot`, letting unit tests redirect the cache to
+/// a temporary directory without mutating process environment variables.
+var cache_root_override: ?[]const u8 = null;
+
+fn keyringDir(gpa: Allocator) Error![]u8 {
+    const root = cacheRoot(gpa) catch return error.CacheFailure;
+    defer gpa.free(root);
+    return std.fs.path.join(gpa, &.{ root, keyring_subdir }) catch return error.OutOfMemory;
+}
+
+/// Absolute path to a `.dat` (or lock) file under `${cache_root}/keyring/`.
+fn datFilePath(gpa: Allocator, name: []const u8) Error![]u8 {
+    const dir = keyringDir(gpa) catch return error.CacheFailure;
+    defer gpa.free(dir);
+    return std.fs.path.join(gpa, &.{ dir, name }) catch return error.OutOfMemory;
+}
+
+/// Absolute path to a legacy cleartext file under `~/.ado-keyring/` (read only
+/// during migration; see issue #18).
+fn legacyFilePath(gpa: Allocator, name: []const u8) Error![]u8 {
+    if (legacy_dir_override) |dir| {
+        return std.fs.path.join(gpa, &.{ dir, name }) catch return error.OutOfMemory;
+    }
     const home = getHome(gpa) catch return error.CacheFailure;
     defer gpa.free(home);
     return std.fs.path.join(gpa, &.{ home, cache_dir_name, name }) catch return error.OutOfMemory;
+}
+
+/// Test-only override for the legacy cleartext directory; see `cache_root_override`.
+var legacy_dir_override: ?[]const u8 = null;
+
+/// Print the ADO file-cache diagnostics for `keyring diagnose`: the resolved
+/// cache directory, whether the disk cache is enabled, where the refresh token
+/// lives and which `.dat` files exist, and the at-rest protection in use.
+pub fn diagnoseCache(gpa: Allocator, stdout: *Io.Writer) !void {
+    const dir = keyringDir(gpa) catch {
+        try stdout.writeAll("ado cache dir: <unavailable>\n");
+        return;
+    };
+    defer gpa.free(dir);
+    try stdout.print("ado cache dir: {s}\n", .{dir});
+    try stdout.print("ado disk cache: {s} ({s})\n", .{
+        if (diskCacheDisabled()) "disabled" else "enabled",
+        disk_cache_env,
+    });
+    switch (builtin.os.tag) {
+        .windows => try stdout.writeAll("ado refresh token: Windows Credential Manager (ado-keyring)\n"),
+        .macos => try stdout.writeAll("ado refresh token: macOS Keychain (ado-keyring/refresh-token)\n"),
+        else => try stdout.print("ado refresh.dat: {s}\n", .{if (datExists(gpa, refresh_dat_name)) "present" else "absent"}),
+    }
+    try stdout.print("ado session.dat: {s}\n", .{if (datExists(gpa, session_dat_name)) "present" else "absent"});
+    try stdout.print("ado at-rest: {s}\n", .{
+        if (builtin.os.tag == .windows) "DPAPI (CryptProtectData, current-user)" else "chmod 0600",
+    });
 }
 
 fn getHome(gpa: Allocator) ![]u8 {
@@ -983,38 +1280,27 @@ test "extractOrg result survives a subsequent stack-clobbering call" {
     try std.testing.expectEqualStrings("msazure", org);
 }
 
-test "cache JSON round-trips the session token after the source buffer is freed" {
-    // Regression test for a use-after-free: loadCache frees the file buffer after
-    // parsing, so the parsed Cache must own its strings. We emulate that by
-    // serializing into a heap buffer, parsing with the same options loadCache
-    // uses, freeing the source buffer, and only then reading the session token.
+test "refresh cache JSON round-trips the tokens after the source buffer is freed" {
+    // Regression test for a use-after-free: loadRefreshDat frees the file buffer
+    // after parsing, so the parsed RefreshCache must own its strings. We emulate
+    // that by parsing with the same options, freeing the source buffer, and only
+    // then reading the tokens.
     const gpa = std.testing.allocator;
-    var cache: Cache = .{
-        .access_token = "access-abc",
-        .refresh_token = "refresh-xyz",
-        .expires_at = 1_000_000,
-    };
+    const json =
+        \\{ "access_token": "access-abc", "refresh_token": "refresh-xyz", "expires_at": 1000000 }
+    ;
+    const bytes = try gpa.dupe(u8, json);
 
-    var out = std.Io.Writer.Allocating.init(gpa);
-    try writeCacheJson(gpa, &out.writer, &cache, "msazure", "session-token-123", 2_000_000);
-
-    // Copy the JSON onto its own heap buffer and free `out` so that any slice that
-    // still references the original bytes would be reading freed memory.
-    const bytes = try gpa.dupe(u8, out.written());
-    out.deinit();
-
-    var parsed = try std.json.parseFromSlice(Cache, gpa, bytes, .{
+    var parsed = try std.json.parseFromSlice(RefreshCache, gpa, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     });
     defer parsed.deinit();
     gpa.free(bytes);
 
-    const session = parsed.value.session_tokens.map.get("msazure") orelse return error.SessionTokenMissing;
-    try std.testing.expectEqualStrings("session-token-123", session.token);
-    try std.testing.expectEqual(@as(i64, 2_000_000), session.expires_at);
     try std.testing.expectEqualStrings("access-abc", parsed.value.access_token.?);
     try std.testing.expectEqualStrings("refresh-xyz", parsed.value.refresh_token.?);
+    try std.testing.expectEqual(@as(i64, 1_000_000), parsed.value.expires_at);
 }
 
 test "long-lived JSON round-trips refresh token only and excludes session tokens" {
@@ -1073,7 +1359,7 @@ test "session file holds session tokens and no secrets" {
     try std.testing.expect(parsed.access_token == null);
 }
 
-test "loadFileInto session file does not clobber long-lived tokens" {
+test "loadLegacyInto session file does not clobber long-lived tokens" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1100,4 +1386,148 @@ test "loadFileInto session file does not clobber long-lived tokens" {
     try std.testing.expectEqualStrings("ll-refresh", cache.refresh_token.?);
     try std.testing.expectEqual(@as(i64, 42), cache.expires_at);
     try std.testing.expect(cache.session_tokens.map.get("contoso") != null);
+}
+
+/// Point the cache (and optionally the legacy dir) at a temporary directory for
+/// the duration of a test. The resolved root is heap-allocated so the override
+/// slice stays valid after `init` returns by value.
+const TempCache = struct {
+    tmp: std.testing.TmpDir,
+    root: []u8,
+
+    fn init(gpa: Allocator) !TempCache {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const len = try tmp.dir.realPath(ioGlobal(), &buf);
+        const root = try gpa.dupe(u8, buf[0..len]);
+        cache_root_override = root;
+        return .{ .tmp = tmp, .root = root };
+    }
+
+    fn deinit(self: *TempCache, gpa: Allocator) void {
+        cache_root_override = null;
+        legacy_dir_override = null;
+        gpa.free(self.root);
+        self.tmp.cleanup();
+    }
+};
+
+test "session.dat round-trips a session token" {
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+
+    try saveSessionDat(gpa, "contoso", "tok-contoso", 2_000);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var cache: Cache = .{};
+    loadSessionDat(arena.allocator(), &cache);
+
+    const session = cache.session_tokens.map.get("contoso") orelse return error.SessionTokenMissing;
+    try std.testing.expectEqualStrings("tok-contoso", session.token);
+    try std.testing.expectEqual(@as(i64, 2_000), session.expires_at);
+}
+
+test "refresh.dat round-trips the long-lived tokens" {
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+
+    const written: Cache = .{ .access_token = "acc", .refresh_token = "ref", .expires_at = 1_234 };
+    try saveRefreshDat(gpa, &written);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var cache: Cache = .{};
+    loadRefreshDat(arena.allocator(), &cache);
+
+    try std.testing.expectEqualStrings("acc", cache.access_token.?);
+    try std.testing.expectEqualStrings("ref", cache.refresh_token.?);
+    try std.testing.expectEqual(@as(i64, 1_234), cache.expires_at);
+}
+
+test "corrupt session.dat is treated as empty, not a crash" {
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+
+    // Bytes that are neither a valid DPAPI blob (Windows) nor valid JSON (Unix).
+    const path = try datFilePath(gpa, session_dat_name);
+    defer gpa.free(path);
+    try writeFileAtomic(gpa, path, "this is not a valid cache \x00\xff");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var cache: Cache = .{};
+    loadSessionDat(arena.allocator(), &cache);
+
+    try std.testing.expectEqual(@as(usize, 0), cache.session_tokens.map.count());
+}
+
+test "session.dat merges sequential writers without losing entries" {
+    // Each save re-reads the on-disk map under the lock and merges in its own
+    // org, so writers for different orgs (including separate processes) do not
+    // clobber one another. This exercises that read-modify-write merge.
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+
+    try saveSessionDat(gpa, "org-a", "tok-a", 100);
+    try saveSessionDat(gpa, "org-b", "tok-b", 200);
+    try saveSessionDat(gpa, "org-c", "tok-c", 300);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var cache: Cache = .{};
+    loadSessionDat(arena.allocator(), &cache);
+
+    try std.testing.expectEqual(@as(usize, 3), cache.session_tokens.map.count());
+    try std.testing.expectEqualStrings("tok-a", cache.session_tokens.map.get("org-a").?.token);
+    try std.testing.expectEqualStrings("tok-b", cache.session_tokens.map.get("org-b").?.token);
+    try std.testing.expectEqualStrings("tok-c", cache.session_tokens.map.get("org-c").?.token);
+}
+
+test "legacy token-cache.json migrates once into the dat files" {
+    // Gated to Linux: there the refresh token migrates into refresh.dat (a file),
+    // whereas on Windows/macOS it would write the real OS secret store. The
+    // file-based pieces of the migration are otherwise platform-uniform.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+
+    const legacy_dir = try std.fs.path.join(gpa, &.{ tc.root, "legacy" });
+    defer gpa.free(legacy_dir);
+    legacy_dir_override = legacy_dir;
+
+    const legacy_json =
+        \\{ "access_token": "a", "refresh_token": "r", "expires_at": 5, "session_tokens": { "contoso": { "token": "s", "expires_at": 9 } } }
+    ;
+    const legacy_path = try legacyFilePath(gpa, cache_file_name);
+    defer gpa.free(legacy_path);
+    try writeFileAtomic(gpa, legacy_path, legacy_json);
+
+    var loaded = loadCache(gpa);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqualStrings("r", loaded.cache.refresh_token.?);
+    try std.testing.expect(loaded.cache.session_tokens.map.get("contoso") != null);
+
+    // Legacy file removed; new protected files written.
+    {
+        const exists = blk: {
+            std.Io.Dir.cwd().access(ioGlobal(), legacy_path, .{}) catch break :blk false;
+            break :blk true;
+        };
+        try std.testing.expect(!exists);
+    }
+    try std.testing.expect(datExists(gpa, refresh_dat_name));
+    try std.testing.expect(datExists(gpa, session_dat_name));
+
+    // A second load reads only the dat files; migration does not run again.
+    var loaded2 = loadCache(gpa);
+    defer loaded2.deinit(gpa);
+    try std.testing.expectEqualStrings("r", loaded2.cache.refresh_token.?);
+    try std.testing.expect(loaded2.cache.session_tokens.map.get("contoso") != null);
 }

@@ -337,6 +337,7 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
         }
     }
     msal_cache.diagnose(arena, stdout) catch {};
+    ado.diagnoseCache(arena, stdout) catch {};
     try stdout.flush();
 }
 

@@ -377,7 +377,7 @@ fn getEnv(gpa: Allocator, name: []const u8) ?[]u8 {
     return null;
 }
 
-fn getHome(gpa: Allocator) ?[]u8 {
+pub fn getHome(gpa: Allocator) ?[]u8 {
     if (builtin.os.tag == .windows) {
         if (getEnv(gpa, "USERPROFILE")) |value| return value;
     }

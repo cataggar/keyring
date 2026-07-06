@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const keyring_zig = @import("keyring_zig");
 const ado = @import("ado.zig");
 const msal_cache = @import("msal_cache.zig");
+const az_export = @import("az_export.zig");
 const color = @import("color.zig");
 const term = @import("term.zig");
 
@@ -45,6 +46,7 @@ pub const Command = union(enum) {
     set: struct { service: []const u8, user: []const u8 },
     get: struct { service: []const u8, user: []const u8 },
     del: struct { service: []const u8, user: []const u8 },
+    az_export: struct { dir: []const u8 },
     usage_error: []const u8,
 };
 
@@ -169,6 +171,9 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
             };
             break :code 0;
         },
+        .az_export => |cmd| code: {
+            break :code try az_export.run(arena, cmd.dir, stdout, stderr);
+        },
         .usage_error => |message| code: {
             try stderr.print("keyring: {s}\n{s}", .{ message, usage });
             try stderr.flush();
@@ -240,6 +245,14 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
 
     if (std.mem.eql(u8, command, "del")) {
         parsed.command = if (rest.len == 2) .{ .del = .{ .service = rest[0], .user = rest[1] } } else .{ .usage_error = "wrong number of arguments" };
+        return parsed;
+    }
+
+    if (std.mem.eql(u8, command, "az")) {
+        parsed.command = if (rest.len == 2 and std.mem.eql(u8, rest[0], "export"))
+            .{ .az_export = .{ .dir = rest[1] } }
+        else
+            .{ .usage_error = "usage: keyring az export <dir>" };
         return parsed;
     }
 
@@ -595,6 +608,16 @@ test "parseArgs recognizes set get del" {
     try expectCommandTag(.del, del);
     try std.testing.expectEqualStrings("svc", del.command.del.service);
     try std.testing.expectEqualStrings("user", del.command.del.user);
+}
+
+test "parseArgs recognizes az export" {
+    const parsed = parseArgs(&.{ "keyring", "az", "export", "/tmp/out" });
+    try expectCommandTag(.az_export, parsed);
+    try std.testing.expectEqualStrings("/tmp/out", parsed.command.az_export.dir);
+
+    try expectUsage(parseArgs(&.{ "keyring", "az", "export" }));
+    try expectUsage(parseArgs(&.{ "keyring", "az", "bogus", "/tmp/out" }));
+    try expectUsage(parseArgs(&.{ "keyring", "az" }));
 }
 
 test "parseArgs recognizes backend flag" {

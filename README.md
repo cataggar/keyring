@@ -6,6 +6,16 @@
 
 Phases A-C are complete; Phase D adds headless Linux ergonomics and diagnostics. The file backend is now available through the upstream keyring-zig package.
 
+## Install
+
+```sh
+ghr install cataggar/keyring
+```
+
+Linux release assets are fully static musl binaries and do not require a
+system libc, libsecret, or GLib. The `secret_service` backend still requires
+access to a running Secret Service daemon.
+
 ## Usage
 
 ```sh

@@ -33,7 +33,12 @@ jobs:
         if: runner.os == 'Linux'
         run: pip install keyring
 
+      - name: Build static Linux binary
+        if: runner.os == 'Linux'
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl
+
       - name: Build
+        if: runner.os != 'Linux'
         run: zig build -Doptimize=ReleaseSafe
 
       - name: Run Linux integration tests

@@ -137,10 +137,7 @@ jobs:
           \`\`\`
           NOTES
 
-          release_flags=()
-          if [[ "$version" == *dev* ]]; then
-            release_flags+=(--prerelease)
-          fi
+          release_flags=(--latest --prerelease=false)
 
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release edit "${GITHUB_REF_NAME}" \

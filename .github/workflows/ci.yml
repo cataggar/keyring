@@ -31,3 +31,27 @@ jobs:
         run: zig build
       - name: Test
         run: zig build test
+
+  static-linux:
+    name: Static ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-linux-musl
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+      - name: Verify static binary
+        run: bash tests/verify_static_elf.sh zig-out/bin/keyring
+      - name: Smoke test
+        run: ./zig-out/bin/keyring version

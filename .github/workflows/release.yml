@@ -75,7 +75,6 @@ jobs:
         run: |
           artifact="keyring-${{ github.ref_name }}-${{ matrix.target }}"
           cp "zig-out/bin/${{ matrix.binary }}" "$artifact"
-          shasum -a 256 "$artifact" > "$artifact.sha256"
 
       - name: Package binary
         if: runner.os == 'Windows'
@@ -83,9 +82,6 @@ jobs:
         run: |
           $artifact = "keyring-${{ github.ref_name }}-${{ matrix.target }}.exe"
           Copy-Item "zig-out/bin/${{ matrix.binary }}" $artifact
-          $hash = Get-FileHash -Algorithm SHA256 $artifact |
-            Select-Object -ExpandProperty Hash
-          "$hash  $artifact" | Out-File -FilePath "$artifact.sha256" -Encoding ascii
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -117,9 +113,10 @@ jobs:
         shell: bash
         run: |
           cd dist
-          find . -maxdepth 1 -name '*.sha256' -print |
-            sort |
-            xargs cat > SHA256SUMS
+          shopt -s nullglob
+          artifacts=(*)
+          ((${#artifacts[@]} > 0))
+          sha256sum "${artifacts[@]}" > SHA256SUMS
 
       - name: Publish GitHub release
         env:

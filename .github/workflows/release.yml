@@ -109,15 +109,6 @@ jobs:
           merge-multiple: true
           path: ./dist
 
-      - name: Generate SHA256SUMS
-        shell: bash
-        run: |
-          cd dist
-          shopt -s nullglob
-          artifacts=(*)
-          ((${#artifacts[@]} > 0))
-          sha256sum "${artifacts[@]}" > SHA256SUMS
-
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

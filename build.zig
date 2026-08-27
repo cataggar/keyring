@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const enable_file_backend = b.option(
+        bool,
+        "file-backend",
+        "Include the optional encrypted file backend",
+    ) orelse false;
 
     const version = b.option([]const u8, "version", "Version string baked into the binary (no 'v' prefix)") orelse "0.0.0-dev";
 
@@ -10,7 +15,10 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", version);
     const build_options_module = build_options.createModule();
 
-    const keyring_zig = b.dependency("keyring_zig", .{ .target = target });
+    const keyring_zig = b.dependency("keyring_zig", .{
+        .target = target,
+        .@"file-backend" = enable_file_backend,
+    });
     const keyring_zig_module = keyring_zig.module("keyring_zig");
 
     const exe = b.addExecutable(.{

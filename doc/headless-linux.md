@@ -30,8 +30,42 @@ dbus-run-session -- bash -lc 'eval "$(printf "\n" | gnome-keyring-daemon --unloc
 
 ## Option C: file backend
 
-`KEYRING_BACKEND=file` uses the upstream file backend for encrypted on-disk
-credentials when you do not want to rely on a secret-service daemon.
+`KEYRING_BACKEND=file` uses an AES-256-GCM encrypted on-disk credential store
+when you do not want to rely on a Secret Service daemon. It is an optional
+build feature, so builds from source must enable it:
+
+```sh
+zig build -Dfile-backend=true -Doptimize=ReleaseSafe
+```
+
+Set both the store path and passphrase before using it. Choose a private path
+outside the repository for persistent credentials:
+
+```sh
+export KEYRING_BACKEND=file
+export KEYRING_FILE_PATH="$HOME/.local/share/keyring/credentials.dat"
+export KEYRING_FILE_PASSPHRASE='use-a-secret-from-your-password-manager'
+keyring set my-service alice
+keyring get my-service alice
+```
 
 `keyring diagnose` detects the missing Secret Service daemon and prints these
 recommendations.
+
+## Automated coverage
+
+On Linux, `tests/headless_linux.sh` points D-Bus at a nonexistent socket and
+checks that `keyring diagnose` exits successfully with the oo7-daemon, GNOME
+under `dbus-run-session`, and file-backend hints. It also performs an isolated
+file-backend set/get/delete round-trip using a disposable path under
+`.zig-cache/`.
+
+Run it with a binary built with the file backend:
+
+```sh
+zig build -Dfile-backend=true
+bash tests/headless_linux.sh
+```
+
+The test does not start or exercise oo7-daemon or GNOME; it only verifies the
+guidance shown when a Secret Service daemon is unavailable.

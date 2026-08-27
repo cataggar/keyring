@@ -484,6 +484,9 @@ pub fn exitCodeFor(err: anyerror) u8 {
     return switch (err) {
         error.EntryNotFound => 3,
         error.NoStorageAccess => 4,
+        // A bad KEYRING_ADO_STORE value is a configuration mistake, not a
+        // storage failure: report it like other invalid usage.
+        error.InvalidStoreSelector => 2,
         error.Locked,
         error.PlatformFailure,
         error.Ambiguous,
@@ -537,6 +540,7 @@ fn errorMessage(err: anyerror) []const u8 {
         error.AuthenticationFailed => "authentication failed",
         error.NetworkFailure => "network failure",
         error.CacheFailure => "cache failure",
+        error.InvalidStoreSelector => "invalid KEYRING_ADO_STORE value: expected 'file' or 'secret'",
         else => "platform failure",
     };
 }

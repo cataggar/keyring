@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const keyring_zig = @import("keyring_zig");
 const wincred = @import("wincred.zig");
 const keychain = @import("keychain.zig");
 const msal_cache = @import("msal_cache.zig");
@@ -15,6 +16,7 @@ pub const Error = error{
     AuthenticationFailed,
     NetworkFailure,
     CacheFailure,
+    InvalidStoreSelector,
     OutOfMemory,
     InvalidUtf8,
 };
@@ -57,6 +59,11 @@ const noninteractive_env = "ADO_KEYRING_NONINTERACTIVE";
 // value the backend keeps no persistent cache at all — neither the platform
 // secret store nor the `.dat` files — so every process re-authenticates.
 const disk_cache_env = "KEYRING_ADO_DISK_CACHE";
+// Linux-only selector for where the long-lived refresh token is persisted:
+// `file` (the default `refresh.dat`) or `secret` (Secret Service via
+// `keyring_zig`). Windows always uses the Credential Manager and macOS the
+// Keychain, so the selector is ignored there.
+const store_env = "KEYRING_ADO_STORE";
 
 const TokenResponse = struct {
     access_token: []const u8,
@@ -117,13 +124,112 @@ const LoadedCache = struct {
     }
 };
 
+/// Where the long-lived refresh token is persisted on Linux, selected by
+/// `KEYRING_ADO_STORE`. Defaults to `file` (`refresh.dat`); `secret` opts in to
+/// the Secret Service (`org.freedesktop.secrets`) via `keyring_zig`. Windows and
+/// macOS always use their platform secret store and ignore the selector.
+pub const Store = enum { file, secret };
+
+/// Test-only override for `selectedStore`, so unit tests can exercise both
+/// stores without mutating the process environment.
+var store_override: ?Store = null;
+
+fn parseStore(value: []const u8) ?Store {
+    if (std.ascii.eqlIgnoreCase(value, "file")) return .file;
+    if (std.ascii.eqlIgnoreCase(value, "secret")) return .secret;
+    return null;
+}
+
+/// Resolve the configured Linux store. An unset or empty `KEYRING_ADO_STORE`
+/// keeps the historical `refresh.dat` default; an unrecognized value fails
+/// loudly rather than silently picking a backend.
+fn selectedStore() Error!Store {
+    if (builtin.os.tag != .linux) return .file;
+    if (store_override) |store| return store;
+    const value = getEnvVarOwned(std.heap.page_allocator, store_env) orelse return .file;
+    defer std.heap.page_allocator.free(value);
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return .file;
+    return parseStore(trimmed) orelse error.InvalidStoreSelector;
+}
+
+/// Errors surfaced by the Secret Service seam. `Locked` is kept distinct from
+/// `NoStorageAccess` so `diagnose` can report it; the credential paths collapse
+/// both into `Error.NoStorageAccess` (exit 4).
+pub const SecretError = error{ EntryNotFound, NoStorageAccess, Locked, OutOfMemory };
+
+/// The Secret Service operations used by the `secret` store, indirected through
+/// function pointers so unit tests can substitute a deterministic fake for a
+/// live D-Bus session bus. Production always uses `live_secret_ops`.
+const SecretOps = struct {
+    get: *const fn (Allocator) SecretError![]u8,
+    set: *const fn (Allocator, []const u8) SecretError!void,
+    delete: *const fn (Allocator) SecretError!void,
+};
+
+const live_secret_ops: SecretOps = .{
+    .get = liveSecretGet,
+    .set = liveSecretSet,
+    .delete = liveSecretDelete,
+};
+
+var secret_ops: SecretOps = live_secret_ops;
+
+/// Select the Secret Service backend inside `keyring_zig` for the duration of a
+/// single call and restore the previous selection afterwards. The ADO backend
+/// can be reached with `KEYRING_BACKEND` pointing at another `keyring_zig`
+/// backend (URL auto-routing runs first), and `KEYRING_ADO_STORE=secret` must
+/// mean the Secret Service, never whatever backend happens to be default.
+const SecretServiceScope = struct {
+    previous: keyring_zig.Backend,
+
+    fn open() SecretError!SecretServiceScope {
+        const previous = keyring_zig.currentBackend();
+        if (previous != .secret_service) {
+            keyring_zig.setDefaultBackend(.secret_service) catch return error.NoStorageAccess;
+        }
+        return .{ .previous = previous };
+    }
+
+    fn close(self: SecretServiceScope) void {
+        keyring_zig.setDefaultBackend(self.previous) catch {};
+    }
+};
+
+fn liveSecretGet(gpa: Allocator) SecretError![]u8 {
+    var ss_scope = try SecretServiceScope.open();
+    defer ss_scope.close();
+    return keyring_zig.getAlloc(gpa, wcm_service, wcm_key) catch |err| mapSecretError(err);
+}
+
+fn liveSecretSet(gpa: Allocator, value: []const u8) SecretError!void {
+    var ss_scope = try SecretServiceScope.open();
+    defer ss_scope.close();
+    return keyring_zig.setAlloc(gpa, wcm_service, wcm_key, value) catch |err| mapSecretError(err);
+}
+
+fn liveSecretDelete(gpa: Allocator) SecretError!void {
+    var ss_scope = try SecretServiceScope.open();
+    defer ss_scope.close();
+    return keyring_zig.deleteAlloc(gpa, wcm_service, wcm_key) catch |err| mapSecretError(err);
+}
+
+fn mapSecretError(err: keyring_zig.Error) SecretError {
+    return switch (err) {
+        error.EntryNotFound => error.EntryNotFound,
+        error.Locked => error.Locked,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.NoStorageAccess,
+    };
+}
+
 pub fn getCredential(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8) Error!Credential {
     if (!isDevOpsUrl(service_url)) return error.EntryNotFound;
 
     const org = extractOrg(service_url) orelse return error.Unsupported;
     const now = unixNow();
 
-    var loaded = loadCache(gpa);
+    var loaded = try loadCache(gpa);
     defer loaded.deinit(gpa);
     var cache: Cache = loaded.cache;
 
@@ -254,6 +360,18 @@ pub fn deletePassword(gpa: Allocator) Error!void {
             error.NoStorageAccess => return error.NoStorageAccess,
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.CacheFailure,
+        }
+    } else if (builtin.os.tag == .linux) {
+        // Only touch the Secret Service when it is the selected store: with the
+        // default `file` store there is nothing of ours in it.
+        if (try selectedStore() == .secret) {
+            if (secret_ops.delete(gpa)) {
+                removed = true;
+            } else |err| switch (err) {
+                error.EntryNotFound => {},
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Locked, error.NoStorageAccess => return error.NoStorageAccess,
+            }
         }
     }
     if (deleteAllCacheFiles(gpa)) removed = true;
@@ -662,6 +780,7 @@ fn ioGlobal() std.Io {
 /// disabled the backend keeps nothing on disk or in the secret store, so each
 /// process re-authenticates from scratch.
 fn diskCacheDisabled() bool {
+    if (disk_cache_override) |disabled| return disabled;
     const value = getEnvVarOwned(std.heap.page_allocator, disk_cache_env) orelse return false;
     defer std.heap.page_allocator.free(value);
     return std.ascii.eqlIgnoreCase(value, "false") or
@@ -669,34 +788,48 @@ fn diskCacheDisabled() bool {
         std.ascii.eqlIgnoreCase(value, "no");
 }
 
+/// Test-only override for `diskCacheDisabled`; see `cache_root_override`.
+var disk_cache_override: ?bool = null;
+
 /// Load the long-lived tokens and per-org session tokens into an owned cache.
 /// The refresh token lives in the platform secret store on Windows (issue #15)
-/// and macOS (issue #16) and in `refresh.dat` on Linux; per-org session tokens
-/// always live in `session.dat`. Never errors — a missing, corrupt, or disabled
-/// cache yields an empty one.
-fn loadCache(gpa: Allocator) LoadedCache {
-    const arena = gpa.create(std.heap.ArenaAllocator) catch
-        return .{ .arena = emptyArena(gpa), .cache = .{} };
+/// and macOS (issue #16); on Linux it lives in `refresh.dat` by default or in
+/// the Secret Service when `KEYRING_ADO_STORE=secret` (issue #17). Per-org
+/// session tokens always live in `session.dat`.
+///
+/// Missing, corrupt, or disabled *file* caches yield an empty cache rather than
+/// an error. A Secret Service that is unreachable or locked while `secret` is
+/// selected fails with `error.NoStorageAccess` instead of silently falling back
+/// to `refresh.dat`; a merely absent entry is a cache miss, so the caller
+/// authenticates and stores a fresh token.
+fn loadCache(gpa: Allocator) Error!LoadedCache {
+    const arena = try gpa.create(std.heap.ArenaAllocator);
     arena.* = .init(gpa);
+    errdefer {
+        arena.deinit();
+        gpa.destroy(arena);
+    }
     const a = arena.allocator();
     var cache: Cache = .{};
     if (diskCacheDisabled()) return .{ .arena = arena, .cache = cache };
 
-    migrateLegacyIfNeeded(a, &cache);
+    const store = try selectedStore();
+    try migrateLegacyIfNeeded(a, &cache, store);
 
     switch (builtin.os.tag) {
         .windows => loadRefreshSecretStore(a, &cache, .windows),
         .macos => loadRefreshSecretStore(a, &cache, .macos),
-        else => loadRefreshDat(a, &cache),
+        else => switch (store) {
+            .file => loadRefreshDat(a, &cache),
+            .secret => {
+                try loadRefreshSecret(a, &cache);
+                // No Secret Service entry yet: adopt an existing refresh.dat.
+                if (cache.refresh_token == null) try migrateRefreshDatToSecret(a, &cache);
+            },
+        },
     }
     loadSessionDat(a, &cache);
     return .{ .arena = arena, .cache = cache };
-}
-
-fn emptyArena(gpa: Allocator) *std.heap.ArenaAllocator {
-    const arena = gpa.create(std.heap.ArenaAllocator) catch unreachable;
-    arena.* = .init(gpa);
-    return arena;
 }
 
 /// Read the refresh token from the platform secret store (Windows Credential
@@ -730,6 +863,57 @@ fn loadRefreshDat(a: Allocator, cache: *Cache) void {
     cache.expires_at = parsed.expires_at;
 }
 
+/// Read the refresh token from the Secret Service (`service=ado-keyring`,
+/// `account=refresh-token`) into `cache`. An absent entry is a cache miss; an
+/// unreachable or locked service is `error.NoStorageAccess` — with `secret`
+/// explicitly selected we never fall back to `refresh.dat`. A corrupt blob is
+/// treated as a miss and overwritten on the next successful authentication.
+fn loadRefreshSecret(a: Allocator, cache: *Cache) Error!void {
+    const blob = secret_ops.get(a) catch |err| switch (err) {
+        error.EntryNotFound => return,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Locked, error.NoStorageAccess => return error.NoStorageAccess,
+    };
+    defer a.free(blob);
+    const parsed = std.json.parseFromSliceLeaky(LongLived, a, blob, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return;
+    cache.refresh_token = parsed.refresh_token;
+}
+
+/// Persist the long-lived tokens into the Secret Service. Only the refresh token
+/// is stored, matching the Windows/macOS blob (see `LongLived`).
+fn saveRefreshSecret(gpa: Allocator, cache: *const Cache) Error!void {
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try writeLongLivedJson(&out.writer, cache);
+    secret_ops.set(gpa, out.written()) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.EntryNotFound, error.Locked, error.NoStorageAccess => return error.NoStorageAccess,
+    };
+}
+
+/// Move an existing `refresh.dat` into the Secret Service when `secret` is
+/// selected but the service holds no entry yet (issue #17). `refresh.dat` is
+/// deleted only after the write succeeds, so a locked or unavailable service
+/// leaves the token on disk to be retried on the next run instead of losing it.
+/// Idempotent: once the file is gone there is nothing left to migrate.
+fn migrateRefreshDatToSecret(a: Allocator, cache: *Cache) Error!void {
+    var from_disk: Cache = .{};
+    loadRefreshDat(a, &from_disk);
+    if (from_disk.refresh_token == null) return;
+
+    try saveRefreshSecret(a, &from_disk);
+    _ = deleteDatFile(a, refresh_dat_name);
+
+    // Keep using the migrated tokens in this process. The access token is not
+    // persisted to the Secret Service, but a still-valid one avoids a refresh.
+    cache.access_token = from_disk.access_token;
+    cache.refresh_token = from_disk.refresh_token;
+    cache.expires_at = from_disk.expires_at;
+}
+
 /// Read `session.dat` (all platforms) into `cache.session_tokens`. A missing or
 /// corrupt file leaves the session map empty.
 fn loadSessionDat(a: Allocator, cache: *Cache) void {
@@ -757,8 +941,9 @@ fn readDatFile(a: Allocator, name: []const u8) ?[]u8 {
 /// One-time migration from the legacy cleartext layout (issue #14) to the
 /// user-protected `.dat` files (issue #18). Runs only when `session.dat` does
 /// not yet exist; once a successful migration creates it, this is a no-op
-/// forever. The legacy refresh token is moved to the secret store
-/// (Windows/macOS) or `refresh.dat` (Linux) and the legacy session tokens to
+/// forever. The legacy refresh token is moved to the selected destination — the
+/// secret store on Windows/macOS, and `refresh.dat` or the Secret Service on
+/// Linux depending on `KEYRING_ADO_STORE` — and the legacy session tokens to
 /// `session.dat`.
 ///
 /// The legacy tokens are also seeded into `cache` so the current process keeps
@@ -767,7 +952,9 @@ fn readDatFile(a: Allocator, name: []const u8) ?[]u8 {
 /// holds data. Legacy files are deleted **only after** every destination write
 /// succeeds, so a transient failure (e.g. a locked Keychain) leaves the cleartext
 /// cache in place to be retried on the next run rather than losing the token.
-fn migrateLegacyIfNeeded(a: Allocator, cache: *Cache) void {
+/// With `KEYRING_ADO_STORE=secret` an unusable Secret Service is reported as
+/// `error.NoStorageAccess` rather than silently degrading to no persistence.
+fn migrateLegacyIfNeeded(a: Allocator, cache: *Cache, store: Store) Error!void {
     if (datExists(a, session_dat_name)) return;
 
     var legacy: Cache = .{};
@@ -788,9 +975,15 @@ fn migrateLegacyIfNeeded(a: Allocator, cache: *Cache) void {
         const saved = switch (builtin.os.tag) {
             .windows => saveLongLivedWindows(a, &legacy),
             .macos => saveLongLivedMacos(a, &legacy),
-            else => saveRefreshDat(a, &legacy),
+            else => switch (store) {
+                .file => saveRefreshDat(a, &legacy),
+                .secret => saveRefreshSecret(a, &legacy),
+            },
         };
-        saved catch return;
+        saved catch |err| {
+            if (store == .secret) return err;
+            return;
+        };
     }
 
     // Persist the session tokens; abort before deleting if this fails.
@@ -840,7 +1033,10 @@ fn saveCache(gpa: Allocator, cache: *const Cache, org: []const u8, token: []cons
     switch (builtin.os.tag) {
         .windows => try saveLongLivedWindows(gpa, cache),
         .macos => try saveLongLivedMacos(gpa, cache),
-        else => try saveRefreshDat(gpa, cache),
+        else => switch (try selectedStore()) {
+            .file => try saveRefreshDat(gpa, cache),
+            .secret => try saveRefreshSecret(gpa, cache),
+        },
     }
     return saveSessionDat(gpa, org, token, expires_at);
 }
@@ -1176,12 +1372,55 @@ pub fn diagnoseCache(gpa: Allocator, stdout: *Io.Writer) !void {
     switch (builtin.os.tag) {
         .windows => try stdout.writeAll("ado refresh token: Windows Credential Manager (ado-keyring)\n"),
         .macos => try stdout.writeAll("ado refresh token: macOS Keychain (ado-keyring/refresh-token)\n"),
-        else => try stdout.print("ado refresh.dat: {s}\n", .{if (datExists(gpa, refresh_dat_name)) "present" else "absent"}),
+        else => try diagnoseLinuxStore(gpa, stdout),
     }
     try stdout.print("ado session.dat: {s}\n", .{if (datExists(gpa, session_dat_name)) "present" else "absent"});
     try stdout.print("ado at-rest: {s}\n", .{
         if (builtin.os.tag == .windows) "DPAPI (CryptProtectData, current-user)" else "chmod 0600",
     });
+}
+
+/// Report the Linux refresh-token store for `keyring diagnose`: which store is
+/// configured, whether the Secret Service entry is present/reachable/locked/
+/// unavailable when `secret` is selected, and whether `refresh.dat` still
+/// exists. Never fails the diagnosis and never prints secret material.
+fn diagnoseLinuxStore(gpa: Allocator, stdout: *Io.Writer) !void {
+    const store = selectedStore() catch {
+        try stdout.print("ado linux store: invalid {s} value (expected 'file' or 'secret')\n", .{store_env});
+        try stdout.print("ado refresh.dat: {s}\n", .{if (datExists(gpa, refresh_dat_name)) "present" else "absent"});
+        return;
+    };
+
+    switch (store) {
+        .file => try stdout.print("ado linux store: file (default, {s}=file)\n", .{store_env}),
+        .secret => {
+            try stdout.print("ado linux store: secret ({s}=secret)\n", .{store_env});
+            try stdout.print("ado secret service ({s}/{s}): {s}\n", .{ wcm_service, wcm_key, secretStateName(gpa) });
+        },
+    }
+
+    const refresh_dat_present = datExists(gpa, refresh_dat_name);
+    const state = if (!refresh_dat_present)
+        "absent"
+    else if (store == .secret)
+        "present (migrates into the Secret Service on next use)"
+    else
+        "present";
+    try stdout.print("ado refresh.dat: {s}\n", .{state});
+}
+
+/// Classify the Secret Service entry for diagnostics. The secret value itself is
+/// read but never printed, only its presence.
+fn secretStateName(gpa: Allocator) []const u8 {
+    if (diskCacheDisabled()) return "not probed (disk cache disabled)";
+    const blob = secret_ops.get(gpa) catch |err| return switch (err) {
+        error.EntryNotFound => "reachable, no entry",
+        error.Locked => "locked",
+        error.NoStorageAccess => "unavailable",
+        error.OutOfMemory => "unknown (out of memory)",
+    };
+    gpa.free(blob);
+    return "present";
 }
 
 fn getHome(gpa: Allocator) ![]u8 {
@@ -1402,16 +1641,81 @@ const TempCache = struct {
         const len = try tmp.dir.realPath(ioGlobal(), &buf);
         const root = try gpa.dupe(u8, buf[0..len]);
         cache_root_override = root;
+        // Pin the configuration so tests never depend on the ambient
+        // KEYRING_ADO_STORE / KEYRING_ADO_DISK_CACHE of the developer's shell.
+        store_override = .file;
+        disk_cache_override = false;
         return .{ .tmp = tmp, .root = root };
     }
 
     fn deinit(self: *TempCache, gpa: Allocator) void {
         cache_root_override = null;
         legacy_dir_override = null;
+        store_override = null;
+        disk_cache_override = null;
+        secret_ops = live_secret_ops;
+        fake_secret = .{};
         gpa.free(self.root);
         self.tmp.cleanup();
     }
 };
+
+/// An in-process stand-in for the Secret Service, so the `secret` store can be
+/// unit tested deterministically without a live D-Bus session bus. Only the
+/// tests install it (via `useFakeSecretService`); production code always talks
+/// to `live_secret_ops`.
+const FakeSecretService = struct {
+    buf: [1024]u8 = undefined,
+    len: usize = 0,
+    present: bool = false,
+    get_calls: usize = 0,
+    set_calls: usize = 0,
+    delete_calls: usize = 0,
+    get_error: ?SecretError = null,
+    set_error: ?SecretError = null,
+    delete_error: ?SecretError = null,
+
+    fn value(self: *const FakeSecretService) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+var fake_secret: FakeSecretService = .{};
+
+const fake_secret_ops: SecretOps = .{
+    .get = fakeSecretGet,
+    .set = fakeSecretSet,
+    .delete = fakeSecretDelete,
+};
+
+fn useFakeSecretService() void {
+    fake_secret = .{};
+    secret_ops = fake_secret_ops;
+}
+
+fn fakeSecretGet(gpa: Allocator) SecretError![]u8 {
+    fake_secret.get_calls += 1;
+    if (fake_secret.get_error) |err| return err;
+    if (!fake_secret.present) return error.EntryNotFound;
+    return gpa.dupe(u8, fake_secret.value()) catch error.OutOfMemory;
+}
+
+fn fakeSecretSet(_: Allocator, value: []const u8) SecretError!void {
+    fake_secret.set_calls += 1;
+    if (fake_secret.set_error) |err| return err;
+    if (value.len > fake_secret.buf.len) return error.NoStorageAccess;
+    @memcpy(fake_secret.buf[0..value.len], value);
+    fake_secret.len = value.len;
+    fake_secret.present = true;
+}
+
+fn fakeSecretDelete(_: Allocator) SecretError!void {
+    fake_secret.delete_calls += 1;
+    if (fake_secret.delete_error) |err| return err;
+    if (!fake_secret.present) return error.EntryNotFound;
+    fake_secret.present = false;
+    fake_secret.len = 0;
+}
 
 test "session.dat round-trips a session token" {
     const gpa = std.testing.allocator;
@@ -1509,7 +1813,7 @@ test "legacy token-cache.json migrates once into the dat files" {
     defer gpa.free(legacy_path);
     try writeFileAtomic(gpa, legacy_path, legacy_json);
 
-    var loaded = loadCache(gpa);
+    var loaded = try loadCache(gpa);
     defer loaded.deinit(gpa);
     try std.testing.expectEqualStrings("r", loaded.cache.refresh_token.?);
     try std.testing.expect(loaded.cache.session_tokens.map.get("contoso") != null);
@@ -1526,8 +1830,337 @@ test "legacy token-cache.json migrates once into the dat files" {
     try std.testing.expect(datExists(gpa, session_dat_name));
 
     // A second load reads only the dat files; migration does not run again.
-    var loaded2 = loadCache(gpa);
+    var loaded2 = try loadCache(gpa);
     defer loaded2.deinit(gpa);
     try std.testing.expectEqualStrings("r", loaded2.cache.refresh_token.?);
     try std.testing.expect(loaded2.cache.session_tokens.map.get("contoso") != null);
+}
+
+test "KEYRING_ADO_STORE parses the supported values" {
+    try std.testing.expectEqual(Store.file, parseStore("file").?);
+    try std.testing.expectEqual(Store.secret, parseStore("secret").?);
+    // Case-insensitive, matching the other boolean-ish ADO env vars.
+    try std.testing.expectEqual(Store.file, parseStore("FILE").?);
+    try std.testing.expectEqual(Store.secret, parseStore("Secret").?);
+    // Anything else is rejected rather than silently mapped to a backend.
+    try std.testing.expect(parseStore("secret_service") == null);
+    try std.testing.expect(parseStore("keychain") == null);
+    try std.testing.expect(parseStore("") == null);
+}
+
+test "selectedStore defaults to the file store and rejects unknown values" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+
+    store_override = null;
+    // No override and (in CI) no env var: the historical refresh.dat default.
+    if (getEnvVarOwned(gpa, store_env)) |value| {
+        gpa.free(value);
+    } else {
+        try std.testing.expectEqual(Store.file, try selectedStore());
+    }
+
+    store_override = .secret;
+    try std.testing.expectEqual(Store.secret, try selectedStore());
+}
+
+test "file store keeps writing refresh.dat and never touches the Secret Service" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .file;
+    disk_cache_override = false;
+
+    const cache: Cache = .{ .access_token = "acc", .refresh_token = "ref", .expires_at = 7 };
+    try saveCache(gpa, &cache, "contoso", "tok", 99);
+
+    try std.testing.expect(datExists(gpa, refresh_dat_name));
+    try std.testing.expectEqual(@as(usize, 0), fake_secret.set_calls);
+
+    var loaded = try loadCache(gpa);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqualStrings("ref", loaded.cache.refresh_token.?);
+    try std.testing.expectEqual(@as(usize, 0), fake_secret.get_calls);
+}
+
+test "secret store round-trips the refresh token and persists nothing else" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = false;
+
+    const cache: Cache = .{ .access_token = "access-secret", .refresh_token = "refresh-secret", .expires_at = 7 };
+    try saveCache(gpa, &cache, "contoso", "tok", 99);
+
+    // Only the refresh token reaches the Secret Service; no refresh.dat is written.
+    try std.testing.expect(fake_secret.present);
+    try std.testing.expect(std.mem.indexOf(u8, fake_secret.value(), "refresh-secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_secret.value(), "access-secret") == null);
+    try std.testing.expect(!datExists(gpa, refresh_dat_name));
+    try std.testing.expect(datExists(gpa, session_dat_name));
+
+    var loaded = try loadCache(gpa);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqualStrings("refresh-secret", loaded.cache.refresh_token.?);
+    try std.testing.expectEqualStrings("tok", loaded.cache.session_tokens.map.get("contoso").?.token);
+}
+
+test "secret store reports an unavailable or locked service instead of falling back" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = false;
+
+    // A refresh.dat is present, but with `secret` selected it must not be used
+    // as a silent fallback when the service itself is unusable.
+    const on_disk: Cache = .{ .refresh_token = "from-file", .expires_at = 1 };
+    try saveRefreshDat(gpa, &on_disk);
+
+    fake_secret.get_error = error.NoStorageAccess;
+    try std.testing.expectError(error.NoStorageAccess, loadCache(gpa));
+
+    fake_secret.get_error = error.Locked;
+    try std.testing.expectError(error.NoStorageAccess, loadCache(gpa));
+
+    fake_secret.get_error = null;
+    fake_secret.set_error = error.NoStorageAccess;
+    try std.testing.expectError(error.NoStorageAccess, saveRefreshSecret(gpa, &on_disk));
+    // The token stayed on disk; nothing was lost.
+    try std.testing.expect(datExists(gpa, refresh_dat_name));
+}
+
+test "refresh.dat migrates into the Secret Service exactly once" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = false;
+
+    const on_disk: Cache = .{ .access_token = "acc", .refresh_token = "ref", .expires_at = 4_242 };
+    try saveRefreshDat(gpa, &on_disk);
+
+    var loaded = try loadCache(gpa);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqualStrings("ref", loaded.cache.refresh_token.?);
+    // The still-valid access token is carried over in memory for this process.
+    try std.testing.expectEqualStrings("acc", loaded.cache.access_token.?);
+    try std.testing.expect(fake_secret.present);
+    try std.testing.expect(!datExists(gpa, refresh_dat_name));
+    try std.testing.expectEqual(@as(usize, 1), fake_secret.set_calls);
+
+    // Idempotent: a second load reads the entry and does not migrate again.
+    var loaded2 = try loadCache(gpa);
+    defer loaded2.deinit(gpa);
+    try std.testing.expectEqualStrings("ref", loaded2.cache.refresh_token.?);
+    try std.testing.expectEqual(@as(usize, 1), fake_secret.set_calls);
+}
+
+test "a failed refresh.dat migration keeps the file and reports no storage access" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = false;
+
+    const on_disk: Cache = .{ .access_token = "acc", .refresh_token = "ref", .expires_at = 4_242 };
+    try saveRefreshDat(gpa, &on_disk);
+    fake_secret.set_error = error.Locked;
+
+    try std.testing.expectError(error.NoStorageAccess, loadCache(gpa));
+    try std.testing.expect(datExists(gpa, refresh_dat_name));
+    try std.testing.expect(!fake_secret.present);
+
+    // Once the service is usable again the migration completes.
+    fake_secret.set_error = null;
+    var loaded = try loadCache(gpa);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqualStrings("ref", loaded.cache.refresh_token.?);
+    try std.testing.expect(!datExists(gpa, refresh_dat_name));
+}
+
+test "legacy token-cache.json migrates into the selected secret store" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = false;
+
+    const legacy_dir = try std.fs.path.join(gpa, &.{ tc.root, "legacy" });
+    defer gpa.free(legacy_dir);
+    legacy_dir_override = legacy_dir;
+
+    const legacy_json =
+        \\{ "access_token": "a", "refresh_token": "r", "expires_at": 5, "session_tokens": { "contoso": { "token": "s", "expires_at": 9 } } }
+    ;
+    const legacy_path = try legacyFilePath(gpa, cache_file_name);
+    defer gpa.free(legacy_path);
+    try writeFileAtomic(gpa, legacy_path, legacy_json);
+
+    var loaded = try loadCache(gpa);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqualStrings("r", loaded.cache.refresh_token.?);
+    try std.testing.expect(loaded.cache.session_tokens.map.get("contoso") != null);
+
+    // The refresh token went to the Secret Service, not to refresh.dat, and the
+    // cleartext legacy file is gone.
+    try std.testing.expect(fake_secret.present);
+    try std.testing.expect(std.mem.indexOf(u8, fake_secret.value(), "\"r\"") != null);
+    try std.testing.expect(!datExists(gpa, refresh_dat_name));
+    try std.testing.expect(datExists(gpa, session_dat_name));
+    {
+        const exists = blk: {
+            std.Io.Dir.cwd().access(ioGlobal(), legacy_path, .{}) catch break :blk false;
+            break :blk true;
+        };
+        try std.testing.expect(!exists);
+    }
+}
+
+test "a legacy migration into an unusable secret store keeps the cleartext file" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = false;
+
+    const legacy_dir = try std.fs.path.join(gpa, &.{ tc.root, "legacy" });
+    defer gpa.free(legacy_dir);
+    legacy_dir_override = legacy_dir;
+
+    const legacy_json =
+        \\{ "access_token": "a", "refresh_token": "r", "expires_at": 5 }
+    ;
+    const legacy_path = try legacyFilePath(gpa, cache_file_name);
+    defer gpa.free(legacy_path);
+    try writeFileAtomic(gpa, legacy_path, legacy_json);
+    fake_secret.set_error = error.NoStorageAccess;
+
+    try std.testing.expectError(error.NoStorageAccess, loadCache(gpa));
+    {
+        const exists = blk: {
+            std.Io.Dir.cwd().access(ioGlobal(), legacy_path, .{}) catch break :blk false;
+            break :blk true;
+        };
+        try std.testing.expect(exists);
+    }
+    try std.testing.expect(!datExists(gpa, session_dat_name));
+}
+
+test "del removes the Secret Service entry and the cache files" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = false;
+
+    const cache: Cache = .{ .refresh_token = "ref" };
+    try saveCache(gpa, &cache, "contoso", "tok", 99);
+    try std.testing.expect(fake_secret.present);
+
+    try deletePassword(gpa);
+    try std.testing.expect(!fake_secret.present);
+    try std.testing.expect(!datExists(gpa, session_dat_name));
+
+    // Nothing left anywhere: a missing entry, not a storage failure.
+    try std.testing.expectError(error.EntryNotFound, deletePassword(gpa));
+
+    // An unusable service is reported as no storage access, not as a miss.
+    fake_secret.delete_error = error.Locked;
+    try std.testing.expectError(error.NoStorageAccess, deletePassword(gpa));
+}
+
+test "del with the file store leaves the Secret Service alone" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .file;
+    disk_cache_override = false;
+
+    const cache: Cache = .{ .refresh_token = "ref" };
+    try saveCache(gpa, &cache, "contoso", "tok", 99);
+
+    try deletePassword(gpa);
+    try std.testing.expectEqual(@as(usize, 0), fake_secret.delete_calls);
+    try std.testing.expect(!datExists(gpa, refresh_dat_name));
+}
+
+test "disabling the disk cache uses neither the Secret Service nor the dat files" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = true;
+
+    const cache: Cache = .{ .access_token = "acc", .refresh_token = "ref", .expires_at = 7 };
+    try saveCache(gpa, &cache, "contoso", "tok", 99);
+    try std.testing.expectEqual(@as(usize, 0), fake_secret.set_calls);
+    try std.testing.expect(!datExists(gpa, refresh_dat_name));
+    try std.testing.expect(!datExists(gpa, session_dat_name));
+
+    var loaded = try loadCache(gpa);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(loaded.cache.refresh_token == null);
+    try std.testing.expectEqual(@as(usize, 0), fake_secret.get_calls);
+}
+
+test "diagnostics report the configured store without printing secrets" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = false;
+
+    const cache: Cache = .{ .refresh_token = "top-secret-token" };
+    try saveRefreshSecret(gpa, &cache);
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try diagnoseCache(gpa, &out.writer);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "ado linux store: secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "ado-keyring/refresh-token): present") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "top-secret-token") == null);
+
+    // A locked or unavailable service is reported, not raised.
+    fake_secret.get_error = error.Locked;
+    var locked = std.Io.Writer.Allocating.init(gpa);
+    defer locked.deinit();
+    try diagnoseCache(gpa, &locked.writer);
+    try std.testing.expect(std.mem.indexOf(u8, locked.written(), "locked") != null);
+
+    // The default store reports refresh.dat and does not probe the service.
+    store_override = .file;
+    fake_secret.get_error = null;
+    const before = fake_secret.get_calls;
+    var file_out = std.Io.Writer.Allocating.init(gpa);
+    defer file_out.deinit();
+    try diagnoseCache(gpa, &file_out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, file_out.written(), "ado linux store: file") != null);
+    try std.testing.expectEqual(before, fake_secret.get_calls);
 }

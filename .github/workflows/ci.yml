@@ -31,6 +31,11 @@ jobs:
         run: zig build
       - name: Test
         run: zig build test
+      - name: Test headless Linux behavior
+        if: runner.os == 'Linux'
+        run: |
+          zig build -Dfile-backend=true
+          bash tests/headless_linux.sh
 
   static-linux:
     name: Static ${{ matrix.target }}

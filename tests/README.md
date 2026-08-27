@@ -30,3 +30,21 @@ Linux Python interop tests require Python `keyring`:
 pip install keyring
 bash tests/python_interop.sh
 ```
+
+## Headless Linux coverage
+
+`headless_linux.sh` requires Linux and Bash, but does not require a Secret
+Service daemon, oo7-daemon, GNOME, or D-Bus session. It verifies the
+`keyring diagnose` guidance for a missing daemon and an encrypted file-backend
+set/get/delete round-trip using an isolated disposable file path.
+
+Build with the optional file backend and run:
+
+```sh
+zig build -Dfile-backend=true
+bash tests/headless_linux.sh
+```
+
+CI runs this script only on Linux. It deliberately does not test starting
+oo7-daemon or GNOME; those remain manual integration prerequisites for
+`integration.sh`.

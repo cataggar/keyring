@@ -31,11 +31,11 @@ dbus-run-session -- bash -lc 'eval "$(printf "\n" | gnome-keyring-daemon --unloc
 ## Option C: file backend
 
 `KEYRING_BACKEND=file` uses an AES-256-GCM encrypted on-disk credential store
-when you do not want to rely on a Secret Service daemon. It is an optional
-build feature, so builds from source must enable it:
+when you do not want to rely on a Secret Service daemon. Default and release
+builds include this backend. Source builders that do not need it can opt out:
 
 ```sh
-zig build -Dfile-backend=true -Doptimize=ReleaseSafe
+zig build -Dfile-backend=false
 ```
 
 Set both the store path and passphrase before using it. Choose a private path
@@ -60,10 +60,10 @@ under `dbus-run-session`, and file-backend hints. It also performs an isolated
 file-backend set/get/delete round-trip using a disposable path under
 `.zig-cache/`.
 
-Run it with a binary built with the file backend:
+Run it with the default build:
 
 ```sh
-zig build -Dfile-backend=true
+zig build
 bash tests/headless_linux.sh
 ```
 

@@ -38,13 +38,14 @@ Service daemon, oo7-daemon, GNOME, or D-Bus session. It verifies the
 `keyring diagnose` guidance for a missing daemon and an encrypted file-backend
 set/get/delete round-trip using an isolated disposable file path.
 
-Build with the optional file backend and run:
+Build normally and run:
 
 ```sh
-zig build -Dfile-backend=true
+zig build
 bash tests/headless_linux.sh
 ```
 
 CI runs this script only on Linux. It deliberately does not test starting
 oo7-daemon or GNOME; those remain manual integration prerequisites for
-`integration.sh`.
+`integration.sh`. Source builders can exclude the file backend with
+`zig build -Dfile-backend=false`.

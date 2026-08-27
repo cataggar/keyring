@@ -59,7 +59,9 @@ first run with `secret` selected, an existing `refresh.dat` (or legacy
 `~/.ado-keyring/token-cache.json`) is written into the Secret Service and only
 then deleted, so a failed migration leaves the token on disk and retries on the
 next run. Migration is idempotent: once the entry exists, later runs read it
-directly.
+directly and delete any `refresh.dat` that a later switch back to `file` may
+have recreated, so the refresh token is never left at rest on disk while
+`secret` is selected.
 
 There is no silent fallback. A missing entry simply means "authenticate", but a
 Secret Service that is unavailable (no D-Bus session bus, no daemon) or that
@@ -72,7 +74,9 @@ with `KEYRING_ADO_DISK_CACHE=false`.
 `keyring del <ado-url> <user>` removes the Secret Service entry along with the
 cache files. `keyring diagnose` reports the configured store and, when `secret`
 is selected, whether the entry is `present`, `reachable, no entry`, `locked`, or
-`unavailable` — never the secret itself:
+`unavailable` — never the secret itself. The `refresh.dat` line describes what
+the next run will do with the file (`migrates into the Secret Service on next
+use`, `stale, removed on next use`, or `unused: disk cache disabled`):
 
 ```
 ado linux store: secret (KEYRING_ADO_STORE=secret)

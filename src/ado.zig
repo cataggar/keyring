@@ -801,7 +801,9 @@ var disk_cache_override: ?bool = null;
 /// an error. A Secret Service that is unreachable or locked while `secret` is
 /// selected fails with `error.NoStorageAccess` instead of silently falling back
 /// to `refresh.dat`; a merely absent entry is a cache miss, so the caller
-/// authenticates and stores a fresh token.
+/// authenticates and stores a fresh token. With `secret` selected, `refresh.dat`
+/// never survives a successful load: it is either migrated into the Secret
+/// Service or, when the service already holds an entry, deleted as stale.
 fn loadCache(gpa: Allocator) Error!LoadedCache {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     arena.* = .init(gpa);
@@ -823,8 +825,16 @@ fn loadCache(gpa: Allocator) Error!LoadedCache {
             .file => loadRefreshDat(a, &cache),
             .secret => {
                 try loadRefreshSecret(a, &cache);
-                // No Secret Service entry yet: adopt an existing refresh.dat.
-                if (cache.refresh_token == null) try migrateRefreshDatToSecret(a, &cache);
+                if (cache.refresh_token == null) {
+                    // No Secret Service entry yet: adopt an existing refresh.dat.
+                    try migrateRefreshDatToSecret(a, &cache);
+                } else {
+                    // The Secret Service already holds the token and is
+                    // authoritative for this store, so a refresh.dat left over
+                    // from an earlier `file` run is stale and unreachable. Drop
+                    // it instead of leaving a refresh token at rest on disk.
+                    _ = deleteDatFile(a, refresh_dat_name);
+                }
             },
         },
     }
@@ -1391,22 +1401,31 @@ fn diagnoseLinuxStore(gpa: Allocator, stdout: *Io.Writer) !void {
         return;
     };
 
+    var secret_present = false;
     switch (store) {
         .file => try stdout.print("ado linux store: file (default, {s}=file)\n", .{store_env}),
         .secret => {
+            const state = secretStateName(gpa);
+            secret_present = std.mem.eql(u8, state, "present");
             try stdout.print("ado linux store: secret ({s}=secret)\n", .{store_env});
-            try stdout.print("ado secret service ({s}/{s}): {s}\n", .{ wcm_service, wcm_key, secretStateName(gpa) });
+            try stdout.print("ado secret service ({s}/{s}): {s}\n", .{ wcm_service, wcm_key, state });
         },
     }
 
-    const refresh_dat_present = datExists(gpa, refresh_dat_name);
-    const state = if (!refresh_dat_present)
-        "absent"
-    else if (store == .secret)
-        "present (migrates into the Secret Service on next use)"
-    else
-        "present";
-    try stdout.print("ado refresh.dat: {s}\n", .{state});
+    try stdout.print("ado refresh.dat: {s}\n", .{refreshDatStateName(gpa, store, secret_present)});
+}
+
+/// Describe `refresh.dat` for diagnostics. With `secret` selected the file is
+/// only consumed on the next run when the cache is actually enabled: report the
+/// pending migration, the pending stale-file cleanup, or the fact that a
+/// disabled disk cache leaves the file untouched, rather than always promising a
+/// migration that will not happen.
+fn refreshDatStateName(gpa: Allocator, store: Store, secret_present: bool) []const u8 {
+    if (!datExists(gpa, refresh_dat_name)) return "absent";
+    if (store == .file) return "present";
+    if (diskCacheDisabled()) return "present (unused: disk cache disabled)";
+    if (secret_present) return "present (stale, removed on next use)";
+    return "present (migrates into the Secret Service on next use)";
 }
 
 /// Classify the Secret Service entry for diagnostics. The secret value itself is
@@ -1967,6 +1986,58 @@ test "refresh.dat migrates into the Secret Service exactly once" {
     try std.testing.expectEqual(@as(usize, 1), fake_secret.set_calls);
 }
 
+test "an existing Secret Service entry retires a stale refresh.dat" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = false;
+
+    // Written while the default `file` store was selected, then the user opted
+    // in to `secret` and authenticated, so the service holds the live token.
+    const on_disk: Cache = .{ .access_token = "old-acc", .refresh_token = "old-ref", .expires_at = 4_242 };
+    try saveRefreshDat(gpa, &on_disk);
+    const in_service: Cache = .{ .refresh_token = "live-ref" };
+    try saveRefreshSecret(gpa, &in_service);
+
+    var loaded = try loadCache(gpa);
+    defer loaded.deinit(gpa);
+    // The service wins and the superseded on-disk copy of the refresh token is
+    // not left behind.
+    try std.testing.expectEqualStrings("live-ref", loaded.cache.refresh_token.?);
+    try std.testing.expect(loaded.cache.access_token == null);
+    try std.testing.expect(!datExists(gpa, refresh_dat_name));
+    // Nothing was written back to the service: this is cleanup, not a migration.
+    try std.testing.expectEqual(@as(usize, 1), fake_secret.set_calls);
+    try std.testing.expectEqualStrings("live-ref", in_service.refresh_token.?);
+}
+
+test "a stale refresh.dat survives a load that cannot reach the Secret Service" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = false;
+
+    const on_disk: Cache = .{ .refresh_token = "ref", .expires_at = 4_242 };
+    try saveRefreshDat(gpa, &on_disk);
+
+    fake_secret.get_error = error.NoStorageAccess;
+    try std.testing.expectError(error.NoStorageAccess, loadCache(gpa));
+    try std.testing.expect(datExists(gpa, refresh_dat_name));
+
+    // A disabled disk cache reads and deletes nothing either.
+    fake_secret.get_error = null;
+    disk_cache_override = true;
+    var loaded = try loadCache(gpa);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(datExists(gpa, refresh_dat_name));
+}
+
 test "a failed refresh.dat migration keeps the file and reports no storage access" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -2163,4 +2234,52 @@ test "diagnostics report the configured store without printing secrets" {
     try diagnoseCache(gpa, &file_out.writer);
     try std.testing.expect(std.mem.indexOf(u8, file_out.written(), "ado linux store: file") != null);
     try std.testing.expectEqual(before, fake_secret.get_calls);
+}
+
+test "diagnostics describe refresh.dat by what the next run will actually do" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+    useFakeSecretService();
+    store_override = .secret;
+    disk_cache_override = false;
+
+    const on_disk: Cache = .{ .refresh_token = "ref", .expires_at = 7 };
+    try saveRefreshDat(gpa, &on_disk);
+
+    const report = struct {
+        fn run(a: Allocator) ![]u8 {
+            var out = std.Io.Writer.Allocating.init(a);
+            defer out.deinit();
+            try diagnoseCache(a, &out.writer);
+            return a.dupe(u8, out.written());
+        }
+    }.run;
+
+    // No entry yet: the next run migrates the file.
+    const pending = try report(gpa);
+    defer gpa.free(pending);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "ado refresh.dat: present (migrates into the Secret Service on next use)") != null);
+
+    // An entry exists: the file is stale and the next run removes it, so do not
+    // promise a migration that will never happen.
+    const in_service: Cache = .{ .refresh_token = "live" };
+    try saveRefreshSecret(gpa, &in_service);
+    const stale = try report(gpa);
+    defer gpa.free(stale);
+    try std.testing.expect(std.mem.indexOf(u8, stale, "ado refresh.dat: present (stale, removed on next use)") != null);
+
+    // A disabled disk cache neither migrates nor removes anything.
+    disk_cache_override = true;
+    const disabled = try report(gpa);
+    defer gpa.free(disabled);
+    try std.testing.expect(std.mem.indexOf(u8, disabled, "ado refresh.dat: present (unused: disk cache disabled)") != null);
+
+    // The default file store just reports the file.
+    disk_cache_override = false;
+    store_override = .file;
+    const file_store = try report(gpa);
+    defer gpa.free(file_store);
+    try std.testing.expect(std.mem.indexOf(u8, file_store, "ado refresh.dat: present\n") != null);
 }

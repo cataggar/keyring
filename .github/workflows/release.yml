@@ -7,6 +7,7 @@ name: Release
 
 permissions:
   contents: read
+  attestations: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -49,10 +50,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Zig
-        uses: mlugg/setup-zig@v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          version: 0.16.0
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Verify Zig version
+        shell: bash
+        run: |
+          version="$(zig version)"
+          echo "Zig version: $version"
+          test "$version" = "0.16.0"
 
       - name: Build
         shell: bash

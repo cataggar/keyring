@@ -4,6 +4,7 @@ const keyring_zig = @import("keyring_zig");
 const ado = @import("ado.zig");
 const msal_cache = @import("msal_cache.zig");
 const az_export = @import("az_export.zig");
+const devops_npm = @import("devops_npm.zig");
 const color = @import("color.zig");
 const term = @import("term.zig");
 
@@ -26,6 +27,7 @@ const usage =
     \\  set <service> <user>          Store a password from stdin.
     \\  get <service> <user>          Read a password to stdout.
     \\  del <service> <user>          Delete a password.
+    \\  devops-npm [options]          Authenticate Azure DevOps npm feeds in .npmrc.
     \\
     \\Backends: secret_service, keychain, win_credential, file, ado, null_backend (or null)
     \\
@@ -47,6 +49,7 @@ pub const Command = union(enum) {
     get: struct { service: []const u8, user: []const u8 },
     del: struct { service: []const u8, user: []const u8 },
     az_export: struct { dir: []const u8 },
+    devops_npm: devops_npm.Options,
     usage_error: []const u8,
 };
 
@@ -174,6 +177,9 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
         .az_export => |cmd| code: {
             break :code try az_export.run(arena, cmd.dir, stdout, stderr);
         },
+        .devops_npm => |opts| code: {
+            break :code try devops_npm.run(arena, io, opts, stdout, stderr);
+        },
         .usage_error => |message| code: {
             try stderr.print("keyring: {s}\n{s}", .{ message, usage });
             try stderr.flush();
@@ -253,6 +259,14 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
             .{ .az_export = .{ .dir = rest[1] } }
         else
             .{ .usage_error = "usage: keyring az export <dir>" };
+        return parsed;
+    }
+
+    if (std.mem.eql(u8, command, "devops-npm")) {
+        parsed.command = if (devops_npm.parseArgs(rest)) |opts|
+            .{ .devops_npm = opts }
+        else
+            .{ .usage_error = "usage: keyring devops-npm [-c <path>] [-f|--force] [--validate-only]" };
         return parsed;
     }
 
@@ -624,6 +638,23 @@ test "parseArgs recognizes az export" {
     try expectUsage(parseArgs(&.{ "keyring", "az" }));
 }
 
+test "parseArgs recognizes devops-npm" {
+    const bare = parseArgs(&.{ "keyring", "devops-npm" });
+    try expectCommandTag(.devops_npm, bare);
+    try std.testing.expect(!bare.command.devops_npm.force);
+    try std.testing.expect(!bare.command.devops_npm.validate_only);
+    try std.testing.expect(bare.command.devops_npm.config_file == null);
+
+    const flags = parseArgs(&.{ "keyring", "devops-npm", "-c", "sub/.npmrc", "-f", "--validate-only" });
+    try expectCommandTag(.devops_npm, flags);
+    try std.testing.expect(flags.command.devops_npm.force);
+    try std.testing.expect(flags.command.devops_npm.validate_only);
+    try std.testing.expectEqualStrings("sub/.npmrc", flags.command.devops_npm.config_file.?);
+
+    try expectUsage(parseArgs(&.{ "keyring", "devops-npm", "--bogus" }));
+    try expectUsage(parseArgs(&.{ "keyring", "devops-npm", "-c" }));
+}
+
 test "parseArgs recognizes backend flag" {
     const parsed = parseArgs(&.{ "keyring", "-b", "null", "get", "svc", "user" });
     try std.testing.expect(backendEql(.{ .keyring = .null_backend }, parsed.backend.?));
@@ -716,4 +747,8 @@ test "disabled Color methods are empty" {
     try std.testing.expectEqualStrings("", disabled.red());
     try std.testing.expectEqualStrings("", disabled.bold());
     try std.testing.expectEqualStrings("", disabled.reset());
+}
+
+test {
+    _ = devops_npm;
 }

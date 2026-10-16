@@ -23,6 +23,11 @@ keyring -b null get my-service alice
 keyring -b secret_service set my-service alice
 keyring -b ado get https://pkgs.dev.azure.com/myorg/_packaging/feed/pypi/simple/ VssSessionToken
 
+# Authenticate Azure Artifacts npm feeds from .npmrc and update ~/.npmrc.
+keyring devops-npm
+keyring devops-npm -c path/to/.npmrc -f
+keyring devops-npm --validate-only
+
 # Disable storage for this process.
 keyring --disable
 keyring --disable get my-service alice

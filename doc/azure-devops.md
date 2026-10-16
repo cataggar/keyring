@@ -97,3 +97,16 @@ browser flow when no usable token is found. On macOS and Linux only plaintext
 MSAL caches are readable. Disable with `KEYRING_ADO_MSAL_CACHE=false`. Run
 `keyring diagnose` to see which caches were found and whether a usable token is
 present.
+
+## npm feeds (`keyring devops-npm`)
+
+`keyring devops-npm` is a drop-in replacement for `@microsoft/artifacts-npm-credprovider` that reads Azure Artifacts npm registries from a workspace `.npmrc` and writes `//<registry>:_authToken=<token>` entries to `~/.npmrc` (or `$NPM_CONFIG_USERCONFIG`):
+
+```sh
+keyring devops-npm                           # discover ./.npmrc (or git root .npmrc) and update ~/.npmrc
+keyring devops-npm -c path/to/.npmrc         # use an explicit workspace .npmrc
+keyring devops-npm -f                        # force refresh even if existing tokens are valid
+keyring devops-npm --validate-only           # check whether existing ~/.npmrc tokens are valid
+```
+
+Registries (`registry=<url>` and `@scope:registry=<url>`) are grouped by Azure DevOps organization so multi-feed workspaces authenticate once per organization using the `ado` backend's token cache, `az login` SSO, and browser OAuth2 + PKCE fallback.

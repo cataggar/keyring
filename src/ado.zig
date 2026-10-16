@@ -223,7 +223,22 @@ fn mapSecretError(err: keyring_zig.Error) SecretError {
     };
 }
 
+pub const GetCredentialOptions = struct {
+    /// When true, ignore any cached session token for the organization and mint
+    /// a fresh `VssSessionToken` from the access/refresh token.
+    bypass_session_cache: bool = false,
+};
+
 pub fn getCredential(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8) Error!Credential {
+    return getCredentialWithOptions(gpa, stderr, service_url, .{});
+}
+
+pub fn getCredentialWithOptions(
+    gpa: Allocator,
+    stderr: *Io.Writer,
+    service_url: []const u8,
+    options: GetCredentialOptions,
+) Error!Credential {
     if (!isDevOpsUrl(service_url)) return error.EntryNotFound;
 
     const org = extractOrg(service_url) orelse return error.Unsupported;
@@ -233,10 +248,12 @@ pub fn getCredential(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8
     defer loaded.deinit(gpa);
     var cache: Cache = loaded.cache;
 
-    if (cache.session_tokens.map.get(org)) |session| {
-        if (session.expires_at > now + 300) {
-            log(stderr, "{s} Using cached session token for '{s}'\n", .{ log_prefix, org });
-            return .{ .username = session_username, .password = try gpa.dupe(u8, session.token) };
+    if (!options.bypass_session_cache) {
+        if (cache.session_tokens.map.get(org)) |session| {
+            if (session.expires_at > now + 300) {
+                log(stderr, "{s} Using cached session token for '{s}'\n", .{ log_prefix, org });
+                return .{ .username = session_username, .password = try gpa.dupe(u8, session.token) };
+            }
         }
     }
 
@@ -533,6 +550,35 @@ fn exchangeCode(gpa: Allocator, code: []const u8, redirect_uri: []const u8, veri
     try formField(&body.writer, "redirect_uri", redirect_uri, false);
     try formField(&body.writer, "code_verifier", verifier, false);
     return postJson(TokenResponse, gpa, token_url, body.written(), "application/x-www-form-urlencoded", &.{});
+}
+
+pub fn exchangeForSessionToken(
+    gpa: Allocator,
+    access_token: []const u8,
+    org: []const u8,
+    bypass_session_cache: bool,
+) Error![]u8 {
+    const now = unixNow();
+    if (!bypass_session_cache and !diskCacheDisabled()) {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var disk: Cache = .{};
+        loadSessionDat(arena.allocator(), &disk);
+        if (disk.session_tokens.map.get(org)) |session| {
+            if (session.expires_at > now + 300) {
+                return gpa.dupe(u8, session.token);
+            }
+        }
+    }
+
+    var parsed = try getSessionToken(gpa, access_token, org);
+    defer parsed.deinit();
+    const owned = try gpa.dupe(u8, parsed.value.token);
+    errdefer gpa.free(owned);
+    if (!diskCacheDisabled()) {
+        saveSessionDat(gpa, org, owned, now + 3000) catch {};
+    }
+    return owned;
 }
 
 fn getSessionToken(gpa: Allocator, access_token: []const u8, org: []const u8) Error!std.json.Parsed(SessionTokenResponse) {

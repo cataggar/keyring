@@ -14,7 +14,7 @@ They also verify that the compiled-in `ado` backend is listed and short-circuits
 Build first:
 
 ```sh
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=safe
 bash tests/integration.sh
 ```
 

@@ -2,11 +2,11 @@
     .name = .keyring,
     .version = "0.1.0",
     .fingerprint = 0x16bef15c85a03555, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .keyring_zig = .{
-            .url = "https://github.com/cataggar/keyring-zig/archive/d1b4320.tar.gz",
-            .hash = "keyring_zig-0.0.0-Lil_COcAAwCkJomDsduSXplwbXnwsrHfyja8x7pkCcgJ",
+            .url = "https://github.com/cataggar/keyring-zig/archive/44eefba.tar.gz",
+            .hash = "keyring_zig-0.1.1-Lil_CPwEAwCgi4F0ciY01dqNozd7Gpqiy2nkQ3bbqerd",
         },
     },
     .paths = .{

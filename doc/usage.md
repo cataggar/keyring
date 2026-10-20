@@ -6,6 +6,25 @@ keyring version
 keyring --list-backends
 keyring diagnose
 
+# Linux: run the built-in Secret Service provider (starts locked).
+keyring service
+keyring service --replace
+
+# Enroll and manage WebAuthn PRF security keys.
+keyring enroll --label primary-yubikey
+keyring enroll --add-key --label backup-yubikey
+keyring enroll --list
+keyring enroll --revoke <id>
+keyring enroll --recover --label replacement-yubikey
+
+# Unlock through a browser over an SSH local-forward, or with Recovery Key.
+keyring unlock
+keyring unlock --port 42317 --timeout 180
+keyring unlock --recover
+
+# Immediately clear the in-memory vault key.
+keyring lock
+
 # Prompt for a password and store it; exits 0 on success.
 keyring set my-service alice
 
@@ -41,6 +60,8 @@ Backends are `secret_service`, `keychain`, `win_credential`, `file`, `ado`, and
 The `file` backend comes from the upstream keyring-zig package and stores
 encrypted credentials on disk, which is useful when no secret-service daemon is
 available. See [Headless Linux](headless-linux.md).
+
+The Linux-only built-in service stores encrypted items in `vault.json` and is unlocked through WebAuthn PRF or the one-time Recovery Key. See [Hardware-backed unlocking over SSH](headless-linux.md#hardware-backed-unlocking-over-ssh).
 
 See also [Environment variables](environment-variables.md) and
 [Exit codes](exit-codes.md).

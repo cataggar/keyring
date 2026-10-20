@@ -139,6 +139,7 @@ pub const PrfEnrollment = struct {
     public_key: []const u8,
     sign_count: u32 = 0,
     prf_output: [prf_salt_len]u8,
+    prf_salt: ?[prf_salt_len]u8 = null,
     created_at: i64,
 };
 
@@ -149,6 +150,8 @@ pub const EnrollmentOptions = struct {
     argon2_t: u32 = 3,
     argon2_m: u32 = 65536,
     argon2_p: u32 = 1,
+    store_id: ?[store_id_len]u8 = null,
+    prf_salt: ?[prf_salt_len]u8 = null,
 };
 
 pub const EnrollmentResult = struct {
@@ -510,15 +513,15 @@ pub fn enrollInitialVault(
     }
     const a = arena.allocator();
 
-    var store_id: [store_id_len]u8 = undefined;
-    secureRandom(io, &store_id);
+    var store_id: [store_id_len]u8 = options.store_id orelse undefined;
+    if (options.store_id == null) secureRandom(io, &store_id);
     var dek: [dek_len]u8 = undefined;
     secureRandom(io, &dek);
     errdefer std.crypto.secureZero(u8, &dek);
     var prf_output = enrollment.prf_output;
     defer std.crypto.secureZero(u8, &prf_output);
-    var prf_salt: [prf_salt_len]u8 = undefined;
-    secureRandom(io, &prf_salt);
+    var prf_salt: [prf_salt_len]u8 = options.prf_salt orelse enrollment.prf_salt orelse undefined;
+    if (options.prf_salt == null and enrollment.prf_salt == null) secureRandom(io, &prf_salt);
     var recovery_salt: [recovery_salt_len]u8 = undefined;
     secureRandom(io, &recovery_salt);
 
@@ -619,8 +622,8 @@ pub fn addPrfSlot(
     }
 
     const store_id = try parseStoreId(document.value.store_id_hex);
-    var prf_salt: [prf_salt_len]u8 = undefined;
-    secureRandom(io, &prf_salt);
+    var prf_salt: [prf_salt_len]u8 = enrollment.prf_salt orelse undefined;
+    if (enrollment.prf_salt == null) secureRandom(io, &prf_salt);
     const wrapped = try wrapDekWithPrf(
         a,
         io,
@@ -773,7 +776,7 @@ pub fn vaultPath(gpa: Allocator) Error![]u8 {
 pub fn validateEnvelope(vault: *const VaultFile) Error!void {
     if (vault.version != version) return error.UnsupportedVersion;
     _ = try parseStoreId(vault.store_id_hex);
-    if (vault.rp_id.len == 0 or vault.prf_slots.len == 0) return error.InvalidVault;
+    if (vault.rp_id.len == 0) return error.InvalidVault;
     var nonce: [gcm_nonce_len]u8 = undefined;
     try base64DecodeExact(vault.payload_nonce_b64, &nonce);
     const payload_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(
@@ -1101,6 +1104,43 @@ test "initial enrollment unwraps the DEK through PRF and recovery slots" {
             &enrolled.document.value.recovery_slot,
         ),
     );
+}
+
+test "initial enrollment preserves ceremony store ID and PRF salt" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const store_id: [store_id_len]u8 = @splat(0x91);
+    const prf_salt: [prf_salt_len]u8 = @splat(0xa2);
+    const prf_output: [prf_salt_len]u8 = @splat(0xb3);
+    var enrolled = try enrollInitialVault(
+        gpa,
+        io,
+        testEnrollment(prf_output, "credential-ceremony", "primary"),
+        .{
+            .payload_created = 1_700_000_000,
+            .argon2_t = 1,
+            .argon2_m = 1024,
+            .argon2_p = 1,
+            .store_id = store_id,
+            .prf_salt = prf_salt,
+        },
+    );
+    defer enrolled.deinit();
+
+    const stored_store_id = try parseStoreId(enrolled.document.value.store_id_hex);
+    try std.testing.expectEqualSlices(u8, &store_id, &stored_store_id);
+    var stored_prf_salt: [prf_salt_len]u8 = undefined;
+    try base64DecodeExact(enrolled.document.value.prf_slots[0].prf_salt_b64, &stored_prf_salt);
+    try std.testing.expectEqualSlices(u8, &prf_salt, &stored_prf_salt);
+
+    var unwrapped = try unwrapDekWithPrf(
+        gpa,
+        prf_output,
+        stored_store_id,
+        &enrolled.document.value.prf_slots[0],
+    );
+    defer std.crypto.secureZero(u8, &unwrapped);
+    try std.testing.expectEqualSlices(u8, &enrolled.dek, &unwrapped);
 }
 
 test "adding a backup PRF slot and revoking the primary preserves access" {

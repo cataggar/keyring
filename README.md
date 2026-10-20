@@ -2,7 +2,7 @@
 
 `keyring` is a Zig command-line interface for OS credential storage, intended to be compatible with the Python keyring CLI.
 
-Phases A-C are complete; Phase D adds headless Linux ergonomics and diagnostics.
+On Linux, the built-in Secret Service provider supports browser-based, hardware-backed unlocking over an SSH tunnel using WebAuthn PRF (`hmac-secret`).
 
 ## Install
 
@@ -19,7 +19,15 @@ keyring set my-service alice     # prompt for a password and store it
 keyring get my-service alice     # print it; exits 3 when not found
 keyring del my-service alice     # delete it; exits 3 when not found
 keyring diagnose                 # report the resolved backend and its health
+
+# Headless Linux with a local browser and security key:
+keyring service                  # start the provider in its locked state
+keyring enroll                   # enroll a YubiKey and print a Recovery Key
+keyring unlock                   # unlock through the browser/SSH tunnel
+keyring lock                     # immediately clear the in-memory master key
 ```
+
+Use `keyring enroll --add-key`, `--list`, and `--revoke <id>` for multiple authenticators. `keyring unlock --recover` uses the one-time Recovery Key. Set `KEYRING_VAULT_PATH` to override the default encrypted vault path.
 
 ## Documentation
 

@@ -7,6 +7,7 @@
 | `KEYRING_ADO_STORE` | **Linux only.** Where the `ado` backend keeps the long-lived refresh token: `file` (default, `refresh.dat`) or `secret` (Secret Service, `service=ado-keyring`, `account=refresh-token`). Any other value is rejected with exit code 2. With `secret`, an unavailable or locked Secret Service fails with exit code 4 instead of falling back to `refresh.dat`. Ignored on Windows and macOS, which always use the Credential Manager / Keychain. |
 | `KEYRING_ADO_MSAL_CACHE` | When set to `false` or `0`, the `ado` backend will not read the shared MSAL token cache for `az login` SSO. Defaults to on. |
 | `KEYRING_ADO_DISK_CACHE` | When set to `false`, `0`, or `no`, the `ado` backend keeps no persistent cache (neither the platform secret store nor the `.dat` files), so every process re-authenticates. Defaults to on. |
+| `KEYRING_VAULT_PATH` | Override the built-in WebAuthn Secret Service vault path. The default is `$XDG_DATA_HOME/keyring/vault.json`, or `~/.local/share/keyring/vault.json`. The file must not be group/world accessible. |
 | `ARTIFACTS_CREDENTIALPROVIDER_MSAL_FILECACHE_LOCATION` | Path to an additional MSAL cache file the `ado` backend should consult (parity with `artifacts-credprovider`). |
 | `KEYRING_PROPERTY_<NAME>` | Backend-specific properties, such as `KEYRING_PROPERTY_KEYCHAIN`, `KEYRING_PROPERTY_COLLECTION`, or `KEYRING_PROPERTY_APPID`. |
 | `NO_COLOR` | Disable ANSI colors in diagnostic output. |
@@ -19,4 +20,5 @@ KEYRING_BACKEND=null keyring get svc user # exits 3 when the entry is not found
 KEYRING_BACKEND=ado keyring get https://pkgs.dev.azure.com/myorg/_packaging/feed/pypi/simple/ VssSessionToken
 KEYRING_ADO_STORE=secret keyring diagnose # Linux: report the Secret Service store
 KEYRING_PROPERTY_COLLECTION=default keyring diagnose
+KEYRING_VAULT_PATH="$HOME/.local/share/keyring/work-vault.json" keyring enroll
 ```

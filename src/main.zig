@@ -7,6 +7,11 @@ const az_export = @import("az_export.zig");
 const devops_npm = @import("devops_npm.zig");
 const color = @import("color.zig");
 const term = @import("term.zig");
+const vault = @import("vault.zig");
+
+test {
+    _ = vault;
+}
 
 var runtime_env_map: ?*std.process.Environ.Map = null;
 var app_backend_override: ?Backend = null;

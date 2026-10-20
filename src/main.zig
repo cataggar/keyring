@@ -8,9 +8,11 @@ const devops_npm = @import("devops_npm.zig");
 const color = @import("color.zig");
 const term = @import("term.zig");
 const vault = @import("vault.zig");
+const service = @import("service.zig");
 
 test {
     _ = vault;
+    _ = service;
 }
 
 var runtime_env_map: ?*std.process.Environ.Map = null;
@@ -349,18 +351,18 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     try diagnoseProperties(arena, stdout);
 
     if (builtin.os.tag == .linux) {
-        const service = "keyring-cli-diagnose-service-that-should-not-exist";
+        const probe_service = "keyring-cli-diagnose-service-that-should-not-exist";
         const user = "keyring-cli-diagnose-user-that-should-not-exist";
-        if (getPassword(arena, stdout, service, user)) |password| {
+        if (getPassword(arena, stdout, probe_service, user)) |password| {
             _ = password;
         } else |err| switch (err) {
             error.NoStorageAccess => try printLinuxNoStorageAccessHint(stdout, colors),
             else => {},
         }
     } else {
-        const service = "keyring-cli-diagnose-service-that-should-not-exist";
+        const probe_service = "keyring-cli-diagnose-service-that-should-not-exist";
         const user = "keyring-cli-diagnose-user-that-should-not-exist";
-        if (getPassword(arena, stdout, service, user)) |password| {
+        if (getPassword(arena, stdout, probe_service, user)) |password| {
             _ = password;
             try stdout.writeAll("backend reachable: yes\n");
         } else |err| switch (err) {
@@ -446,14 +448,14 @@ fn currentBackend() Backend {
 /// explicitly (no `-b`, no `--disable`, no `KEYRING_BACKEND` env var) and the
 /// service string looks like an Azure DevOps URL, route to the `ado` backend
 /// so tools like uv "just work" against ADO package feeds.
-fn effectiveBackend(service: ?[]const u8) Backend {
+fn effectiveBackend(service_name: ?[]const u8) Backend {
     if (app_backend_override) |backend| return backend;
     if (!app_env_backend_checked) {
         app_env_backend = readAppEnvBackend();
         app_env_backend_checked = true;
     }
     if (app_env_backend) |backend| return backend;
-    if (service) |s| {
+    if (service_name) |s| {
         if (ado.isDevOpsUrl(s)) return .ado;
     }
     return .{ .keyring = keyring_zig.currentBackend() };
@@ -478,24 +480,24 @@ fn backendName(backend: Backend) []const u8 {
     };
 }
 
-fn getPassword(arena: std.mem.Allocator, stderr: *std.Io.Writer, service: []const u8, user: []const u8) (keyring_zig.Error || ado.Error)![]u8 {
-    return switch (effectiveBackend(service)) {
-        .ado => ado.getPassword(arena, stderr, service, user),
-        .keyring => keyring_zig.getAlloc(arena, service, user),
+fn getPassword(arena: std.mem.Allocator, stderr: *std.Io.Writer, service_name: []const u8, user: []const u8) (keyring_zig.Error || ado.Error)![]u8 {
+    return switch (effectiveBackend(service_name)) {
+        .ado => ado.getPassword(arena, stderr, service_name, user),
+        .keyring => keyring_zig.getAlloc(arena, service_name, user),
     };
 }
 
-fn setPassword(arena: std.mem.Allocator, service: []const u8, user: []const u8, password: []const u8) (keyring_zig.Error || ado.Error)!void {
-    return switch (effectiveBackend(service)) {
-        .ado => ado.setPassword(arena, service, user, password),
-        .keyring => keyring_zig.setAlloc(arena, service, user, password),
+fn setPassword(arena: std.mem.Allocator, service_name: []const u8, user: []const u8, password: []const u8) (keyring_zig.Error || ado.Error)!void {
+    return switch (effectiveBackend(service_name)) {
+        .ado => ado.setPassword(arena, service_name, user, password),
+        .keyring => keyring_zig.setAlloc(arena, service_name, user, password),
     };
 }
 
-fn deletePassword(arena: std.mem.Allocator, service: []const u8, user: []const u8) (keyring_zig.Error || ado.Error)!void {
-    return switch (effectiveBackend(service)) {
+fn deletePassword(arena: std.mem.Allocator, service_name: []const u8, user: []const u8) (keyring_zig.Error || ado.Error)!void {
+    return switch (effectiveBackend(service_name)) {
         .ado => ado.deletePassword(arena),
-        .keyring => keyring_zig.deleteAlloc(arena, service, user),
+        .keyring => keyring_zig.deleteAlloc(arena, service_name, user),
     };
 }
 
@@ -522,10 +524,10 @@ pub fn exitCodeFor(err: anyerror) u8 {
     };
 }
 
-fn printAppError(stderr: *std.Io.Writer, err: anyerror, service: ?[]const u8, user: ?[]const u8) !void {
+fn printAppError(stderr: *std.Io.Writer, err: anyerror, service_name: ?[]const u8, user: ?[]const u8) !void {
     const msg = errorMessage(err);
-    if (entryErrorContext(err) and service != null and user != null) {
-        try stderr.print("keyring: {s}: service='{s}' user='{s}'\n", .{ msg, service.?, user.? });
+    if (entryErrorContext(err) and service_name != null and user != null) {
+        try stderr.print("keyring: {s}: service='{s}' user='{s}'\n", .{ msg, service_name.?, user.? });
     } else {
         try stderr.print("keyring: {s}\n", .{msg});
     }

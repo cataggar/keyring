@@ -20,6 +20,10 @@ pub fn build(b: *std.Build) void {
         .@"file-backend" = enable_file_backend,
     });
     const keyring_zig_module = keyring_zig.module("keyring_zig");
+    // Reuse keyring-zig's D-Bus module instance. Creating a second module
+    // rooted at the same file is rejected by Zig 0.17.
+    const secret_service_module = keyring_zig_module.import_table.get("secret_service").?;
+    const dbus_module = secret_service_module.import_table.get("dbus").?;
 
     const exe = b.addExecutable(.{
         .name = "keyring",
@@ -30,6 +34,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("keyring_zig", keyring_zig_module);
+    exe.root_module.addImport("dbus", dbus_module);
     exe.root_module.addImport("app_build_options", build_options_module);
     linkPlatformDeps(exe.root_module, target.result.os.tag);
 
@@ -49,6 +54,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     unit_tests.root_module.addImport("keyring_zig", keyring_zig_module);
+    unit_tests.root_module.addImport("dbus", dbus_module);
     unit_tests.root_module.addImport("app_build_options", build_options_module);
     linkPlatformDeps(unit_tests.root_module, target.result.os.tag);
 

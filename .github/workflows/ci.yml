@@ -42,7 +42,7 @@ jobs:
           test "$version" = "0.17.0"
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
+        run: sudo apt-get update && sudo apt-get install -y dbus libsecret-1-dev python3-cryptography
       - name: Build
         run: zig build
       - name: Test
@@ -50,6 +50,9 @@ jobs:
       - name: Test headless Linux behavior
         if: runner.os == 'Linux'
         run: bash tests/headless_linux.sh
+      - name: Test WebAuthn Secret Service flow
+        if: runner.os == 'Linux'
+        run: bash tests/webauthn_service_integration.sh
 
   static-linux:
     name: Static ${{ matrix.target }}

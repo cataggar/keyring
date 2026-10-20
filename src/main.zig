@@ -752,3 +752,8 @@ test "disabled Color methods are empty" {
 test {
     _ = devops_npm;
 }
+
+test {
+    _ = @import("webauthn.zig");
+    _ = @import("tunnel_http.zig");
+}

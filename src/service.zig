@@ -342,8 +342,13 @@ pub const ServiceState = struct {
             var body: std.ArrayList(u8) = .empty;
             defer body.deinit(self.gpa);
             var w = wire.Writer.init(self.gpa, &body);
-            try writeObjectPathArray(&w, matches.items);
-            try writeObjectPathArray(&w, &.{});
+            if (self.unlocked) {
+                try writeObjectPathArray(&w, matches.items);
+                try writeObjectPathArray(&w, &.{});
+            } else {
+                try writeObjectPathArray(&w, &.{});
+                try writeObjectPathArray(&w, &.{collection_path});
+            }
             return self.reply(call, "aoao", body.items);
         }
         if (std.mem.eql(u8, member, "Unlock")) {
@@ -1660,7 +1665,8 @@ test "service dispatch unlocks, serves both session algorithms, persists CRUD, a
         try std.testing.expect(!r.arrayHasMore(unlocked));
         r.pos = unlocked.end;
         const locked = try r.beginArray(4);
-        try std.testing.expect(!r.arrayHasMore(locked));
+        try std.testing.expect(r.arrayHasMore(locked));
+        try std.testing.expectEqualStrings(collection_path, try r.readObjectPath());
     }
 
     {

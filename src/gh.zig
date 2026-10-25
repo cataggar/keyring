@@ -975,53 +975,30 @@ fn readFileIfExists(gpa: Allocator, path: []const u8) ?[]u8 {
 
 fn writePrivateFile(dir_path: []const u8, filename: []const u8, data: []const u8) !void {
     const io = Io.Threaded.global_single_threaded.io();
-    try makePathPrivate(io, dir_path);
+    _ = try Io.Dir.cwd().createDirPathStatus(io, dir_path, dirPermissions());
 
     var dir = try Io.Dir.cwd().openDir(io, dir_path, .{});
     defer dir.close(io);
 
-    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-        dir.setPermissions(io, .fromMode(0o700)) catch {};
-    }
-
     const file = try dir.createFile(io, filename, .{
         .truncate = true,
-        .permissions = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
-            .default_file
-        else
-            .fromMode(0o600),
+        .permissions = filePermissions(),
     });
     defer file.close(io);
 
     if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-        file.setPermissions(io, .fromMode(0o600)) catch {};
+        file.setPermissions(io, filePermissions()) catch {};
     }
 
     try file.writeStreamingAll(io, data);
 }
 
-fn makePathPrivate(io: Io, path: []const u8) !void {
-    var end: usize = 0;
-    while (end < path.len) {
-        const rest = path[end..];
-        const rel_sep = std.mem.indexOfAny(u8, rest, "/\\");
-        const next_end = if (rel_sep) |idx| end + idx else path.len;
-        if (next_end > 0) {
-            const prefix = path[0..next_end];
-            Io.Dir.cwd().createDir(
-                io,
-                prefix,
-                if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
-                    .default_dir
-                else
-                    .fromMode(0o700),
-            ) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                else => if (next_end == path.len) return err,
-            };
-        }
-        end = next_end + 1;
-    }
+fn dirPermissions() Io.File.Permissions {
+    return if (builtin.os.tag == .windows or builtin.os.tag == .wasi) .default_dir else .fromMode(0o700);
+}
+
+fn filePermissions() Io.File.Permissions {
+    return if (builtin.os.tag == .windows or builtin.os.tag == .wasi) .default_file else .fromMode(0o600);
 }
 
 fn getEnvVarOwned(gpa: Allocator, name: []const u8) ?[]u8 {

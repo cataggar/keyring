@@ -42,6 +42,15 @@ keyring -b null get my-service alice
 keyring -b secret_service set my-service alice
 keyring -b ado get https://pkgs.dev.azure.com/myorg/_packaging/feed/pypi/simple/ VssSessionToken
 
+# Export Azure CLI cache or GitHub CLI credentials for a headless machine.
+keyring az export /tmp/az-export
+keyring gh export /tmp/gh-export
+
+# Import GitHub CLI credentials into the OS keyring (from dir, file, stdin, or local hosts.yml).
+keyring gh import /tmp/gh-export
+keyring gh import
+ssh vm 'cat ~/.config/gh/hosts.yml' | keyring gh import -
+
 # Authenticate Azure Artifacts npm feeds from .npmrc and update ~/.npmrc.
 keyring devops-npm
 keyring devops-npm -c path/to/.npmrc -f

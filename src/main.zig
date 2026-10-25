@@ -5,6 +5,7 @@ const ado = @import("ado.zig");
 const msal_cache = @import("msal_cache.zig");
 const az_export = @import("az_export.zig");
 const devops_npm = @import("devops_npm.zig");
+const gh = @import("gh.zig");
 const color = @import("color.zig");
 const term = @import("term.zig");
 const vault = @import("vault.zig");
@@ -42,6 +43,9 @@ const usage =
     \\  set <service> <user>          Store a password from stdin.
     \\  get <service> <user>          Read a password to stdout.
     \\  del <service> <user>          Delete a password.
+    \\  az export <dir>               Export Azure CLI token cache to a directory.
+    \\  gh export <dir>               Export GitHub CLI credentials to <dir>/hosts.yml.
+    \\  gh import [<dir-or-file>]     Import GitHub CLI credentials into the keyring.
     \\  devops-npm [options]          Authenticate Azure DevOps npm feeds in .npmrc.
     \\
     \\Backends: secret_service, keychain, win_credential, file, ado, null_backend (or null)
@@ -91,6 +95,8 @@ pub const Command = union(enum) {
     get: struct { service: []const u8, user: []const u8 },
     del: struct { service: []const u8, user: []const u8 },
     az_export: struct { dir: []const u8 },
+    gh_export: struct { dir: []const u8 },
+    gh_import: struct { source: ?[]const u8 },
     devops_npm: devops_npm.Options,
     usage_error: []const u8,
 };
@@ -252,6 +258,14 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
         .az_export => |cmd| code: {
             break :code try az_export.run(arena, cmd.dir, stdout, stderr);
         },
+        .gh_export => |cmd| code: {
+            break :code try gh.runExport(arena, cmd.dir, stdout, stderr);
+        },
+        .gh_import => |cmd| code: {
+            var stdin_buffer: [4096]u8 = undefined;
+            var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+            break :code try gh.runImport(arena, cmd.source, &stdin_reader.interface, stdout, stderr);
+        },
         .devops_npm => |opts| code: {
             break :code try devops_npm.run(arena, io, opts, stdout, stderr);
         },
@@ -354,6 +368,19 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
             .{ .az_export = .{ .dir = rest[1] } }
         else
             .{ .usage_error = "usage: keyring az export <dir>" };
+        return parsed;
+    }
+
+    if (std.mem.eql(u8, command, "gh")) {
+        if (rest.len == 2 and std.mem.eql(u8, rest[0], "export") and rest[1].len > 0) {
+            parsed.command = .{ .gh_export = .{ .dir = rest[1] } };
+        } else if (rest.len == 1 and std.mem.eql(u8, rest[0], "import")) {
+            parsed.command = .{ .gh_import = .{ .source = null } };
+        } else if (rest.len == 2 and std.mem.eql(u8, rest[0], "import") and rest[1].len > 0) {
+            parsed.command = .{ .gh_import = .{ .source = rest[1] } };
+        } else {
+            parsed.command = .{ .usage_error = "usage: keyring gh <export <dir> | import [<dir-or-file>]>" };
+        }
         return parsed;
     }
 
@@ -1266,6 +1293,26 @@ test "parseArgs recognizes az export" {
     try expectUsage(parseArgs(&.{ "keyring", "az" }));
 }
 
+test "parseArgs recognizes gh export and import" {
+    const exp = parseArgs(&.{ "keyring", "gh", "export", "/tmp/gh-out" });
+    try expectCommandTag(.gh_export, exp);
+    try std.testing.expectEqualStrings("/tmp/gh-out", exp.command.gh_export.dir);
+
+    const imp_local = parseArgs(&.{ "keyring", "gh", "import" });
+    try expectCommandTag(.gh_import, imp_local);
+    try std.testing.expect(imp_local.command.gh_import.source == null);
+
+    const imp_dir = parseArgs(&.{ "keyring", "gh", "import", "/tmp/gh-out" });
+    try expectCommandTag(.gh_import, imp_dir);
+    try std.testing.expectEqualStrings("/tmp/gh-out", imp_dir.command.gh_import.source.?);
+
+    try expectUsage(parseArgs(&.{ "keyring", "gh" }));
+    try expectUsage(parseArgs(&.{ "keyring", "gh", "export" }));
+    try expectUsage(parseArgs(&.{ "keyring", "gh", "export", "/tmp/a", "extra" }));
+    try expectUsage(parseArgs(&.{ "keyring", "gh", "import", "/tmp/a", "extra" }));
+    try expectUsage(parseArgs(&.{ "keyring", "gh", "bogus" }));
+}
+
 test "parseArgs recognizes devops-npm" {
     const bare = parseArgs(&.{ "keyring", "devops-npm" });
     try expectCommandTag(.devops_npm, bare);
@@ -1378,7 +1425,9 @@ test "disabled Color methods are empty" {
 }
 
 test {
+    _ = az_export;
     _ = devops_npm;
+    _ = gh;
 }
 
 test {

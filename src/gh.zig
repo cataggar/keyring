@@ -1698,7 +1698,7 @@ pub fn getOrLoginGitCredential(
     return cred;
 }
 
-/// Parse CLI arguments for `keyring gh login [--hostname <host>] [--scopes <scopes>] [--web|--device]`.
+/// Parse CLI arguments for `keyring gh login [-h|--hostname <host>] [--scopes <scopes>] [--web|--device]`.
 pub fn parseLoginArgs(args: []const []const u8) ?LoginOptions {
     var opts: LoginOptions = .{};
     var saw_web = false;
@@ -1783,10 +1783,14 @@ pub fn loginOAuth(
     const normalized_scopes = try normalizeScopesAlloc(gpa, opts.scopes);
     defer gpa.free(normalized_scopes);
 
+    const can_open_browser = canOpenBrowserForOAuth(gpa);
     const token = switch (opts.mode) {
-        .device => try deviceCodeOAuthFlow(gpa, endpoints, client_id, normalized_scopes, true, stderr),
+        .device => try deviceCodeOAuthFlow(gpa, endpoints, client_id, normalized_scopes, can_open_browser, stderr),
         .web => try webAppOAuthFlow(gpa, endpoints, client_id, client_secret, normalized_scopes, false, stderr),
-        .auto => try webAppOAuthFlow(gpa, endpoints, client_id, client_secret, normalized_scopes, true, stderr),
+        .auto => if (can_open_browser)
+            try webAppOAuthFlow(gpa, endpoints, client_id, client_secret, normalized_scopes, true, stderr)
+        else
+            try deviceCodeOAuthFlow(gpa, endpoints, client_id, normalized_scopes, false, stderr),
     };
     errdefer gpa.free(token);
 
@@ -2063,11 +2067,21 @@ pub fn buildGitHubAuthorizeUrl(
     return std.fmt.allocPrint(gpa, "{s}/login/oauth/authorize?{s}", .{ trimmed_base, query.written() });
 }
 
+fn canOpenBrowserForOAuth(gpa: Allocator) bool {
+    return ado.canLaunchBrowserWithEnv(
+        gpa,
+        getEnvVarOwned,
+        true,
+        builtin.os.tag,
+        ado.isWsl(),
+    );
+}
+
 fn openBrowserForOAuth(gpa: Allocator, stderr: *Io.Writer, url: []const u8) AuthError!void {
     if (browser_open_override) |override_fn| {
         return override_fn(gpa, stderr, url);
     }
-    ado.openBrowser(gpa, stderr, url) catch |err| return switch (err) {
+    ado.openBrowserWithEnv(gpa, stderr, url, getEnvVarOwned, true) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.NoStorageAccess,
     };
@@ -2970,7 +2984,8 @@ test "loginOAuth falls back to device flow and stores token in hosts.yml when OS
     poll_sleep_override = HeadlessMocks.noSleep;
     defer poll_sleep_override = null;
     env_override_fn = struct {
-        fn get(_: []const u8) ?[]const u8 {
+        fn get(name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "DISPLAY")) return ":0";
             return null;
         }
     }.get;
@@ -3010,6 +3025,92 @@ test "loginOAuth falls back to device flow and stores token in hosts.yml when OS
 
     // `git credential approve` (`storeGitCredential`) recognizes the token already in hosts.yml.
     try storeGitCredential(gpa, "microsoft.ghe.com", "cameron-taggart", "gho_headless_ghe_token");
+}
+
+test "loginOAuth skips web loopback and browser launch in headless SSH session" {
+    const gpa = std.testing.allocator;
+    FakeStore.reset(gpa);
+    defer FakeStore.reset(gpa);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const config_dir = try std.fs.path.join(gpa, &.{ root, "gh-config" });
+    defer gpa.free(config_dir);
+
+    const SshMocks = struct {
+        var browser_calls: usize = 0;
+
+        fn postFormJson(alloc: Allocator, url: []const u8, _: []const u8) AuthError![]u8 {
+            if (std.mem.eql(u8, "https://microsoft.ghe.com/login/device/code", url)) {
+                return alloc.dupe(
+                    u8,
+                    "{\"device_code\":\"dev_ssh\",\"user_code\":\"48FC-EFA6\",\"verification_uri\":\"https://microsoft.ghe.com/login/device\",\"expires_in\":900,\"interval\":1}",
+                );
+            }
+            if (std.mem.eql(u8, "https://microsoft.ghe.com/login/oauth/access_token", url)) {
+                return alloc.dupe(u8, "{\"access_token\":\"gho_ssh_ghe_token\"}");
+            }
+            return error.AuthenticationFailed;
+        }
+
+        fn getJsonWithToken(alloc: Allocator, url: []const u8, token: []const u8) AuthError![]u8 {
+            if (!std.mem.eql(u8, "https://api.microsoft.ghe.com/user", url)) return error.AuthenticationFailed;
+            if (!std.mem.eql(u8, "gho_ssh_ghe_token", token)) return error.AuthenticationFailed;
+            return alloc.dupe(u8, "{\"login\":\"cameron-taggart\"}");
+        }
+
+        fn openBrowser(_: Allocator, _: *Io.Writer, _: []const u8) AuthError!void {
+            browser_calls += 1;
+            return error.NoStorageAccess;
+        }
+
+        fn noSleep(_: u32) void {}
+    };
+
+    SshMocks.browser_calls = 0;
+
+    secret_store_override = FakeStore.store;
+    defer secret_store_override = null;
+    gh_config_dir_override = config_dir;
+    defer gh_config_dir_override = null;
+    http_transport_override = .{
+        .postFormJson = SshMocks.postFormJson,
+        .getJsonWithToken = SshMocks.getJsonWithToken,
+    };
+    defer http_transport_override = null;
+    browser_open_override = SshMocks.openBrowser;
+    defer browser_open_override = null;
+    poll_sleep_override = SshMocks.noSleep;
+    defer poll_sleep_override = null;
+    env_override_fn = struct {
+        fn get(name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "SSH_TTY")) return "/dev/pts/0";
+            if (std.mem.eql(u8, name, "SSH_CONNECTION")) return "10.0.0.1 54321 10.0.0.2 22";
+            return null;
+        }
+    }.get;
+    defer env_override_fn = null;
+
+    var stdout = Io.Writer.Allocating.init(gpa);
+    defer stdout.deinit();
+    var stderr = Io.Writer.Allocating.init(gpa);
+    defer stderr.deinit();
+
+    const code = try runLogin(gpa, .{
+        .hostname = "microsoft.ghe.com",
+        .mode = .auto,
+    }, &stdout.writer, &stderr.writer);
+    try std.testing.expectEqual(@as(u8, 0), code);
+    // Neither webAppOAuthFlow nor deviceCodeOAuthFlow attempted to launch a browser.
+    try std.testing.expectEqual(@as(usize, 0), SshMocks.browser_calls);
+    try std.testing.expect(std.mem.indexOf(u8, stderr.written(), "127.0.0.1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr.written(), "48FC-EFA6") != null);
 }
 
 test "saveUserCredential returns Locked and does not write plaintext hosts.yml when keyring is locked" {

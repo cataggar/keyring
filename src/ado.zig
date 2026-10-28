@@ -384,7 +384,7 @@ fn acquireAccessToken(gpa: Allocator, stderr: *Io.Writer, refresh_token: ?[]cons
     // from the shared MSAL cache using our own client id (issue #19).
     if (tryMsalAuth(gpa, stderr)) |parsed| return parsed;
 
-    if (isNonInteractive()) return error.NoStorageAccess;
+    if (isNonInteractive() or !canLaunchBrowser()) return error.NoStorageAccess;
     log(stderr, "{s} No cached token, starting browser auth...\n", .{log_prefix});
     return browserAuth(gpa, stderr);
 }
@@ -543,7 +543,7 @@ pub fn generatePkce(verifier_out: *[43]u8, challenge_out: *[43]u8) void {
 }
 
 fn browserAuth(gpa: Allocator, stderr: *Io.Writer) Error!std.json.Parsed(TokenResponse) {
-    if (isNonInteractive()) return error.NoStorageAccess;
+    if (isNonInteractive() or !canLaunchBrowser()) return error.NoStorageAccess;
 
     var verifier: [43]u8 = undefined;
     var challenge: [43]u8 = undefined;
@@ -771,6 +771,32 @@ fn sendHtml(io: Io, stream: std.Io.net.Stream, html: []const u8) Error!void {
 }
 
 pub fn openBrowser(gpa: Allocator, stderr: *Io.Writer, url: []const u8) Error!void {
+    return openBrowserWithEnv(gpa, stderr, url, getEnvVarOwned, false);
+}
+
+pub fn openBrowserWithEnv(
+    gpa: Allocator,
+    stderr: *Io.Writer,
+    url: []const u8,
+    env_fn: EnvLookupFn,
+    check_gh_browser: bool,
+) Error!void {
+    if (!canLaunchBrowserWithEnv(gpa, env_fn, check_gh_browser, builtin.os.tag, isWsl())) {
+        return error.NoStorageAccess;
+    }
+    // global_single_threaded uses a failing allocator, which makes
+    // std.process.spawn return OutOfMemory. Initialize our own Threaded
+    // instance backed by `gpa` for process spawning.
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = currentProcessEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    if (customBrowserCommandAlloc(gpa, env_fn, check_gh_browser)) |custom_cmd| {
+        defer gpa.free(custom_cmd);
+        const argv: []const []const u8 = &.{ custom_cmd, url };
+        if (spawnBrowserAttempt(io, stderr, argv)) return;
+    }
+
     if (builtin.os.tag == .windows) {
         // Call ShellExecuteW("open", url, ...) directly. Going through a shell
         // (cmd /c start, powershell Start-Process) truncates the URL at the
@@ -782,33 +808,53 @@ pub fn openBrowser(gpa: Allocator, stderr: *Io.Writer, url: []const u8) Error!vo
         log(stderr, "{s} ShellExecuteW failed to open browser\n", .{log_prefix});
         return error.NoStorageAccess;
     }
-    // global_single_threaded uses a failing allocator, which makes
-    // std.process.spawn return OutOfMemory. Initialize our own Threaded
-    // instance backed by `gpa` for process spawning.
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = currentProcessEnviron() });
-    defer threaded.deinit();
-    const io = threaded.io();
+
     const attempts = browserAttempts();
     for (attempts) |argv_prefix| {
         const argv = try appendUrlArg(gpa, argv_prefix, url);
         defer gpa.free(argv);
-        var child = std.process.spawn(io, .{
-            .argv = argv,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .ignore,
-        }) catch |err| {
-            log(stderr, "{s} browser spawn '{s}' failed: {s}\n", .{ log_prefix, argv[0], @errorName(err) });
-            continue;
-        };
-        const term = child.wait(io) catch |err| {
-            log(stderr, "{s} browser wait '{s}' failed: {s}\n", .{ log_prefix, argv[0], @errorName(err) });
-            continue;
-        };
-        if (term == .exited and term.exited == 0) return;
-        log(stderr, "{s} browser command '{s}' exited non-zero: {any}\n", .{ log_prefix, argv[0], term });
+        if (spawnBrowserAttempt(io, stderr, argv)) return;
     }
     return error.NoStorageAccess;
+}
+
+fn spawnBrowserAttempt(io: Io, stderr: *Io.Writer, argv: []const []const u8) bool {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch |err| {
+        log(stderr, "{s} browser spawn '{s}' failed: {s}\n", .{ log_prefix, argv[0], @errorName(err) });
+        return false;
+    };
+    const term = child.wait(io) catch |err| {
+        log(stderr, "{s} browser wait '{s}' failed: {s}\n", .{ log_prefix, argv[0], @errorName(err) });
+        return false;
+    };
+    if (term == .exited and term.exited == 0) return true;
+    log(stderr, "{s} browser command '{s}' exited non-zero: {any}\n", .{ log_prefix, argv[0], term });
+    return false;
+}
+
+fn customBrowserCommandAlloc(gpa: Allocator, env_fn: EnvLookupFn, check_gh_browser: bool) ?[]u8 {
+    if (check_gh_browser) {
+        if (env_fn(gpa, "GH_BROWSER")) |val| {
+            defer gpa.free(val);
+            const trimmed = std.mem.trim(u8, val, " \t\r\n");
+            if (trimmed.len > 0 and !isBrowserEnvDisabled(trimmed)) {
+                return gpa.dupe(u8, trimmed) catch null;
+            }
+        }
+    }
+    if (env_fn(gpa, "BROWSER")) |val| {
+        defer gpa.free(val);
+        const trimmed = std.mem.trim(u8, val, " \t\r\n");
+        if (trimmed.len > 0 and !isBrowserEnvDisabled(trimmed)) {
+            return gpa.dupe(u8, trimmed) catch null;
+        }
+    }
+    return null;
 }
 
 const SW_SHOWNORMAL: i32 = 1;
@@ -855,13 +901,123 @@ fn appendUrlArg(gpa: Allocator, prefix: []const []const u8, url: []const u8) Err
     return argv;
 }
 
-fn isWsl() bool {
+pub fn isWsl() bool {
     if (builtin.os.tag != .linux) return false;
     const io = std.Io.Threaded.global_single_threaded.io();
     const contents = std.Io.Dir.cwd().readFileAlloc(io, "/proc/version", std.heap.page_allocator, .limited(4096)) catch return false;
     defer std.heap.page_allocator.free(contents);
     _ = std.ascii.lowerString(contents, contents);
     return std.mem.indexOf(u8, contents, "microsoft") != null;
+}
+
+pub const EnvLookupFn = *const fn (gpa: Allocator, name: []const u8) ?[]u8;
+
+/// Return true when `value` (from `BROWSER` or `GH_BROWSER`) explicitly
+/// disables launching a browser.
+pub fn isBrowserEnvDisabled(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(trimmed, "false") or
+        std.ascii.eqlIgnoreCase(trimmed, "none") or
+        std.ascii.eqlIgnoreCase(trimmed, "0") or
+        std.ascii.eqlIgnoreCase(trimmed, "no") or
+        std.ascii.eqlIgnoreCase(trimmed, "echo") or
+        std.mem.eql(u8, trimmed, "/bin/false") or
+        std.mem.eql(u8, trimmed, "/usr/bin/false") or
+        std.mem.eql(u8, trimmed, ":");
+}
+
+fn hasNonEmptyEnvWith(gpa: Allocator, env_fn: EnvLookupFn, name: []const u8) bool {
+    const val = env_fn(gpa, name) orelse return false;
+    defer gpa.free(val);
+    return std.mem.trim(u8, val, " \t\r\n").len > 0;
+}
+
+/// Determine whether the current environment can launch a local web browser,
+/// following Git Credential Manager (`LinuxSessionManager` / `PosixSessionManager`)
+/// and Azure CLI (`can_launch_browser` / `_profile.py`) environment checks:
+///
+/// - Honors explicit disable values in `GH_BROWSER` (when `check_gh_browser` is
+///   set) and `BROWSER` (`false`, `none`, `0`, `no`, `echo`, `/bin/false`, `:`).
+/// - Treats GitHub Codespaces (`CODESPACES=true`) and Azure Cloud Shell
+///   (`ACC_CLOUD`) as headless environments without a local loopback browser
+///   (matching Azure CLI).
+/// - In VS Code Remote sessions (`VSCODE_IPC_HOOK_CLI` and `BROWSER` set),
+///   allows browser launch in Remote-SSH (`SSH_CONNECTION` set without
+///   `SSH_TTY`) and Dev Containers (`REMOTE_CONTAINERS` set), while rejecting
+///   Remote Tunnels and regular SSH TTY sessions (matching GCM).
+/// - Rejects SSH sessions (`SSH_TTY`, `SSH_CLIENT`, or `SSH_CONNECTION` set)
+///   that have no X11 or Wayland display (`DISPLAY` or `WAYLAND_DISPLAY`).
+/// - Allows a non-disabled custom `GH_BROWSER` or `BROWSER` handler when not
+///   in an unforwarded SSH session.
+/// - On Linux, requires either WSL (`is_wsl`) or a graphical desktop session
+///   (`DISPLAY` or `WAYLAND_DISPLAY` set), matching GCM's `IsDesktopSession`
+///   and Azure CLI's `can_launch_browser()`.
+pub fn canLaunchBrowserWithEnv(
+    gpa: Allocator,
+    env_fn: EnvLookupFn,
+    check_gh_browser: bool,
+    os_tag: std.Target.Os.Tag,
+    is_wsl: bool,
+) bool {
+    var has_gh_browser = false;
+    if (check_gh_browser) {
+        if (env_fn(gpa, "GH_BROWSER")) |val| {
+            defer gpa.free(val);
+            const trimmed = std.mem.trim(u8, val, " \t\r\n");
+            if (trimmed.len > 0) {
+                if (isBrowserEnvDisabled(trimmed)) return false;
+                has_gh_browser = true;
+            }
+        }
+    }
+
+    var has_browser = false;
+    if (env_fn(gpa, "BROWSER")) |val| {
+        defer gpa.free(val);
+        const trimmed = std.mem.trim(u8, val, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (isBrowserEnvDisabled(trimmed)) return false;
+            has_browser = true;
+        }
+    }
+
+    if (env_fn(gpa, "CODESPACES")) |val| {
+        defer gpa.free(val);
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, val, " \t\r\n"), "true")) return false;
+    }
+    if (hasNonEmptyEnvWith(gpa, env_fn, "ACC_CLOUD")) return false;
+
+    const is_desktop_session = hasNonEmptyEnvWith(gpa, env_fn, "DISPLAY") or
+        hasNonEmptyEnvWith(gpa, env_fn, "WAYLAND_DISPLAY");
+    const has_ssh_tty = hasNonEmptyEnvWith(gpa, env_fn, "SSH_TTY");
+    const has_ssh_client = hasNonEmptyEnvWith(gpa, env_fn, "SSH_CLIENT");
+    const has_ssh_connection = hasNonEmptyEnvWith(gpa, env_fn, "SSH_CONNECTION");
+    const is_ssh_session = has_ssh_tty or has_ssh_client or has_ssh_connection;
+
+    if (has_browser and hasNonEmptyEnvWith(gpa, env_fn, "VSCODE_IPC_HOOK_CLI")) {
+        if (has_ssh_connection and !has_ssh_tty) return true;
+        if (hasNonEmptyEnvWith(gpa, env_fn, "REMOTE_CONTAINERS")) return true;
+        return false;
+    }
+
+    if (is_ssh_session and !is_desktop_session) return false;
+
+    if (has_gh_browser or has_browser) return true;
+
+    if (os_tag == .windows or os_tag == .macos) return true;
+    if (os_tag == .linux and is_wsl) return true;
+    return is_desktop_session;
+}
+
+pub fn canLaunchBrowser() bool {
+    return canLaunchBrowserWithEnv(
+        std.heap.page_allocator,
+        getEnvVarOwned,
+        false,
+        builtin.os.tag,
+        isWsl(),
+    );
 }
 
 fn randomUrlToken(gpa: Allocator, byte_len: usize) Error![]u8 {
@@ -2417,4 +2573,103 @@ test "diagnostics describe refresh.dat by what the next run will actually do" {
     const file_store = try report(gpa);
     defer gpa.free(file_store);
     try std.testing.expect(std.mem.indexOf(u8, file_store, "ado refresh.dat: present\n") != null);
+}
+
+test "canLaunchBrowserWithEnv checks SSH, DISPLAY, WAYLAND_DISPLAY, BROWSER, WSL, and VS Code Remote" {
+    const gpa = std.testing.allocator;
+
+    const EnvHelper = struct {
+        var entries: []const struct { k: []const u8, v: []const u8 } = &.{};
+
+        fn lookup(alloc: Allocator, name: []const u8) ?[]u8 {
+            for (entries) |e| {
+                if (std.mem.eql(u8, e.k, name)) return alloc.dupe(u8, e.v) catch null;
+            }
+            return null;
+        }
+    };
+    defer EnvHelper.entries = &.{};
+
+    // Headless Linux without DISPLAY/WAYLAND_DISPLAY (non-WSL): false.
+    EnvHelper.entries = &.{};
+    try std.testing.expect(!canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+
+    // Headless SSH session on Linux (SSH_TTY, SSH_CLIENT, SSH_CONNECTION set, no DISPLAY): false.
+    EnvHelper.entries = &.{
+        .{ .k = "SSH_TTY", .v = "/dev/pts/0" },
+        .{ .k = "SSH_CLIENT", .v = "10.0.0.1 54321 22" },
+        .{ .k = "SSH_CONNECTION", .v = "10.0.0.1 54321 10.0.0.2 22" },
+    };
+    try std.testing.expect(!canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+    // Even on macOS or WSL, an SSH session without X11/Wayland display cannot open a local GUI browser.
+    try std.testing.expect(!canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .macos, false));
+    try std.testing.expect(!canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, true));
+
+    // SSH session with X11 forwarding (DISPLAY set): true.
+    EnvHelper.entries = &.{
+        .{ .k = "SSH_TTY", .v = "/dev/pts/0" },
+        .{ .k = "DISPLAY", .v = "localhost:10.0" },
+    };
+    try std.testing.expect(canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+
+    // Linux desktop with X11 or Wayland display: true.
+    EnvHelper.entries = &.{.{ .k = "DISPLAY", .v = ":0" }};
+    try std.testing.expect(canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+    EnvHelper.entries = &.{.{ .k = "WAYLAND_DISPLAY", .v = "wayland-0" }};
+    try std.testing.expect(canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+
+    // WSL without SSH: true even without DISPLAY.
+    EnvHelper.entries = &.{};
+    try std.testing.expect(canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, true));
+
+    // Explicit disable via BROWSER or GH_BROWSER overrides desktop/OS availability.
+    EnvHelper.entries = &.{
+        .{ .k = "DISPLAY", .v = ":0" },
+        .{ .k = "BROWSER", .v = "false" },
+    };
+    try std.testing.expect(!canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+    try std.testing.expect(!canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .macos, false));
+
+    EnvHelper.entries = &.{
+        .{ .k = "DISPLAY", .v = ":0" },
+        .{ .k = "GH_BROWSER", .v = "none" },
+    };
+    try std.testing.expect(!canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+    try std.testing.expect(canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, false, .linux, false));
+
+    // GitHub Codespaces and Azure Cloud Shell disable browser launch.
+    EnvHelper.entries = &.{
+        .{ .k = "DISPLAY", .v = ":0" },
+        .{ .k = "CODESPACES", .v = "true" },
+    };
+    try std.testing.expect(!canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+
+    EnvHelper.entries = &.{
+        .{ .k = "DISPLAY", .v = ":0" },
+        .{ .k = "ACC_CLOUD", .v = "1" },
+    };
+    try std.testing.expect(!canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+
+    // VS Code Remote-SSH (VSCODE_IPC_HOOK_CLI + BROWSER + SSH_CONNECTION without SSH_TTY): true.
+    EnvHelper.entries = &.{
+        .{ .k = "VSCODE_IPC_HOOK_CLI", .v = "/run/user/1000/vscode-ipc.sock" },
+        .{ .k = "BROWSER", .v = "/home/user/.vscode-server/bin/helpers/browser.sh" },
+        .{ .k = "SSH_CONNECTION", .v = "10.0.0.1 54321 10.0.0.2 22" },
+    };
+    try std.testing.expect(canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+
+    // VS Code Dev Containers (VSCODE_IPC_HOOK_CLI + BROWSER + REMOTE_CONTAINERS): true.
+    EnvHelper.entries = &.{
+        .{ .k = "VSCODE_IPC_HOOK_CLI", .v = "/run/user/1000/vscode-ipc.sock" },
+        .{ .k = "BROWSER", .v = "/vscode/bin/helpers/browser.sh" },
+        .{ .k = "REMOTE_CONTAINERS", .v = "true" },
+    };
+    try std.testing.expect(canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+
+    // VS Code Remote Tunnel (VSCODE_IPC_HOOK_CLI + BROWSER, neither Remote-SSH nor Dev Containers): false.
+    EnvHelper.entries = &.{
+        .{ .k = "VSCODE_IPC_HOOK_CLI", .v = "/run/user/1000/vscode-ipc.sock" },
+        .{ .k = "BROWSER", .v = "/home/user/.vscode-server/bin/helpers/browser.sh" },
+    };
+    try std.testing.expect(!canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
 }

@@ -33,7 +33,7 @@ const usage =
     \\usage: keyring [--disable] [-b <backend>] <command> [args]
     \\
     \\Commands:
-    \\  --help, -h, help              Show this help.
+    \\  --help, help                  Show this help.
     \\  version                       Show version.
     \\  --list-backends               List available backends.
     \\  diagnose                      Show backend diagnostics.
@@ -336,7 +336,6 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
     const command = args[i];
     const rest = args[i + 1 ..];
     if (std.mem.eql(u8, command, "--help") or
-        std.mem.eql(u8, command, "-h") or
         std.mem.eql(u8, command, "help"))
     {
         parsed.command = if (rest.len == 0) .help else .{ .usage_error = "wrong number of arguments" };
@@ -406,7 +405,7 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
             parsed.command = if (gh.parseLoginArgs(rest[1..])) |opts|
                 .{ .gh_login = opts }
             else
-                .{ .usage_error = "usage: keyring gh login [--hostname <host>] [--scopes <scopes>] [--web|--device]" };
+                .{ .usage_error = "usage: keyring gh login [-h|--hostname <host>] [--scopes <scopes>] [--web|--device]" };
         } else if (rest.len == 2 and std.mem.eql(u8, rest[0], "export") and rest[1].len > 0) {
             parsed.command = .{ .gh_export = .{ .dir = rest[1] } };
         } else if (rest.len == 1 and std.mem.eql(u8, rest[0], "import")) {
@@ -432,9 +431,9 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
             parsed.command = if (git_credential.parseConfigArgs(rest[1..])) |opts|
                 .{ .git_config = opts }
             else
-                .{ .usage_error = "usage: keyring git config [--hostname <host>] [--global|--local]" };
+                .{ .usage_error = "usage: keyring git config [-h|--hostname <host>] [--global|--local]" };
         } else {
-            parsed.command = .{ .usage_error = "usage: keyring git <credential <get|store|erase> | config [--hostname <host>] [--global|--local]>" };
+            parsed.command = .{ .usage_error = "usage: keyring git <credential <get|store|erase> | config [-h|--hostname <host>] [--global|--local]>" };
         }
         return parsed;
     }
@@ -1236,7 +1235,7 @@ fn expectUsage(parsed: ParsedArgs) !void {
 test "parseArgs recognizes simple commands" {
     try expectCommandTag(.help, parseArgs(&.{"keyring"}));
     try expectCommandTag(.help, parseArgs(&.{ "keyring", "--help" }));
-    try expectCommandTag(.help, parseArgs(&.{ "keyring", "-h" }));
+    try expectUsage(parseArgs(&.{ "keyring", "-h" }));
     try expectCommandTag(.help, parseArgs(&.{ "keyring", "help" }));
     try expectCommandTag(.version, parseArgs(&.{ "keyring", "version" }));
     try expectCommandTag(.list_backends, parseArgs(&.{ "keyring", "--list-backends" }));
@@ -1362,6 +1361,10 @@ test "parseArgs recognizes gh login, export, and import" {
     try std.testing.expectEqualStrings("example.ghe.com", login_ghe.command.gh_login.hostname);
     try std.testing.expectEqual(gh.LoginMode.device, login_ghe.command.gh_login.mode);
 
+    const login_short_h = parseArgs(&.{ "keyring", "gh", "login", "-h", "microsoft.ghe.com" });
+    try expectCommandTag(.gh_login, login_short_h);
+    try std.testing.expectEqualStrings("microsoft.ghe.com", login_short_h.command.gh_login.hostname);
+
     const exp = parseArgs(&.{ "keyring", "gh", "export", "/tmp/gh-out" });
     try expectCommandTag(.gh_export, exp);
     try std.testing.expectEqualStrings("/tmp/gh-out", exp.command.gh_export.dir);
@@ -1400,6 +1403,11 @@ test "parseArgs recognizes git credential, git-credential-keyring argv0, and git
     try expectCommandTag(.git_config, cfg_host);
     try std.testing.expectEqualStrings("example.ghe.com", cfg_host.command.git_config.hostname.?);
     try std.testing.expect(!cfg_host.command.git_config.global);
+
+    const cfg_short_h = parseArgs(&.{ "keyring", "git", "config", "-h", "microsoft.ghe.com" });
+    try expectCommandTag(.git_config, cfg_short_h);
+    try std.testing.expectEqualStrings("microsoft.ghe.com", cfg_short_h.command.git_config.hostname.?);
+    try std.testing.expect(cfg_short_h.command.git_config.global);
 
     try expectUsage(parseArgs(&.{ "keyring", "git", "credential", "bogus" }));
     try expectUsage(parseArgs(&.{ "git-credential-keyring", "bogus" }));

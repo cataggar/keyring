@@ -10,6 +10,8 @@
 | `KEYRING_VAULT_PATH` | Override the built-in WebAuthn Secret Service vault path. The default is `$XDG_DATA_HOME/keyring/vault.json`, or `~/.local/share/keyring/vault.json`. The file must not be group/world accessible. |
 | `ARTIFACTS_CREDENTIALPROVIDER_MSAL_FILECACHE_LOCATION` | Path to an additional MSAL cache file the `ado` backend should consult (parity with `artifacts-credprovider`). |
 | `KEYRING_PROPERTY_<NAME>` | Backend-specific properties, such as `KEYRING_PROPERTY_KEYCHAIN`, `KEYRING_PROPERTY_COLLECTION`, or `KEYRING_PROPERTY_APPID`. |
+| `GH_BROWSER`, `BROWSER` | Override the browser executable for OAuth login, or set to `false` / `none` / `0` / `no` / `echo` to disable launching a browser and use the device-code flow. |
+| `DISPLAY`, `WAYLAND_DISPLAY`, `SSH_TTY`, `SSH_CLIENT`, `SSH_CONNECTION` | Checked (along with WSL, `VSCODE_IPC_HOOK_CLI`, `REMOTE_CONTAINERS`, `CODESPACES`, and `ACC_CLOUD`) following Git Credential Manager and Azure CLI conventions to detect headless or SSH sessions without a local GUI display and skip launching a browser. |
 | `NO_COLOR` | Disable ANSI colors in diagnostic output. |
 | `CLICOLOR_FORCE` | Force ANSI colors even when stdout is not a TTY. |
 

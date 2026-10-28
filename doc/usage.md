@@ -46,6 +46,13 @@ keyring -b ado get https://pkgs.dev.azure.com/myorg/_packaging/feed/pypi/simple/
 keyring az export /tmp/az-export
 keyring gh export /tmp/gh-export
 
+# Authenticate with GitHub (github.com, *.ghe.com data residency, or GHES) and configure Git.
+keyring gh login
+keyring gh login --hostname example.ghe.com
+keyring gh login --hostname example.ghe.com --device
+keyring git config
+keyring git config --hostname example.ghe.com
+
 # Import GitHub CLI credentials into the OS keyring (from dir, file, stdin, or local hosts.yml).
 keyring gh import /tmp/gh-export
 keyring gh import
@@ -71,6 +78,12 @@ encrypted credentials on disk, which is useful when no secret-service daemon is
 available. See [Headless Linux](headless-linux.md).
 
 The Linux-only built-in service stores encrypted items in `vault.json` and is unlocked through WebAuthn PRF or the one-time Recovery Key. See [Hardware-backed unlocking over SSH](headless-linux.md#hardware-backed-unlocking-over-ssh).
+
+## Git credential helper (`keyring git credential`)
+
+`keyring git credential <get|store|erase>` (or invoking the binary via a `git-credential-keyring` symlink) implements the Git credential helper protocol over HTTPS for `github.com`, GitHub Enterprise Cloud with data residency (`*.ghe.com`, resolving REST calls to `https://api.<tenant>.ghe.com/user`), GitHub Enterprise Server, Azure DevOps (`dev.azure.com` and `*.visualstudio.com`), and generic HTTPS hosts stored in the active `keyring` backend.
+
+Run `keyring git config` to configure `keyring` globally as your Git credential helper, or `keyring git config --hostname example.ghe.com` to scope it to a specific host. When multiple GitHub accounts are stored in `gh:<host>` and `~/.config/gh/hosts.yml`, specifying a username in the remote URL (such as `https://alice@github.com/owner/repo.git`) or `credential.<url>.username` selects that account directly; otherwise the active `gh` user for that host is used, or an interactive OAuth login is initiated on demand.
 
 See also [Environment variables](environment-variables.md) and
 [Exit codes](exit-codes.md).

@@ -6,6 +6,7 @@ const msal_cache = @import("msal_cache.zig");
 const az_export = @import("az_export.zig");
 const devops_npm = @import("devops_npm.zig");
 const gh = @import("gh.zig");
+const git_credential = @import("git_credential.zig");
 const color = @import("color.zig");
 const term = @import("term.zig");
 const vault = @import("vault.zig");
@@ -14,6 +15,8 @@ const tunnel_http = @import("tunnel_http.zig");
 const service = @import("service.zig");
 
 test {
+    _ = gh;
+    _ = git_credential;
     _ = vault;
     _ = webauthn;
     _ = tunnel_http;
@@ -44,8 +47,11 @@ const usage =
     \\  get <service> <user>          Read a password to stdout.
     \\  del <service> <user>          Delete a password.
     \\  az export <dir>               Export Azure CLI token cache to a directory.
+    \\  gh login [options]            Authenticate with a GitHub host (github.com, *.ghe.com, GHES).
     \\  gh export <dir>               Export GitHub CLI credentials to <dir>/hosts.yml.
     \\  gh import [<dir-or-file>]     Import GitHub CLI credentials into the keyring.
+    \\  git credential <op>           Git credential helper protocol (get, store, erase).
+    \\  git config [options]          Configure Git to use keyring as its credential helper.
     \\  devops-npm [options]          Authenticate Azure DevOps npm feeds in .npmrc.
     \\
     \\Backends: secret_service, keychain, win_credential, file, ado, null_backend (or null)
@@ -95,8 +101,11 @@ pub const Command = union(enum) {
     get: struct { service: []const u8, user: []const u8 },
     del: struct { service: []const u8, user: []const u8 },
     az_export: struct { dir: []const u8 },
+    gh_login: gh.LoginOptions,
     gh_export: struct { dir: []const u8 },
     gh_import: struct { source: ?[]const u8 },
+    git_credential: git_credential.Operation,
+    git_config: git_credential.ConfigOptions,
     devops_npm: devops_npm.Options,
     usage_error: []const u8,
 };
@@ -258,6 +267,9 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
         .az_export => |cmd| code: {
             break :code try az_export.run(arena, cmd.dir, stdout, stderr);
         },
+        .gh_login => |opts| code: {
+            break :code try gh.runLogin(arena, opts, stdout, stderr);
+        },
         .gh_export => |cmd| code: {
             break :code try gh.runExport(arena, cmd.dir, stdout, stderr);
         },
@@ -265,6 +277,14 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
             var stdin_buffer: [4096]u8 = undefined;
             var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
             break :code try gh.runImport(arena, cmd.source, &stdin_reader.interface, stdout, stderr);
+        },
+        .git_credential => |op| code: {
+            var stdin_buffer: [4096]u8 = undefined;
+            var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+            break :code try git_credential.runCredential(arena, op, &stdin_reader.interface, stdout, stderr);
+        },
+        .git_config => |opts| code: {
+            break :code try git_credential.runConfig(arena, opts, stdout, stderr);
         },
         .devops_npm => |opts| code: {
             break :code try devops_npm.run(arena, io, opts, stdout, stderr);
@@ -279,6 +299,16 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
 
 pub fn parseArgs(args: []const []const u8) ParsedArgs {
     var parsed = ParsedArgs{ .command = .help };
+    if (args.len >= 1 and git_credential.isGitCredentialArgv0(args[0])) {
+        if (args.len == 2) {
+            if (git_credential.Operation.fromString(args[1])) |op| {
+                parsed.command = .{ .git_credential = op };
+                return parsed;
+            }
+        }
+        parsed.command = .{ .usage_error = "usage: git-credential-keyring <get|store|erase>" };
+        return parsed;
+    }
     if (args.len < 2) return parsed;
 
     var i: usize = 1;
@@ -372,14 +402,39 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
     }
 
     if (std.mem.eql(u8, command, "gh")) {
-        if (rest.len == 2 and std.mem.eql(u8, rest[0], "export") and rest[1].len > 0) {
+        if (rest.len >= 1 and std.mem.eql(u8, rest[0], "login")) {
+            parsed.command = if (gh.parseLoginArgs(rest[1..])) |opts|
+                .{ .gh_login = opts }
+            else
+                .{ .usage_error = "usage: keyring gh login [--hostname <host>] [--scopes <scopes>] [--web|--device]" };
+        } else if (rest.len == 2 and std.mem.eql(u8, rest[0], "export") and rest[1].len > 0) {
             parsed.command = .{ .gh_export = .{ .dir = rest[1] } };
         } else if (rest.len == 1 and std.mem.eql(u8, rest[0], "import")) {
             parsed.command = .{ .gh_import = .{ .source = null } };
         } else if (rest.len == 2 and std.mem.eql(u8, rest[0], "import") and rest[1].len > 0) {
             parsed.command = .{ .gh_import = .{ .source = rest[1] } };
         } else {
-            parsed.command = .{ .usage_error = "usage: keyring gh <export <dir> | import [<dir-or-file>]>" };
+            parsed.command = .{ .usage_error = "usage: keyring gh <login [options] | export <dir> | import [<dir-or-file>]>" };
+        }
+        return parsed;
+    }
+
+    if (std.mem.eql(u8, command, "git")) {
+        if (rest.len >= 1 and std.mem.eql(u8, rest[0], "credential")) {
+            if (rest.len == 2) {
+                if (git_credential.Operation.fromString(rest[1])) |op| {
+                    parsed.command = .{ .git_credential = op };
+                    return parsed;
+                }
+            }
+            parsed.command = .{ .usage_error = "usage: keyring git credential <get|store|erase>" };
+        } else if (rest.len >= 1 and std.mem.eql(u8, rest[0], "config")) {
+            parsed.command = if (git_credential.parseConfigArgs(rest[1..])) |opts|
+                .{ .git_config = opts }
+            else
+                .{ .usage_error = "usage: keyring git config [--hostname <host>] [--global|--local]" };
+        } else {
+            parsed.command = .{ .usage_error = "usage: keyring git <credential <get|store|erase> | config [--hostname <host>] [--global|--local]>" };
         }
         return parsed;
     }
@@ -960,6 +1015,7 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     }
     msal_cache.diagnose(arena, stdout) catch {};
     ado.diagnoseCache(arena, stdout) catch {};
+    gh.diagnoseHosts(arena, stdout) catch {};
     try stdout.flush();
 }
 
@@ -1293,7 +1349,17 @@ test "parseArgs recognizes az export" {
     try expectUsage(parseArgs(&.{ "keyring", "az" }));
 }
 
-test "parseArgs recognizes gh export and import" {
+test "parseArgs recognizes gh login, export, and import" {
+    const login_default = parseArgs(&.{ "keyring", "gh", "login" });
+    try expectCommandTag(.gh_login, login_default);
+    try std.testing.expectEqualStrings("github.com", login_default.command.gh_login.hostname);
+    try std.testing.expectEqual(gh.LoginMode.auto, login_default.command.gh_login.mode);
+
+    const login_ghe = parseArgs(&.{ "keyring", "gh", "login", "--hostname", "example.ghe.com", "--device" });
+    try expectCommandTag(.gh_login, login_ghe);
+    try std.testing.expectEqualStrings("example.ghe.com", login_ghe.command.gh_login.hostname);
+    try std.testing.expectEqual(gh.LoginMode.device, login_ghe.command.gh_login.mode);
+
     const exp = parseArgs(&.{ "keyring", "gh", "export", "/tmp/gh-out" });
     try expectCommandTag(.gh_export, exp);
     try std.testing.expectEqualStrings("/tmp/gh-out", exp.command.gh_export.dir);
@@ -1307,10 +1373,35 @@ test "parseArgs recognizes gh export and import" {
     try std.testing.expectEqualStrings("/tmp/gh-out", imp_dir.command.gh_import.source.?);
 
     try expectUsage(parseArgs(&.{ "keyring", "gh" }));
+    try expectUsage(parseArgs(&.{ "keyring", "gh", "login", "--web", "--device" }));
     try expectUsage(parseArgs(&.{ "keyring", "gh", "export" }));
     try expectUsage(parseArgs(&.{ "keyring", "gh", "export", "/tmp/a", "extra" }));
     try expectUsage(parseArgs(&.{ "keyring", "gh", "import", "/tmp/a", "extra" }));
     try expectUsage(parseArgs(&.{ "keyring", "gh", "bogus" }));
+}
+
+test "parseArgs recognizes git credential, git-credential-keyring argv0, and git config" {
+    const gc_get = parseArgs(&.{ "keyring", "git", "credential", "get" });
+    try expectCommandTag(.git_credential, gc_get);
+    try std.testing.expectEqual(git_credential.Operation.get, gc_get.command.git_credential);
+
+    const argv0_erase = parseArgs(&.{ "/usr/local/bin/git-credential-keyring", "erase" });
+    try expectCommandTag(.git_credential, argv0_erase);
+    try std.testing.expectEqual(git_credential.Operation.erase, argv0_erase.command.git_credential);
+
+    const cfg_all = parseArgs(&.{ "keyring", "git", "config" });
+    try expectCommandTag(.git_config, cfg_all);
+    try std.testing.expect(cfg_all.command.git_config.hostname == null);
+    try std.testing.expect(cfg_all.command.git_config.global);
+
+    const cfg_host = parseArgs(&.{ "keyring", "git", "config", "--hostname", "example.ghe.com", "--local" });
+    try expectCommandTag(.git_config, cfg_host);
+    try std.testing.expectEqualStrings("example.ghe.com", cfg_host.command.git_config.hostname.?);
+    try std.testing.expect(!cfg_host.command.git_config.global);
+
+    try expectUsage(parseArgs(&.{ "keyring", "git", "credential", "bogus" }));
+    try expectUsage(parseArgs(&.{ "git-credential-keyring", "bogus" }));
+    try expectUsage(parseArgs(&.{ "keyring", "git", "bogus" }));
 }
 
 test "parseArgs recognizes devops-npm" {

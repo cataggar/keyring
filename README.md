@@ -25,6 +25,10 @@ keyring service                  # start the provider in its locked state
 keyring enroll                   # enroll a YubiKey and print a Recovery Key
 keyring unlock                   # unlock through the browser/SSH tunnel
 keyring lock                     # immediately clear the in-memory master key
+
+# Git credential helper for github.com, *.ghe.com, GHES, and Azure DevOps:
+keyring gh login --hostname example.ghe.com
+keyring git setup --hostname example.ghe.com
 ```
 
 Use `keyring enroll --add-key`, `--list`, and `--revoke <id>` for multiple authenticators. `keyring unlock --recover` uses the one-time Recovery Key. Set `KEYRING_VAULT_PATH` to override the default encrypted vault path.

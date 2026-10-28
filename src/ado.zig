@@ -309,6 +309,61 @@ pub fn getCredentialWithOptions(
     return .{ .username = session_username, .password = owned_token };
 }
 
+const git_oauth_cache_key = "__entra_oauth__";
+
+/// Obtain an Azure DevOps credential suitable for Git over HTTPS (`dev.azure.com`
+/// and `*.visualstudio.com`). Uses the Entra OAuth access token for resource
+/// `499b84ac-1321-427f-aa17-267ca6975798` directly (matching Git Credential
+/// Manager's `credential.azreposcredentialtype=oauth`), cached in `session.dat`
+/// under `__entra_oauth__` so it works across organizations even when Git sends
+/// only `host=dev.azure.com` without an organization path.
+pub fn getGitCredential(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8) Error!Credential {
+    if (!isDevOpsUrl(service_url)) return error.EntryNotFound;
+
+    const now = unixNow();
+    var loaded = try loadCache(gpa);
+    defer loaded.deinit(gpa);
+    var cache: Cache = loaded.cache;
+
+    if (cache.access_token) |tok| {
+        if (cache.expires_at > now + 60 and tok.len > 0) {
+            return .{ .username = session_username, .password = try gpa.dupe(u8, tok) };
+        }
+    }
+
+    if (cache.session_tokens.map.get(git_oauth_cache_key)) |cached| {
+        if (cached.expires_at > now + 60 and cached.token.len > 0) {
+            return .{ .username = session_username, .password = try gpa.dupe(u8, cached.token) };
+        }
+    }
+
+    var token_parsed = try acquireAccessToken(gpa, stderr, cache.refresh_token);
+    defer token_parsed.deinit();
+
+    const access_token = token_parsed.value.access_token;
+    if (access_token.len == 0) return error.AuthenticationFailed;
+
+    cache.access_token = access_token;
+    if (token_parsed.value.refresh_token) |rt| {
+        cache.refresh_token = rt;
+    }
+    const expires_at = now + token_parsed.value.expires_in;
+    cache.expires_at = expires_at;
+
+    const owned_token = try gpa.dupe(u8, access_token);
+    errdefer gpa.free(owned_token);
+
+    try saveCache(gpa, &cache, git_oauth_cache_key, owned_token, expires_at);
+    return .{ .username = session_username, .password = owned_token };
+}
+
+/// Evict cached short-lived Azure DevOps session/access tokens on `git credential erase`
+/// while preserving the long-lived refresh token so the next `get` refreshes cleanly.
+pub fn eraseGitCredential(gpa: Allocator, service_url: []const u8) Error!void {
+    if (!isDevOpsUrl(service_url)) return error.EntryNotFound;
+    _ = deleteDatFile(gpa, session_dat_name);
+}
+
 /// Obtain a fresh Entra access token, preferring a silent refresh-token grant,
 /// then a refresh token inherited from the shared MSAL cache (az login SSO),
 /// and finally falling back to interactive browser auth. Used both for the
@@ -715,7 +770,7 @@ fn sendHtml(io: Io, stream: std.Io.net.Stream, html: []const u8) Error!void {
     writer.interface.flush() catch return error.NetworkFailure;
 }
 
-fn openBrowser(gpa: Allocator, stderr: *Io.Writer, url: []const u8) Error!void {
+pub fn openBrowser(gpa: Allocator, stderr: *Io.Writer, url: []const u8) Error!void {
     if (builtin.os.tag == .windows) {
         // Call ShellExecuteW("open", url, ...) directly. Going through a shell
         // (cmd /c start, powershell Start-Process) truncates the URL at the
@@ -1496,10 +1551,29 @@ fn getHome(gpa: Allocator) ![]u8 {
     return getEnvVarOwned(gpa, "HOME") orelse error.EnvironmentVariableNotFound;
 }
 
-fn isNonInteractive() bool {
-    const value = getEnvVarOwned(std.heap.page_allocator, noninteractive_env) orelse return false;
-    defer std.heap.page_allocator.free(value);
-    return std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1");
+pub fn isNonInteractive() bool {
+    if (getEnvVarOwned(std.heap.page_allocator, noninteractive_env)) |value| {
+        defer std.heap.page_allocator.free(value);
+        if (std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1")) return true;
+    }
+    if (getEnvVarOwned(std.heap.page_allocator, "KEYRING_NONINTERACTIVE")) |value| {
+        defer std.heap.page_allocator.free(value);
+        if (std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1")) return true;
+    }
+    if (getEnvVarOwned(std.heap.page_allocator, "GIT_TERMINAL_PROMPT")) |value| {
+        defer std.heap.page_allocator.free(value);
+        if (std.ascii.eqlIgnoreCase(value, "false") or std.mem.eql(u8, value, "0")) return true;
+    }
+    if (getEnvVarOwned(std.heap.page_allocator, "GCM_INTERACTIVE")) |value| {
+        defer std.heap.page_allocator.free(value);
+        if (std.ascii.eqlIgnoreCase(value, "never") or
+            std.ascii.eqlIgnoreCase(value, "false") or
+            std.mem.eql(u8, value, "0"))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn unixNow() i64 {

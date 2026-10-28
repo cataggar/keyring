@@ -75,7 +75,7 @@ pub fn isGitCredentialArgv0(arg0: []const u8) bool {
     return std.ascii.eqlIgnoreCase(base, "git-credential-keyring");
 }
 
-/// Parse `keyring git config [--hostname <host>] [--global|--local]`.
+/// Parse `keyring git config [-h|--hostname <host>] [--global|--local]`.
 pub fn parseConfigArgs(args: []const []const u8) ?ConfigOptions {
     var opts: ConfigOptions = .{};
     var i: usize = 0;
@@ -338,7 +338,7 @@ pub fn formatGitHelperValue(gpa: Allocator, exe_path: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// Run `keyring git config [--hostname <host>] [--global|--local]`.
+/// Run `keyring git config [-h|--hostname <host>] [--global|--local]`.
 pub fn runConfig(
     gpa: Allocator,
     opts: ConfigOptions,

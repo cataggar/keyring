@@ -1144,6 +1144,7 @@ pub const GitCredential = struct {
     username: []u8,
     token: []u8,
     from_env: bool = false,
+    stored_in_keyring: bool = true,
 
     pub fn deinit(self: *const GitCredential, gpa: Allocator) void {
         gpa.free(self.username);
@@ -1435,12 +1436,18 @@ pub fn lookupStoredCredential(
 
 /// Store a GitHub token for `(raw_host, username)` into the OS keyring (`gh:<host>`)
 /// and update `<gh_config_dir>/hosts.yml` so both `git` and `gh` share the login.
+///
+/// When the OS keyring is unavailable (for example on a headless Linux machine
+/// with no Secret Service daemon), falls back to storing `oauth_token` in
+/// `<gh_config_dir>/hosts.yml` (mode `0600`), matching `gh auth login`.
+/// Returns true when stored in both the OS keyring and `hosts.yml`, or false
+/// when persisted in `hosts.yml` only.
 pub fn saveUserCredential(
     gpa: Allocator,
     raw_host: []const u8,
     username: []const u8,
     token: []const u8,
-) AuthError!void {
+) AuthError!bool {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1449,17 +1456,18 @@ pub fn saveUserCredential(
     const service = try keyringServiceName(a, canonical);
     const store = activeSecretStore();
 
-    store.set(a, service, username, token) catch |err| return switch (err) {
-        error.NoStorageAccess => error.NoStorageAccess,
-        error.Locked => error.Locked,
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.StorageFailure,
-    };
-    store.set(a, service, "", token) catch |err| return switch (err) {
-        error.NoStorageAccess => error.NoStorageAccess,
-        error.Locked => error.Locked,
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.StorageFailure,
+    const stored_in_keyring: bool = blk: {
+        store.set(a, service, username, token) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Locked => return error.Locked,
+            error.NoStorageAccess, error.StorageFailure, error.EntryNotFound => break :blk false,
+        };
+        store.set(a, service, "", token) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Locked => return error.Locked,
+            error.NoStorageAccess, error.StorageFailure, error.EntryNotFound => break :blk false,
+        };
+        break :blk true;
     };
 
     const config_dir = resolveGhConfigDir(a) orelse return error.NoStorageAccess;
@@ -1470,20 +1478,31 @@ pub fn saveUserCredential(
     else
         std.ArrayListUnmanaged(HostConfig).empty;
 
+    const yaml_token: ?[]const u8 = if (stored_in_keyring) null else token;
     var incoming_host = HostConfig{
         .hostname = canonical,
         .git_protocol = "https",
         .active_user = username,
+        .oauth_token = yaml_token,
     };
     try incoming_host.users.append(a, .{
         .username = username,
-        .oauth_token = null,
+        .oauth_token = yaml_token,
     });
     const incoming_slice = [_]HostConfig{incoming_host};
     try mergeHosts(a, &merged_hosts, &incoming_slice);
 
-    const rendered = formatHostsYaml(a, merged_hosts.items, .keyring) catch return error.OutOfMemory;
+    for (merged_hosts.items) |*h| {
+        if (!std.ascii.eqlIgnoreCase(h.hostname, canonical)) continue;
+        h.oauth_token = if (yaml_token) |tok| try a.dupe(u8, tok) else null;
+        if (h.findUserIndex(username)) |u_idx| {
+            h.users.items[u_idx].oauth_token = if (yaml_token) |tok| try a.dupe(u8, tok) else null;
+        }
+    }
+
+    const rendered = formatHostsYaml(a, merged_hosts.items, .plaintext) catch return error.OutOfMemory;
     writePrivateFile(config_dir, hosts_filename, rendered) catch return error.StorageFailure;
+    return stored_in_keyring;
 }
 
 /// Persist a Git credential supplied via `git credential approve` (`keyring git credential store`)
@@ -1518,7 +1537,7 @@ pub fn storeGitCredential(
         return;
     }
 
-    try saveUserCredential(gpa, canonical, username, token);
+    _ = try saveUserCredential(gpa, canonical, username, token);
 }
 
 fn isCredentialAlreadyStored(
@@ -1529,9 +1548,6 @@ fn isCredentialAlreadyStored(
     username: []const u8,
     token: []const u8,
 ) bool {
-    const stored_user_tok = store.get(a, service, username) catch return false;
-    if (!std.mem.eql(u8, stored_user_tok, token)) return false;
-
     const config_dir = resolveGhConfigDir(a) orelse return false;
     const local_hosts_path = std.fs.path.join(a, &.{ config_dir, hosts_filename }) catch return false;
     const existing_yaml = readFileIfExists(a, local_hosts_path) orelse return false;
@@ -1539,13 +1555,29 @@ fn isCredentialAlreadyStored(
 
     for (hosts.items) |h| {
         if (!std.ascii.eqlIgnoreCase(h.hostname, canonical_host)) continue;
-        if (h.findUserIndex(username) == null) return false;
+        const user_idx = h.findUserIndex(username) orelse return false;
         const active = h.active_user orelse return false;
-        if (std.mem.eql(u8, active, username)) {
-            const mirror_tok = store.get(a, service, "") catch return false;
-            if (!std.mem.eql(u8, mirror_tok, token)) return false;
+        const is_active = std.mem.eql(u8, active, username);
+
+        if (store.get(a, service, username)) |stored_user_tok| {
+            if (!std.mem.eql(u8, stored_user_tok, token)) return false;
+            if (is_active) {
+                const mirror_tok = store.get(a, service, "") catch return false;
+                if (!std.mem.eql(u8, mirror_tok, token)) return false;
+            }
+            return true;
+        } else |err| switch (err) {
+            error.NoStorageAccess, error.StorageFailure, error.EntryNotFound => {
+                const yaml_user_tok = h.users.items[user_idx].oauth_token orelse return false;
+                if (!std.mem.eql(u8, yaml_user_tok, token)) return false;
+                if (is_active) {
+                    const yaml_host_tok = h.oauth_token orelse yaml_user_tok;
+                    if (!std.mem.eql(u8, yaml_host_tok, token)) return false;
+                }
+                return true;
+            },
+            else => return false,
         }
-        return true;
     }
     return false;
 }
@@ -1722,7 +1754,8 @@ pub fn runLogin(
     };
     defer gpa.free(canonical);
 
-    try stdout.print("Logged in to {s} as {s} (stored in keyring and hosts.yml)\n", .{ canonical, cred.username });
+    const storage_desc = if (cred.stored_in_keyring) "stored in keyring and hosts.yml" else "stored in hosts.yml";
+    try stdout.print("Logged in to {s} as {s} ({s})\n", .{ canonical, cred.username, storage_desc });
     try stdout.flush();
     return 0;
 }
@@ -1751,7 +1784,7 @@ pub fn loginOAuth(
     defer gpa.free(normalized_scopes);
 
     const token = switch (opts.mode) {
-        .device => try deviceCodeOAuthFlow(gpa, endpoints, client_id, normalized_scopes, stderr),
+        .device => try deviceCodeOAuthFlow(gpa, endpoints, client_id, normalized_scopes, true, stderr),
         .web => try webAppOAuthFlow(gpa, endpoints, client_id, client_secret, normalized_scopes, false, stderr),
         .auto => try webAppOAuthFlow(gpa, endpoints, client_id, client_secret, normalized_scopes, true, stderr),
     };
@@ -1760,11 +1793,12 @@ pub fn loginOAuth(
     const username = try fetchAuthenticatedUser(gpa, endpoints.api_base_url, token);
     errdefer gpa.free(username);
 
-    try saveUserCredential(gpa, endpoints.canonical_host, username, token);
+    const stored_in_keyring = try saveUserCredential(gpa, endpoints.canonical_host, username, token);
 
     return .{
         .username = username,
         .token = token,
+        .stored_in_keyring = stored_in_keyring,
     };
 }
 
@@ -1825,7 +1859,7 @@ fn webAppOAuthFlow(
     var address: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(0) };
     var server = Io.net.IpAddress.listen(&address, io, .{ .reuse_address = true }) catch {
         if (fallback_to_device) {
-            return deviceCodeOAuthFlow(gpa, endpoints, client_id, scopes, stderr);
+            return deviceCodeOAuthFlow(gpa, endpoints, client_id, scopes, true, stderr);
         }
         return error.NoStorageAccess;
     };
@@ -1852,16 +1886,20 @@ fn webAppOAuthFlow(
     );
     defer gpa.free(auth_url);
 
-    stderr.print("[keyring gh] Opening browser for {s} authentication...\n", .{endpoints.canonical_host}) catch {};
-    stderr.print("[keyring gh] If the browser does not open, visit:\n{s}\n", .{auth_url}) catch {};
-    stderr.flush() catch {};
+    var sink = Io.Writer.Allocating.init(gpa);
+    defer sink.deinit();
+    const browser_stderr = if (fallback_to_device) &sink.writer else stderr;
 
-    openBrowserForOAuth(gpa, stderr, auth_url) catch |err| {
+    openBrowserForOAuth(gpa, browser_stderr, auth_url) catch |err| {
         if (fallback_to_device) {
-            return deviceCodeOAuthFlow(gpa, endpoints, client_id, scopes, stderr);
+            return deviceCodeOAuthFlow(gpa, endpoints, client_id, scopes, false, stderr);
         }
         return err;
     };
+
+    stderr.print("[keyring gh] Opening browser for {s} authentication...\n", .{endpoints.canonical_host}) catch {};
+    stderr.print("[keyring gh] If the browser does not open, visit:\n{s}\n", .{auth_url}) catch {};
+    stderr.flush() catch {};
 
     var stream = server.accept(io) catch return error.AuthenticationFailed;
     defer stream.socket.close(io);
@@ -1903,6 +1941,7 @@ fn deviceCodeOAuthFlow(
     endpoints: Endpoints,
     client_id: []const u8,
     scopes: []const u8,
+    try_open_browser: bool,
     stderr: *Io.Writer,
 ) AuthError![]u8 {
     const device_url = try std.fmt.allocPrint(gpa, "{s}/login/device/code", .{endpoints.oauth_base_url});
@@ -1933,7 +1972,11 @@ fn deviceCodeOAuthFlow(
     ) catch {};
     stderr.flush() catch {};
 
-    _ = openBrowserForOAuth(gpa, stderr, verification_uri) catch {};
+    if (try_open_browser) {
+        var sink = Io.Writer.Allocating.init(gpa);
+        defer sink.deinit();
+        _ = openBrowserForOAuth(gpa, &sink.writer, verification_uri) catch {};
+    }
 
     const token_url = try std.fmt.allocPrint(gpa, "{s}/login/oauth/access_token", .{endpoints.oauth_base_url});
     defer gpa.free(token_url);
@@ -2835,3 +2878,183 @@ test "loginOAuth web loopback flow exchanges callback code and stores token for 
     try std.testing.expectEqualStrings("cameron_ghe", cred.username);
     try std.testing.expectEqualStrings("gho_web_ghe_token", cred.token);
 }
+
+test "loginOAuth falls back to device flow and stores token in hosts.yml when OS keyring returns NoStorageAccess" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const config_dir = try std.fs.path.join(gpa, &.{ root, "gh-config" });
+    defer gpa.free(config_dir);
+
+    // Existing hosts.yml already has a plaintext token for github.com.
+    const initial_hosts =
+        \\github.com:
+        \\    git_protocol: https
+        \\    users:
+        \\        cataggar:
+        \\            oauth_token: gho_dotcom_existing
+        \\    user: cataggar
+        \\    oauth_token: gho_dotcom_existing
+        \\
+    ;
+    try writePrivateFile(config_dir, hosts_filename, initial_hosts);
+
+    const NoKeyringStore = struct {
+        fn get(_: Allocator, _: []const u8, _: []const u8) SecretError![]u8 {
+            return error.NoStorageAccess;
+        }
+        fn set(_: Allocator, _: []const u8, _: []const u8, _: []const u8) SecretError!void {
+            return error.NoStorageAccess;
+        }
+        fn delete(_: Allocator, _: []const u8, _: []const u8) SecretError!void {
+            return error.NoStorageAccess;
+        }
+        const store: SecretStore = .{
+            .get = get,
+            .set = set,
+            .delete = delete,
+        };
+    };
+
+    const HeadlessMocks = struct {
+        var browser_calls: usize = 0;
+
+        fn postFormJson(alloc: Allocator, url: []const u8, _: []const u8) AuthError![]u8 {
+            if (std.mem.eql(u8, "https://microsoft.ghe.com/login/device/code", url)) {
+                return alloc.dupe(
+                    u8,
+                    "{\"device_code\":\"dev_headless\",\"user_code\":\"335D-98F3\",\"verification_uri\":\"https://microsoft.ghe.com/login/device\",\"expires_in\":900,\"interval\":1}",
+                );
+            }
+            if (std.mem.eql(u8, "https://microsoft.ghe.com/login/oauth/access_token", url)) {
+                return alloc.dupe(u8, "{\"access_token\":\"gho_headless_ghe_token\"}");
+            }
+            return error.AuthenticationFailed;
+        }
+
+        fn getJsonWithToken(alloc: Allocator, url: []const u8, token: []const u8) AuthError![]u8 {
+            if (!std.mem.eql(u8, "https://api.microsoft.ghe.com/user", url)) return error.AuthenticationFailed;
+            if (!std.mem.eql(u8, "gho_headless_ghe_token", token)) return error.AuthenticationFailed;
+            return alloc.dupe(u8, "{\"login\":\"cameron-taggart\"}");
+        }
+
+        fn openBrowser(_: Allocator, stderr_w: *Io.Writer, _: []const u8) AuthError!void {
+            browser_calls += 1;
+            stderr_w.writeAll("[keyring ado] browser spawn 'xdg-open' failed: FileNotFound\n") catch {};
+            return error.NoStorageAccess;
+        }
+
+        fn noSleep(_: u32) void {}
+    };
+
+    HeadlessMocks.browser_calls = 0;
+
+    secret_store_override = NoKeyringStore.store;
+    defer secret_store_override = null;
+    gh_config_dir_override = config_dir;
+    defer gh_config_dir_override = null;
+    http_transport_override = .{
+        .postFormJson = HeadlessMocks.postFormJson,
+        .getJsonWithToken = HeadlessMocks.getJsonWithToken,
+    };
+    defer http_transport_override = null;
+    browser_open_override = HeadlessMocks.openBrowser;
+    defer browser_open_override = null;
+    poll_sleep_override = HeadlessMocks.noSleep;
+    defer poll_sleep_override = null;
+    env_override_fn = struct {
+        fn get(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    }.get;
+    defer env_override_fn = null;
+
+    var stdout = Io.Writer.Allocating.init(gpa);
+    defer stdout.deinit();
+    var stderr = Io.Writer.Allocating.init(gpa);
+    defer stderr.deinit();
+
+    const code = try runLogin(gpa, .{
+        .hostname = "microsoft.ghe.com",
+        .mode = .auto,
+    }, &stdout.writer, &stderr.writer);
+    try std.testing.expectEqual(@as(u8, 0), code);
+    try std.testing.expectEqualStrings(
+        "Logged in to microsoft.ghe.com as cameron-taggart (stored in hosts.yml)\n",
+        stdout.written(),
+    );
+    // Browser was only probed once during auto fallback; neither dead loopback URL nor browser error was printed.
+    try std.testing.expectEqual(@as(usize, 1), HeadlessMocks.browser_calls);
+    try std.testing.expect(std.mem.indexOf(u8, stderr.written(), "127.0.0.1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr.written(), "xdg-open") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr.written(), "335D-98F3") != null);
+
+    // Subsequent credential lookup resolves microsoft.ghe.com from hosts.yml.
+    const resolved = (try lookupStoredCredential(gpa, "microsoft.ghe.com", null)).?;
+    defer resolved.deinit(gpa);
+    try std.testing.expectEqualStrings("cameron-taggart", resolved.username);
+    try std.testing.expectEqualStrings("gho_headless_ghe_token", resolved.token);
+
+    // Existing github.com token in hosts.yml must also still be preserved.
+    const dotcom_resolved = (try lookupStoredCredential(gpa, "github.com", null)).?;
+    defer dotcom_resolved.deinit(gpa);
+    try std.testing.expectEqualStrings("cataggar", dotcom_resolved.username);
+    try std.testing.expectEqualStrings("gho_dotcom_existing", dotcom_resolved.token);
+
+    // `git credential approve` (`storeGitCredential`) recognizes the token already in hosts.yml.
+    try storeGitCredential(gpa, "microsoft.ghe.com", "cameron-taggart", "gho_headless_ghe_token");
+}
+
+test "saveUserCredential returns Locked and does not write plaintext hosts.yml when keyring is locked" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const config_dir = try std.fs.path.join(gpa, &.{ root, "gh-config" });
+    defer gpa.free(config_dir);
+
+    const LockedStore = struct {
+        fn get(_: Allocator, _: []const u8, _: []const u8) SecretError![]u8 {
+            return error.Locked;
+        }
+        fn set(_: Allocator, _: []const u8, _: []const u8, _: []const u8) SecretError!void {
+            return error.Locked;
+        }
+        fn delete(_: Allocator, _: []const u8, _: []const u8) SecretError!void {
+            return error.Locked;
+        }
+        const store: SecretStore = .{
+            .get = get,
+            .set = set,
+            .delete = delete,
+        };
+    };
+
+    secret_store_override = LockedStore.store;
+    defer secret_store_override = null;
+    gh_config_dir_override = config_dir;
+    defer gh_config_dir_override = null;
+
+    try std.testing.expectError(
+        error.Locked,
+        saveUserCredential(gpa, "microsoft.ghe.com", "cameron-taggart", "gho_secret_token"),
+    );
+
+    const hosts_path = try std.fs.path.join(gpa, &.{ config_dir, hosts_filename });
+    defer gpa.free(hosts_path);
+    try std.testing.expect(readFileIfExists(gpa, hosts_path) == null);
+}
+

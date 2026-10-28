@@ -999,7 +999,9 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
         if (getPassword(arena, stdout, probe_service, user)) |password| {
             _ = password;
         } else |err| switch (err) {
-            error.NoStorageAccess => try printLinuxNoStorageAccessHint(stdout, colors),
+            error.NoStorageAccess, error.PlatformFailure => if (backendEql(current, .{ .keyring = .secret_service })) {
+                try printLinuxNoStorageAccessHint(stdout, colors);
+            },
             else => {},
         }
     } else {

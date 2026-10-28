@@ -1,5 +1,5 @@
-//! Git credential helper (`keyring git-credential <get|store|erase>`,
-//! `git-credential-keyring` argv[0] dispatch, and `keyring git setup`).
+//! Git credential helper (`keyring git credential <get|store|erase>`,
+//! `git-credential-keyring` argv[0] dispatch, and `keyring git config`).
 //!
 //! Routes HTTPS Git credential requests across:
 //! 1. GitHub (`github.com`, `gist.github.com`, `<tenant>.ghe.com` data-residency
@@ -29,7 +29,7 @@ pub const Operation = enum {
     }
 };
 
-pub const SetupOptions = struct {
+pub const ConfigOptions = struct {
     hostname: ?[]const u8 = null,
     global: bool = true,
 };
@@ -74,9 +74,9 @@ pub fn isGitCredentialArgv0(arg0: []const u8) bool {
     return std.ascii.eqlIgnoreCase(base, "git-credential-keyring");
 }
 
-/// Parse `keyring git setup [--hostname <host>] [--global|--local]`.
-pub fn parseSetupArgs(args: []const []const u8) ?SetupOptions {
-    var opts: SetupOptions = .{};
+/// Parse `keyring git config [--hostname <host>] [--global|--local]`.
+pub fn parseConfigArgs(args: []const []const u8) ?ConfigOptions {
+    var opts: ConfigOptions = .{};
     var i: usize = 0;
     while (i < args.len) {
         const arg = args[i];
@@ -330,14 +330,14 @@ pub fn formatGitHelperValue(gpa: Allocator, exe_path: []const u8) ![]u8 {
     } else {
         try out.writer.writeAll(exe_path);
     }
-    try out.writer.writeAll(" git-credential");
+    try out.writer.writeAll(" git credential");
     return out.toOwnedSlice();
 }
 
-/// Run `keyring git setup [--hostname <host>] [--global|--local]`.
-pub fn runSetup(
+/// Run `keyring git config [--hostname <host>] [--global|--local]`.
+pub fn runConfig(
     gpa: Allocator,
-    opts: SetupOptions,
+    opts: ConfigOptions,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
 ) !u8 {
@@ -352,14 +352,14 @@ pub fn runSetup(
 
     if (opts.hostname) |raw_host| {
         const canonical = gh.normalizeHostnameAlloc(a, raw_host) catch {
-            try stderr.print("keyring: git setup: invalid hostname '{s}'\n", .{raw_host});
+            try stderr.print("keyring: git config: invalid hostname '{s}'\n", .{raw_host});
             try stderr.flush();
             return 2;
         };
         const key = try std.fmt.allocPrint(a, "credential.https://{s}.helper", .{canonical});
 
         // Clear any inherited helper first (empty string resets the helper chain for that host),
-        // then add `!keyring git-credential`, matching `gh auth setup-git`.
+        // then add `!keyring git credential`, matching `gh auth setup-git`.
         try runGitConfig(a, &.{ "git", "config", scope_flag, "--replace-all", key, "" }, stderr);
         try runGitConfig(a, &.{ "git", "config", scope_flag, "--add", key, helper_val }, stderr);
 
@@ -391,7 +391,7 @@ fn runGitConfig(gpa: Allocator, argv: []const []const u8, stderr: *Io.Writer) !v
         .stdout_limit = .limited(16 * 1024),
         .stderr_limit = .limited(16 * 1024),
     }) catch |err| {
-        try stderr.print("keyring: git setup: failed to run git: {s}\n", .{@errorName(err)});
+        try stderr.print("keyring: git config: failed to run git: {s}\n", .{@errorName(err)});
         try stderr.flush();
         return err;
     };
@@ -632,9 +632,9 @@ test "formatGitHelperValue quotes paths with spaces or backslashes" {
     const gpa = std.testing.allocator;
     const simple = try formatGitHelperValue(gpa, "keyring");
     defer gpa.free(simple);
-    try std.testing.expectEqualStrings("!keyring git-credential", simple);
+    try std.testing.expectEqualStrings("!keyring git credential", simple);
 
     const win = try formatGitHelperValue(gpa, "C:\\Program Files\\keyring\\keyring.exe");
     defer gpa.free(win);
-    try std.testing.expectEqualStrings("!\"C:/Program Files/keyring/keyring.exe\" git-credential", win);
+    try std.testing.expectEqualStrings("!\"C:/Program Files/keyring/keyring.exe\" git credential", win);
 }

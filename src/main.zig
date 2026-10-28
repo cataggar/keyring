@@ -50,8 +50,8 @@ const usage =
     \\  gh login [options]            Authenticate with a GitHub host (github.com, *.ghe.com, GHES).
     \\  gh export <dir>               Export GitHub CLI credentials to <dir>/hosts.yml.
     \\  gh import [<dir-or-file>]     Import GitHub CLI credentials into the keyring.
-    \\  git-credential <op>           Git credential helper protocol (get, store, erase).
-    \\  git setup [options]           Configure Git to use keyring as its credential helper.
+    \\  git credential <op>           Git credential helper protocol (get, store, erase).
+    \\  git config [options]          Configure Git to use keyring as its credential helper.
     \\  devops-npm [options]          Authenticate Azure DevOps npm feeds in .npmrc.
     \\
     \\Backends: secret_service, keychain, win_credential, file, ado, null_backend (or null)
@@ -105,7 +105,7 @@ pub const Command = union(enum) {
     gh_export: struct { dir: []const u8 },
     gh_import: struct { source: ?[]const u8 },
     git_credential: git_credential.Operation,
-    git_setup: git_credential.SetupOptions,
+    git_config: git_credential.ConfigOptions,
     devops_npm: devops_npm.Options,
     usage_error: []const u8,
 };
@@ -283,8 +283,8 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
             var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
             break :code try git_credential.runCredential(arena, op, &stdin_reader.interface, stdout, stderr);
         },
-        .git_setup => |opts| code: {
-            break :code try git_credential.runSetup(arena, opts, stdout, stderr);
+        .git_config => |opts| code: {
+            break :code try git_credential.runConfig(arena, opts, stdout, stderr);
         },
         .devops_npm => |opts| code: {
             break :code try devops_npm.run(arena, io, opts, stdout, stderr);
@@ -419,25 +419,22 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
         return parsed;
     }
 
-    if (std.mem.eql(u8, command, "git-credential")) {
-        if (rest.len == 1) {
-            if (git_credential.Operation.fromString(rest[0])) |op| {
-                parsed.command = .{ .git_credential = op };
-                return parsed;
-            }
-        }
-        parsed.command = .{ .usage_error = "usage: keyring git-credential <get|store|erase>" };
-        return parsed;
-    }
-
     if (std.mem.eql(u8, command, "git")) {
-        if (rest.len >= 1 and std.mem.eql(u8, rest[0], "setup")) {
-            parsed.command = if (git_credential.parseSetupArgs(rest[1..])) |opts|
-                .{ .git_setup = opts }
+        if (rest.len >= 1 and std.mem.eql(u8, rest[0], "credential")) {
+            if (rest.len == 2) {
+                if (git_credential.Operation.fromString(rest[1])) |op| {
+                    parsed.command = .{ .git_credential = op };
+                    return parsed;
+                }
+            }
+            parsed.command = .{ .usage_error = "usage: keyring git credential <get|store|erase>" };
+        } else if (rest.len >= 1 and std.mem.eql(u8, rest[0], "config")) {
+            parsed.command = if (git_credential.parseConfigArgs(rest[1..])) |opts|
+                .{ .git_config = opts }
             else
-                .{ .usage_error = "usage: keyring git setup [--hostname <host>] [--global|--local]" };
+                .{ .usage_error = "usage: keyring git config [--hostname <host>] [--global|--local]" };
         } else {
-            parsed.command = .{ .usage_error = "usage: keyring git setup [--hostname <host>] [--global|--local]" };
+            parsed.command = .{ .usage_error = "usage: keyring git <credential <get|store|erase> | config [--hostname <host>] [--global|--local]>" };
         }
         return parsed;
     }
@@ -1383,8 +1380,8 @@ test "parseArgs recognizes gh login, export, and import" {
     try expectUsage(parseArgs(&.{ "keyring", "gh", "bogus" }));
 }
 
-test "parseArgs recognizes git-credential, git-credential-keyring argv0, and git setup" {
-    const gc_get = parseArgs(&.{ "keyring", "git-credential", "get" });
+test "parseArgs recognizes git credential, git-credential-keyring argv0, and git config" {
+    const gc_get = parseArgs(&.{ "keyring", "git", "credential", "get" });
     try expectCommandTag(.git_credential, gc_get);
     try std.testing.expectEqual(git_credential.Operation.get, gc_get.command.git_credential);
 
@@ -1392,17 +1389,17 @@ test "parseArgs recognizes git-credential, git-credential-keyring argv0, and git
     try expectCommandTag(.git_credential, argv0_erase);
     try std.testing.expectEqual(git_credential.Operation.erase, argv0_erase.command.git_credential);
 
-    const setup_all = parseArgs(&.{ "keyring", "git", "setup" });
-    try expectCommandTag(.git_setup, setup_all);
-    try std.testing.expect(setup_all.command.git_setup.hostname == null);
-    try std.testing.expect(setup_all.command.git_setup.global);
+    const cfg_all = parseArgs(&.{ "keyring", "git", "config" });
+    try expectCommandTag(.git_config, cfg_all);
+    try std.testing.expect(cfg_all.command.git_config.hostname == null);
+    try std.testing.expect(cfg_all.command.git_config.global);
 
-    const setup_host = parseArgs(&.{ "keyring", "git", "setup", "--hostname", "example.ghe.com", "--local" });
-    try expectCommandTag(.git_setup, setup_host);
-    try std.testing.expectEqualStrings("example.ghe.com", setup_host.command.git_setup.hostname.?);
-    try std.testing.expect(!setup_host.command.git_setup.global);
+    const cfg_host = parseArgs(&.{ "keyring", "git", "config", "--hostname", "example.ghe.com", "--local" });
+    try expectCommandTag(.git_config, cfg_host);
+    try std.testing.expectEqualStrings("example.ghe.com", cfg_host.command.git_config.hostname.?);
+    try std.testing.expect(!cfg_host.command.git_config.global);
 
-    try expectUsage(parseArgs(&.{ "keyring", "git-credential", "bogus" }));
+    try expectUsage(parseArgs(&.{ "keyring", "git", "credential", "bogus" }));
     try expectUsage(parseArgs(&.{ "git-credential-keyring", "bogus" }));
     try expectUsage(parseArgs(&.{ "keyring", "git", "bogus" }));
 }

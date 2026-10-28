@@ -1486,6 +1486,70 @@ pub fn saveUserCredential(
     writePrivateFile(config_dir, hosts_filename, rendered) catch return error.StorageFailure;
 }
 
+/// Persist a Git credential supplied via `git credential approve` (`keyring git credential store`)
+/// into the OS keyring (`gh:<host>`) and `<gh_config_dir>/hosts.yml`.
+///
+/// Ignores empty credentials and synthetic `"x-access-token"` usernames (such as
+/// credentials originating from `GH_TOKEN` / `GITHUB_TOKEN` environment variables).
+/// Skips redundant keyring/file writes when the exact token is already stored for
+/// `(raw_host, username)`.
+pub fn storeGitCredential(
+    gpa: Allocator,
+    raw_host: []const u8,
+    raw_username: ?[]const u8,
+    raw_password: ?[]const u8,
+) AuthError!void {
+    const user_in = raw_username orelse return;
+    const pass_in = raw_password orelse return;
+    const username = std.mem.trim(u8, user_in, " \t\r\n");
+    const token = std.mem.trim(u8, pass_in, " \t\r\n");
+    if (username.len == 0 or token.len == 0) return;
+    if (std.ascii.eqlIgnoreCase(username, token_username)) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const canonical = try normalizeHostnameAlloc(a, raw_host);
+    const service = try keyringServiceName(a, canonical);
+    const store = activeSecretStore();
+
+    if (isCredentialAlreadyStored(a, store, canonical, service, username, token)) {
+        return;
+    }
+
+    try saveUserCredential(gpa, canonical, username, token);
+}
+
+fn isCredentialAlreadyStored(
+    a: Allocator,
+    store: SecretStore,
+    canonical_host: []const u8,
+    service: []const u8,
+    username: []const u8,
+    token: []const u8,
+) bool {
+    const stored_user_tok = store.get(a, service, username) catch return false;
+    if (!std.mem.eql(u8, stored_user_tok, token)) return false;
+
+    const config_dir = resolveGhConfigDir(a) orelse return false;
+    const local_hosts_path = std.fs.path.join(a, &.{ config_dir, hosts_filename }) catch return false;
+    const existing_yaml = readFileIfExists(a, local_hosts_path) orelse return false;
+    const hosts = parseHostsYaml(a, existing_yaml) catch return false;
+
+    for (hosts.items) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.hostname, canonical_host)) continue;
+        if (h.findUserIndex(username) == null) return false;
+        const active = h.active_user orelse return false;
+        if (std.mem.eql(u8, active, username)) {
+            const mirror_tok = store.get(a, service, "") catch return false;
+            if (!std.mem.eql(u8, mirror_tok, token)) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
 /// Remove a stored GitHub token for `raw_host` (called on `git credential erase`).
 /// When `requested_username` is provided, only that user's token is erased;
 /// otherwise the active user's token on `raw_host` is erased.

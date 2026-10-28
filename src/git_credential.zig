@@ -224,7 +224,10 @@ pub fn runCredential(
                 try writeCredentialOutput(stdout, host, cred.username, cred.token);
                 return 0;
             },
-            .store => return 0,
+            .store => {
+                gh.storeGitCredential(a, host, req.username, req.password) catch {};
+                return 0;
+            },
             .erase => {
                 _ = gh.eraseStoredCredential(a, host, req.username) catch {};
                 return 0;
@@ -479,7 +482,7 @@ test "parseCredentialInput parses key-value pairs, url=, and capability[]=authty
     try std.testing.expectEqualStrings("sec!ret", req2.password.?);
 }
 
-test "runCredential serves and erases GitHub credentials for github.com and *.ghe.com" {
+test "runCredential serves, stores, and erases GitHub credentials for github.com and *.ghe.com" {
     const gpa = std.testing.allocator;
     gh.FakeStore.reset(gpa);
     defer gh.FakeStore.reset(gpa);
@@ -537,7 +540,8 @@ test "runCredential serves and erases GitHub credentials for github.com and *.gh
         );
     }
 
-    // 2. Get credential for specific user bob on github.com
+    // 2. Get credential for specific user bob on github.com, then `store` (as `git credential approve`
+    //    does after a fetch) without changing the active user away from alice.
     {
         var stdin = Io.Reader.fixed("protocol=https\nhost=github.com\nusername=bob\n\n");
         var stdout = Io.Writer.Allocating.init(gpa);
@@ -552,6 +556,23 @@ test "runCredential serves and erases GitHub credentials for github.com and *.gh
             stdout.written(),
         );
     }
+    {
+        var store_stdin = Io.Reader.fixed(
+            "protocol=https\nhost=github.com\nusername=bob\npassword=gho_bob456\n\n",
+        );
+        var stdout = Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+
+        const code = try runCredential(gpa, .store, &store_stdin, &stdout.writer, &stderr.writer);
+        try std.testing.expectEqual(@as(u8, 0), code);
+
+        const active_cred = (try gh.lookupStoredCredential(gpa, "github.com", null)).?;
+        defer active_cred.deinit(gpa);
+        try std.testing.expectEqualStrings("alice", active_cred.username);
+        try std.testing.expectEqualStrings("gho_alice123", active_cred.token);
+    }
 
     // 3. Erase bob on github.com
     {
@@ -564,6 +585,66 @@ test "runCredential serves and erases GitHub credentials for github.com and *.gh
         const code = try runCredential(gpa, .erase, &stdin, &stdout.writer, &stderr.writer);
         try std.testing.expectEqual(@as(u8, 0), code);
         try std.testing.expect((try gh.lookupStoredCredential(gpa, "github.com", "bob")) == null);
+    }
+
+    // 4. Simulate `gh auth login` credential helper update (`git credential reject` followed by
+    //    `git credential approve`) on example.ghe.com: erase without username, then store new token.
+    {
+        var erase_stdin = Io.Reader.fixed("protocol=https\nhost=example.ghe.com\n\n");
+        var stdout = Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+
+        const code = try runCredential(gpa, .erase, &erase_stdin, &stdout.writer, &stderr.writer);
+        try std.testing.expectEqual(@as(u8, 0), code);
+        try std.testing.expect((try gh.lookupStoredCredential(gpa, "example.ghe.com", null)) == null);
+    }
+    {
+        var store_stdin = Io.Reader.fixed(
+            "protocol=https\nhost=example.ghe.com\nusername=alice_ent\npassword=gho_ent_refreshed\n\n",
+        );
+        var stdout = Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+
+        const code = try runCredential(gpa, .store, &store_stdin, &stdout.writer, &stderr.writer);
+        try std.testing.expectEqual(@as(u8, 0), code);
+    }
+    {
+        var get_stdin = Io.Reader.fixed("protocol=https\nhost=example.ghe.com\n\n");
+        var stdout = Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+
+        const code = try runCredential(gpa, .get, &get_stdin, &stdout.writer, &stderr.writer);
+        try std.testing.expectEqual(@as(u8, 0), code);
+        try std.testing.expectEqualStrings(
+            "protocol=https\nhost=example.ghe.com\nusername=alice_ent\npassword=gho_ent_refreshed\n\n",
+            stdout.written(),
+        );
+    }
+
+    // 5. `store` ignores synthetic `x-access-token` usernames (e.g. from GH_TOKEN) so environment
+    //    tokens do not overwrite keyring credentials or `hosts.yml`.
+    {
+        var store_stdin = Io.Reader.fixed(
+            "protocol=https\nhost=example.ghe.com\nusername=x-access-token\npassword=gho_env_ephemeral\n\n",
+        );
+        var stdout = Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+
+        const code = try runCredential(gpa, .store, &store_stdin, &stdout.writer, &stderr.writer);
+        try std.testing.expectEqual(@as(u8, 0), code);
+
+        const cred = (try gh.lookupStoredCredential(gpa, "example.ghe.com", null)).?;
+        defer cred.deinit(gpa);
+        try std.testing.expectEqualStrings("alice_ent", cred.username);
+        try std.testing.expectEqualStrings("gho_ent_refreshed", cred.token);
     }
 }
 
@@ -696,10 +777,10 @@ test "runConfig preserves process environment ($HOME) and writes host-scoped and
         var stderr = Io.Writer.Allocating.init(gpa);
         defer stderr.deinit();
 
-        const code = try runConfig(gpa, .{ .hostname = "microsoft.ghe.com", .global = true }, &stdout.writer, &stderr.writer);
+        const code = try runConfig(gpa, .{ .hostname = "example.ghe.com", .global = true }, &stdout.writer, &stderr.writer);
         try std.testing.expectEqual(@as(u8, 0), code);
         try std.testing.expectEqualStrings(
-            "Configured Git credential helper for https://microsoft.ghe.com (--global)\n",
+            "Configured Git credential helper for https://example.ghe.com (--global)\n",
             stdout.written(),
         );
     }
@@ -716,7 +797,7 @@ test "runConfig preserves process environment ($HOME) and writes host-scoped and
 
     const content = try Io.Dir.cwd().readFileAlloc(io, cfg_path, gpa, .limited(64 * 1024));
     defer gpa.free(content);
-    try std.testing.expect(std.mem.indexOf(u8, content, "[credential \"https://microsoft.ghe.com\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "[credential \"https://example.ghe.com\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "git credential") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "useHttpPath = true") != null);
 }

@@ -785,7 +785,7 @@ pub fn openBrowser(gpa: Allocator, stderr: *Io.Writer, url: []const u8) Error!vo
     // global_single_threaded uses a failing allocator, which makes
     // std.process.spawn return OutOfMemory. Initialize our own Threaded
     // instance backed by `gpa` for process spawning.
-    var threaded = std.Io.Threaded.init(gpa, .{});
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = currentProcessEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
     const attempts = browserAttempts();
@@ -1579,6 +1579,21 @@ pub fn isNonInteractive() bool {
 fn unixNow() i64 {
     const io = std.Io.Threaded.global_single_threaded.io();
     return std.Io.Clock.real.now(io).toSeconds();
+}
+
+/// Build a `std.process.Environ` view of the current process environment so
+/// `std.Io.Threaded.init` preserves `HOME`, `PATH`, etc. for child processes
+/// instead of defaulting to `.empty`.
+pub fn currentProcessEnviron() std.process.Environ {
+    if (builtin.os.tag == .windows) {
+        return .{ .block = .global };
+    }
+    if (builtin.os.tag == .wasi) {
+        return .empty;
+    }
+    var count: usize = 0;
+    while (std.c.environ[count] != null) : (count += 1) {}
+    return .{ .block = .{ .slice = @ptrCast(std.c.environ[0..count :null]) } };
 }
 
 fn getEnvVarOwned(gpa: Allocator, name: []const u8) ?[]u8 {

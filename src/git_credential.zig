@@ -56,6 +56,7 @@ const live_generic_store: GenericStore = .{
 };
 
 var generic_store_override: ?GenericStore = null;
+var git_config_global_override: ?[]const u8 = null;
 
 fn activeGenericStore() GenericStore {
     return generic_store_override orelse live_generic_store;
@@ -345,7 +346,10 @@ pub fn runConfig(
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    const io = Io.Threaded.global_single_threaded.io();
+    var threaded = Io.Threaded.init(gpa, .{ .environ = ado.currentProcessEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
     const exe_path: []const u8 = std.process.executablePathAlloc(io, a) catch "keyring";
     const helper_val = try formatGitHelperValue(a, exe_path);
     const scope_flag = if (opts.global) "--global" else "--local";
@@ -360,12 +364,21 @@ pub fn runConfig(
 
         // Clear any inherited helper first (empty string resets the helper chain for that host),
         // then add `!keyring git credential`, matching `gh auth setup-git`.
-        try runGitConfig(a, &.{ "git", "config", scope_flag, "--replace-all", key, "" }, stderr);
-        try runGitConfig(a, &.{ "git", "config", scope_flag, "--add", key, helper_val }, stderr);
+        runGitConfig(a, io, &.{ "git", "config", scope_flag, "--replace-all", key, "" }, stderr) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return 1,
+        };
+        runGitConfig(a, io, &.{ "git", "config", scope_flag, "--add", key, helper_val }, stderr) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return 1,
+        };
 
         if (ado.isDevOpsUrl(canonical)) {
             const http_path_key = try std.fmt.allocPrint(a, "credential.https://{s}.useHttpPath", .{canonical});
-            try runGitConfig(a, &.{ "git", "config", scope_flag, http_path_key, "true" }, stderr);
+            runGitConfig(a, io, &.{ "git", "config", scope_flag, http_path_key, "true" }, stderr) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return 1,
+            };
         }
 
         try stdout.print("Configured Git credential helper for https://{s} ({s})\n", .{ canonical, scope_flag });
@@ -373,21 +386,32 @@ pub fn runConfig(
         return 0;
     }
 
-    try runGitConfig(a, &.{ "git", "config", scope_flag, "credential.helper", helper_val }, stderr);
-    try runGitConfig(a, &.{ "git", "config", scope_flag, "credential.https://dev.azure.com.useHttpPath", "true" }, stderr);
+    runGitConfig(a, io, &.{ "git", "config", scope_flag, "credential.helper", helper_val }, stderr) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return 1,
+    };
+    runGitConfig(a, io, &.{ "git", "config", scope_flag, "credential.https://dev.azure.com.useHttpPath", "true" }, stderr) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return 1,
+    };
 
     try stdout.print("Configured Git credential helper ({s}): {s}\n", .{ scope_flag, helper_val });
     try stdout.flush();
     return 0;
 }
 
-fn runGitConfig(gpa: Allocator, argv: []const []const u8, stderr: *Io.Writer) !void {
-    var threaded = Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+fn runGitConfig(gpa: Allocator, io: Io, argv: []const []const u8, stderr: *Io.Writer) !void {
+    var env_map_opt: ?std.process.Environ.Map = if (git_config_global_override) |cfg_path| blk: {
+        var m = try std.process.Environ.createMap(ado.currentProcessEnviron(), gpa);
+        errdefer m.deinit();
+        try m.put("GIT_CONFIG_GLOBAL", cfg_path);
+        break :blk m;
+    } else null;
+    defer if (env_map_opt) |*m| m.deinit();
 
     const result = std.process.run(gpa, io, .{
         .argv = argv,
+        .environ_map = if (env_map_opt) |*m| m else null,
         .stdout_limit = .limited(16 * 1024),
         .stderr_limit = .limited(16 * 1024),
     }) catch |err| {
@@ -638,3 +662,62 @@ test "formatGitHelperValue quotes paths with spaces or backslashes" {
     defer gpa.free(win);
     try std.testing.expectEqualStrings("!\"C:/Program Files/keyring/keyring.exe\" git credential", win);
 }
+
+test "runConfig preserves process environment ($HOME) and writes host-scoped and global git config" {
+    const gpa = std.testing.allocator;
+
+    // 1. Verify un-overridden `Io.Threaded.init(gpa, .{ .environ = ado.currentProcessEnviron() })`
+    //    passes $HOME/$PATH to `git config --global` (regression test for `fatal: $HOME not set`).
+    {
+        var threaded = Io.Threaded.init(gpa, .{ .environ = ado.currentProcessEnviron() });
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try runGitConfig(gpa, io, &.{ "git", "config", "--global", "--default", "", "--get", "user.name" }, &stderr.writer);
+    }
+
+    // 2. Verify `runConfig` writes host-scoped and global credential helper entries to a temp gitconfig.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const cfg_path = try std.fs.path.join(gpa, &.{ root_buf[0..root_len], "gitconfig" });
+    defer gpa.free(cfg_path);
+
+    git_config_global_override = cfg_path;
+    defer git_config_global_override = null;
+
+    {
+        var stdout = Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+
+        const code = try runConfig(gpa, .{ .hostname = "microsoft.ghe.com", .global = true }, &stdout.writer, &stderr.writer);
+        try std.testing.expectEqual(@as(u8, 0), code);
+        try std.testing.expectEqualStrings(
+            "Configured Git credential helper for https://microsoft.ghe.com (--global)\n",
+            stdout.written(),
+        );
+    }
+
+    {
+        var stdout = Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+
+        const code = try runConfig(gpa, .{ .hostname = "dev.azure.com", .global = true }, &stdout.writer, &stderr.writer);
+        try std.testing.expectEqual(@as(u8, 0), code);
+    }
+
+    const content = try Io.Dir.cwd().readFileAlloc(io, cfg_path, gpa, .limited(64 * 1024));
+    defer gpa.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "[credential \"https://microsoft.ghe.com\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "git credential") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "useHttpPath = true") != null);
+}
+

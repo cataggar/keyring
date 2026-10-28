@@ -915,7 +915,7 @@ fn liveSecretDelete(gpa: Allocator, service: []const u8, account: []const u8) Se
 }
 
 fn macosSecurityDelete(gpa: Allocator, service: []const u8, account: []const u8) bool {
-    var threaded = Io.Threaded.init(gpa, .{});
+    var threaded = Io.Threaded.init(gpa, .{ .environ = ado.currentProcessEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -941,7 +941,7 @@ fn macosSecurityDelete(gpa: Allocator, service: []const u8, account: []const u8)
 }
 
 fn macosSecurityGet(gpa: Allocator, service: []const u8, account: []const u8) SecretError![]u8 {
-    var threaded = Io.Threaded.init(gpa, .{});
+    var threaded = Io.Threaded.init(gpa, .{ .environ = ado.currentProcessEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -979,7 +979,7 @@ fn macosSecurityGet(gpa: Allocator, service: []const u8, account: []const u8) Se
 /// `zalando/go-keyring` on macOS) so `/usr/bin/security` owns the Keychain item
 /// ACL and `gh` can read it without triggering a Keychain GUI prompt.
 fn macosSecuritySet(gpa: Allocator, service: []const u8, account: []const u8, encoded_value: []const u8) SecretError!void {
-    var threaded = Io.Threaded.init(gpa, .{});
+    var threaded = Io.Threaded.init(gpa, .{ .environ = ado.currentProcessEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
 

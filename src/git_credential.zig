@@ -345,7 +345,9 @@ pub fn runSetup(
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    const helper_val = try formatGitHelperValue(a, "keyring");
+    const io = Io.Threaded.global_single_threaded.io();
+    const exe_path: []const u8 = std.process.executablePathAlloc(io, a) catch "keyring";
+    const helper_val = try formatGitHelperValue(a, exe_path);
     const scope_flag = if (opts.global) "--global" else "--local";
 
     if (opts.hostname) |raw_host| {

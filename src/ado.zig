@@ -28,6 +28,7 @@ pub const Credential = struct {
 
 const client_id = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 const scope = "499b84ac-1321-427f-aa17-267ca6975798/.default offline_access";
+const arm_scope = "https://management.azure.com/.default offline_access";
 const auth_url = "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize";
 const token_url = "https://login.microsoftonline.com/organizations/oauth2/v2.0/token";
 const log_prefix = "[keyring ado]";
@@ -310,6 +311,54 @@ pub fn getCredentialWithOptions(
 }
 
 const git_oauth_cache_key = "__entra_oauth__";
+const arm_oauth_cache_key = "__arm_oauth__";
+
+/// Obtain a Microsoft Entra access token scoped to Azure Resource Manager
+/// (`https://management.azure.com/.default`), used by `keyring wslc` to
+/// exchange for Azure Container Registry (`*.azurecr.io`) refresh tokens via
+/// `POST /oauth2/exchange`. Reuses the cached FOCI refresh token in `ado-keyring`
+/// or the shared MSAL cache (`az login` SSO), falling back to interactive
+/// browser OAuth2 + PKCE only when `allow_interactive` is true and the
+/// environment is interactive.
+pub fn acquireArmAccessToken(
+    gpa: Allocator,
+    stderr: *Io.Writer,
+    allow_interactive: bool,
+) Error![]u8 {
+    const now = unixNow();
+    var loaded = try loadCache(gpa);
+    defer loaded.deinit(gpa);
+    var cache: Cache = loaded.cache;
+
+    if (cache.session_tokens.map.get(arm_oauth_cache_key)) |cached| {
+        if (cached.expires_at > now + 60 and cached.token.len > 0) {
+            return gpa.dupe(u8, cached.token);
+        }
+    }
+
+    var token_parsed = try acquireAccessTokenWithScope(
+        gpa,
+        stderr,
+        cache.refresh_token,
+        arm_scope,
+        allow_interactive,
+    );
+    defer token_parsed.deinit();
+
+    const access_token = token_parsed.value.access_token;
+    if (access_token.len == 0) return error.AuthenticationFailed;
+
+    if (token_parsed.value.refresh_token) |rt| {
+        cache.refresh_token = rt;
+    }
+    const expires_at = now + token_parsed.value.expires_in;
+
+    const owned_token = try gpa.dupe(u8, access_token);
+    errdefer gpa.free(owned_token);
+
+    try saveCache(gpa, &cache, arm_oauth_cache_key, owned_token, expires_at);
+    return owned_token;
+}
 
 /// Obtain an Azure DevOps credential suitable for Git over HTTPS (`dev.azure.com`
 /// and `*.visualstudio.com`). Uses the Entra OAuth access token for resource
@@ -370,9 +419,19 @@ pub fn eraseGitCredential(gpa: Allocator, service_url: []const u8) Error!void {
 /// initial acquisition and to recover when a cached access token is rejected
 /// by Azure DevOps.
 fn acquireAccessToken(gpa: Allocator, stderr: *Io.Writer, refresh_token: ?[]const u8) Error!std.json.Parsed(TokenResponse) {
+    return acquireAccessTokenWithScope(gpa, stderr, refresh_token, scope, true);
+}
+
+fn acquireAccessTokenWithScope(
+    gpa: Allocator,
+    stderr: *Io.Writer,
+    refresh_token: ?[]const u8,
+    requested_scope: []const u8,
+    allow_interactive: bool,
+) Error!std.json.Parsed(TokenResponse) {
     if (refresh_token) |rt| {
         log(stderr, "{s} Refreshing access token...\n", .{log_prefix});
-        if (refreshAccessToken(gpa, rt)) |parsed| {
+        if (refreshAccessTokenWithScope(gpa, rt, requested_scope)) |parsed| {
             return parsed;
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -382,20 +441,28 @@ fn acquireAccessToken(gpa: Allocator, stderr: *Io.Writer, refresh_token: ?[]cons
 
     // Read-only SSO with az login and friends: redeem a Family Refresh Token
     // from the shared MSAL cache using our own client id (issue #19).
-    if (tryMsalAuth(gpa, stderr)) |parsed| return parsed;
+    if (tryMsalAuthWithScope(gpa, stderr, requested_scope)) |parsed| return parsed;
 
-    if (isNonInteractive() or !canLaunchBrowser()) return error.NoStorageAccess;
+    if (!allow_interactive or isNonInteractive() or !canLaunchBrowser()) return error.NoStorageAccess;
     log(stderr, "{s} No cached token, starting browser auth...\n", .{log_prefix});
-    return browserAuth(gpa, stderr);
+    return browserAuthWithScope(gpa, stderr, requested_scope);
 }
 
 /// Attempt to redeem a FOCI refresh token from the shared MSAL cache. Returns
 /// null on any failure so the caller can fall through to browser auth. The
 /// MSAL cache is never written back to.
 fn tryMsalAuth(gpa: Allocator, stderr: *Io.Writer) ?std.json.Parsed(TokenResponse) {
+    return tryMsalAuthWithScope(gpa, stderr, scope);
+}
+
+fn tryMsalAuthWithScope(gpa: Allocator, stderr: *Io.Writer, requested_scope: []const u8) ?std.json.Parsed(TokenResponse) {
     const candidate = msal_cache.findFociRefreshToken(gpa) orelse return null;
+    defer {
+        gpa.free(candidate.secret);
+        gpa.free(candidate.home_account_id);
+    }
     log(stderr, "{s} Trying refresh token from MSAL cache (az login SSO)...\n", .{log_prefix});
-    return refreshAccessToken(gpa, candidate.secret) catch |err| {
+    return refreshAccessTokenWithScope(gpa, candidate.secret, requested_scope) catch |err| {
         log(stderr, "{s} MSAL cache refresh failed ({s})\n", .{ log_prefix, @errorName(err) });
         return null;
     };
@@ -543,6 +610,10 @@ pub fn generatePkce(verifier_out: *[43]u8, challenge_out: *[43]u8) void {
 }
 
 fn browserAuth(gpa: Allocator, stderr: *Io.Writer) Error!std.json.Parsed(TokenResponse) {
+    return browserAuthWithScope(gpa, stderr, scope);
+}
+
+fn browserAuthWithScope(gpa: Allocator, stderr: *Io.Writer, requested_scope: []const u8) Error!std.json.Parsed(TokenResponse) {
     if (isNonInteractive() or !canLaunchBrowser()) return error.NoStorageAccess;
 
     var verifier: [43]u8 = undefined;
@@ -565,10 +636,10 @@ fn browserAuth(gpa: Allocator, stderr: *Io.Writer) Error!std.json.Parsed(TokenRe
     const redirect_uri = try std.fmt.allocPrint(gpa, "http://localhost:{d}", .{bound_port});
     defer gpa.free(redirect_uri);
 
-    const url = try buildAuthorizeUrl(gpa, redirect_uri, &challenge, state);
+    const url = try buildAuthorizeUrlWithScope(gpa, redirect_uri, &challenge, state, requested_scope);
     defer gpa.free(url);
 
-    log(stderr, "{s} Opening browser for Azure DevOps authentication...\n", .{log_prefix});
+    log(stderr, "{s} Opening browser for Microsoft Entra authentication...\n", .{log_prefix});
     log(stderr, "{s} If the browser does not open, visit:\n{s}\n", .{ log_prefix, url });
     try openBrowser(gpa, stderr, url);
 
@@ -587,12 +658,16 @@ fn browserAuth(gpa: Allocator, stderr: *Io.Writer) Error!std.json.Parsed(TokenRe
 }
 
 fn refreshAccessToken(gpa: Allocator, refresh_token: []const u8) Error!std.json.Parsed(TokenResponse) {
+    return refreshAccessTokenWithScope(gpa, refresh_token, scope);
+}
+
+fn refreshAccessTokenWithScope(gpa: Allocator, refresh_token: []const u8, requested_scope: []const u8) Error!std.json.Parsed(TokenResponse) {
     var body = std.Io.Writer.Allocating.init(gpa);
     defer body.deinit();
     try formField(&body.writer, "client_id", client_id, true);
     try formField(&body.writer, "grant_type", "refresh_token", false);
     try formField(&body.writer, "refresh_token", refresh_token, false);
-    try formField(&body.writer, "scope", scope, false);
+    try formField(&body.writer, "scope", requested_scope, false);
     return postJson(TokenResponse, gpa, token_url, body.written(), "application/x-www-form-urlencoded", &.{});
 }
 
@@ -693,12 +768,22 @@ fn percentEncodeForm(writer: *Io.Writer, value: []const u8) Error!void {
 }
 
 fn buildAuthorizeUrl(gpa: Allocator, redirect_uri: []const u8, challenge: []const u8, state: []const u8) Error![]u8 {
+    return buildAuthorizeUrlWithScope(gpa, redirect_uri, challenge, state, scope);
+}
+
+fn buildAuthorizeUrlWithScope(
+    gpa: Allocator,
+    redirect_uri: []const u8,
+    challenge: []const u8,
+    state: []const u8,
+    requested_scope: []const u8,
+) Error![]u8 {
     var query = std.Io.Writer.Allocating.init(gpa);
     defer query.deinit();
     try formField(&query.writer, "client_id", client_id, true);
     try formField(&query.writer, "response_type", "code", false);
     try formField(&query.writer, "redirect_uri", redirect_uri, false);
-    try formField(&query.writer, "scope", scope, false);
+    try formField(&query.writer, "scope", requested_scope, false);
     try formField(&query.writer, "code_challenge", challenge, false);
     try formField(&query.writer, "code_challenge_method", "S256", false);
     try formField(&query.writer, "state", state, false);

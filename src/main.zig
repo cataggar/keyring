@@ -13,6 +13,7 @@ const vault = @import("vault.zig");
 const webauthn = @import("webauthn.zig");
 const tunnel_http = @import("tunnel_http.zig");
 const service = @import("service.zig");
+const wslc = @import("wslc.zig");
 
 test {
     _ = gh;
@@ -21,6 +22,7 @@ test {
     _ = webauthn;
     _ = tunnel_http;
     _ = service;
+    _ = wslc;
 }
 
 var runtime_env_map: ?*std.process.Environ.Map = null;
@@ -53,6 +55,10 @@ const usage =
     \\  git credential <op>           Git credential helper protocol (get, store, erase).
     \\  git config [options]          Configure Git to use keyring as its credential helper.
     \\  devops-npm [options]          Authenticate Azure DevOps npm feeds in .npmrc.
+    \\  wslc login [options] [<srv>]  Authenticate container registries for wslc (GHCR, ACR, generic).
+    \\  wslc logout <server>...       Remove registry credentials from wslc storage.
+    \\  wslc status                   Show wslc credential store status and configured registries.
+    \\  wslc credential <op>          Credential helper protocol for wslc (get, store, erase).
     \\
     \\Backends: secret_service, keychain, win_credential, file, ado, null_backend (or null)
     \\
@@ -107,6 +113,7 @@ pub const Command = union(enum) {
     git_credential: git_credential.Operation,
     git_config: git_credential.ConfigOptions,
     devops_npm: devops_npm.Options,
+    wslc: wslc.Subcommand,
     usage_error: []const u8,
 };
 
@@ -289,6 +296,11 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
         .devops_npm => |opts| code: {
             break :code try devops_npm.run(arena, io, opts, stdout, stderr);
         },
+        .wslc => |subcmd| code: {
+            var stdin_buffer: [4096]u8 = undefined;
+            var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+            break :code try wslc.run(arena, subcmd, &stdin_reader.interface, stdout, stderr);
+        },
         .usage_error => |message| code: {
             try stderr.print("keyring: {s}\n{s}", .{ message, usage });
             try stderr.flush();
@@ -443,6 +455,14 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
             .{ .devops_npm = opts }
         else
             .{ .usage_error = "usage: keyring devops-npm [-c <path>] [-f|--force] [--validate-only]" };
+        return parsed;
+    }
+
+    if (std.mem.eql(u8, command, "wslc")) {
+        parsed.command = if (wslc.parseArgs(rest)) |subcmd|
+            .{ .wslc = subcmd }
+        else
+            .{ .usage_error = "usage: keyring wslc <login [<server>...] [-u <user>] [--password-stdin] [-f|--force] | logout <server>... | status | credential <get|store|erase>>" };
         return parsed;
     }
 
@@ -1017,6 +1037,7 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     msal_cache.diagnose(arena, stdout) catch {};
     ado.diagnoseCache(arena, stdout) catch {};
     gh.diagnoseHosts(arena, stdout) catch {};
+    wslc.diagnose(arena, stdout) catch {};
     try stdout.flush();
 }
 
@@ -1429,6 +1450,35 @@ test "parseArgs recognizes devops-npm" {
 
     try expectUsage(parseArgs(&.{ "keyring", "devops-npm", "--bogus" }));
     try expectUsage(parseArgs(&.{ "keyring", "devops-npm", "-c" }));
+}
+
+test "parseArgs recognizes wslc subcommands" {
+    const login_srv = parseArgs(&.{ "keyring", "wslc", "login", "ghcr.io", "myacr.azurecr.io", "-f" });
+    try expectCommandTag(.wslc, login_srv);
+    try std.testing.expectEqual(@as(usize, 2), login_srv.command.wslc.login.servers.len);
+    try std.testing.expect(login_srv.command.wslc.login.force);
+
+    const login_stdin = parseArgs(&.{ "keyring", "wslc", "login", "-u", "alice", "--password-stdin", "registry.example.com" });
+    try expectCommandTag(.wslc, login_stdin);
+    try std.testing.expect(login_stdin.command.wslc.login.password_stdin);
+    try std.testing.expectEqualStrings("alice", login_stdin.command.wslc.login.username.?);
+
+    const logout_cmd = parseArgs(&.{ "keyring", "wslc", "logout", "ghcr.io" });
+    try expectCommandTag(.wslc, logout_cmd);
+    try std.testing.expectEqual(@as(usize, 1), logout_cmd.command.wslc.logout.servers.len);
+
+    const status_cmd = parseArgs(&.{ "keyring", "wslc", "status" });
+    try expectCommandTag(.wslc, status_cmd);
+    try std.testing.expectEqual(std.meta.Tag(wslc.Subcommand).status, std.meta.activeTag(status_cmd.command.wslc));
+
+    const cred_get = parseArgs(&.{ "keyring", "wslc", "credential", "get" });
+    try expectCommandTag(.wslc, cred_get);
+    try std.testing.expectEqual(wslc.Operation.get, cred_get.command.wslc.credential);
+
+    try expectUsage(parseArgs(&.{ "keyring", "wslc" }));
+    try expectUsage(parseArgs(&.{ "keyring", "wslc", "logout" }));
+    try expectUsage(parseArgs(&.{ "keyring", "wslc", "login", "--password-stdin", "ghcr.io" }));
+    try expectUsage(parseArgs(&.{ "keyring", "wslc", "credential", "bogus" }));
 }
 
 test "parseArgs recognizes backend flag" {

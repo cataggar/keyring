@@ -29,6 +29,10 @@ keyring lock                     # immediately clear the in-memory master key
 # Git credential helper for github.com, *.ghe.com, GHES, and Azure DevOps:
 keyring gh login --hostname example.ghe.com
 keyring git config --hostname example.ghe.com
+
+# WSL Container CLI (wslc) registry authentication (GHCR, ACR, and generic registries):
+keyring wslc login ghcr.io myregistry.azurecr.io
+keyring wslc status
 ```
 
 Use `keyring enroll --add-key`, `--list`, and `--revoke <id>` for multiple authenticators. `keyring unlock --recover` uses the one-time Recovery Key. Set `KEYRING_VAULT_PATH` to override the default encrypted vault path.

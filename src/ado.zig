@@ -117,6 +117,7 @@ fn validateOrganizationResponse(gpa: Allocator, status: std.http.Status, body: [
 
 const client_id = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 const scope = "499b84ac-1321-427f-aa17-267ca6975798/.default offline_access";
+const arm_scope = "https://management.azure.com/.default offline_access";
 const auth_url = "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize";
 const token_url = "https://login.microsoftonline.com/organizations/oauth2/v2.0/token";
 const log_prefix = "[keyring ado]";
@@ -399,6 +400,130 @@ pub fn getCredentialWithOptions(
 }
 
 const git_oauth_cache_key = "__entra_oauth__";
+const arm_oauth_cache_key = "__arm_oauth__";
+
+/// Obtain a Microsoft Entra access token scoped to Azure Resource Manager
+/// (`https://management.azure.com/.default`), used by `keyring wslc` to
+/// exchange for Azure Container Registry (`*.azurecr.io`) refresh tokens via
+/// `POST /oauth2/exchange`. Reuses the cached FOCI refresh token in `ado-keyring`
+/// or the shared MSAL cache (`az login` SSO), falling back to interactive
+pub fn isValidEntraTenantUuid(s: []const u8) bool {
+    if (s.len != 36) return false;
+    var non_zero = false;
+    for (s, 0..) |c, idx| {
+        if (idx == 8 or idx == 13 or idx == 18 or idx == 23) {
+            if (c != '-') return false;
+        } else {
+            if (!std.ascii.isHex(c)) return false;
+            if (c != '0') non_zero = true;
+        }
+    }
+    return non_zero;
+}
+
+/// Validate and canonicalize a Microsoft Entra tenant GUID (`8-4-4-4-12` hex,
+/// rejecting the all-zero empty GUID) before interpolating into an OAuth URL
+/// or session cache key.
+pub fn normalizeEntraTenantIdAlloc(gpa: Allocator, raw_tid: []const u8) Error![]u8 {
+    const trimmed = std.mem.trim(u8, raw_tid, " \t\r\n");
+    if (!isValidEntraTenantUuid(trimmed)) return error.AuthenticationFailed;
+    const out = try gpa.dupe(u8, trimmed);
+    _ = std.ascii.lowerString(out, out);
+    return out;
+}
+
+fn armCacheKeyAlloc(gpa: Allocator, normalized_tid: ?[]const u8) Error![]u8 {
+    if (normalized_tid) |tid| {
+        return std.fmt.allocPrint(gpa, "{s}:{s}", .{ arm_oauth_cache_key, tid });
+    }
+    return gpa.dupe(u8, arm_oauth_cache_key);
+}
+
+/// browser OAuth2 + PKCE only when `allow_interactive` is true and the
+/// environment is interactive.
+pub fn acquireArmAccessToken(
+    gpa: Allocator,
+    stderr: *Io.Writer,
+    allow_interactive: bool,
+) Error![]u8 {
+    return acquireArmAccessTokenForTenant(gpa, stderr, allow_interactive, false, null);
+}
+
+/// Obtain a Microsoft Entra access token scoped to Azure Resource Manager
+/// (`https://management.azure.com/.default`). When `force_refresh` is true,
+/// skips any cached `__arm_oauth__` entry in `session.dat` and refreshes from
+/// the FOCI `refresh_token`, shared MSAL cache, or interactive browser login.
+pub fn acquireArmAccessTokenWithOptions(
+    gpa: Allocator,
+    stderr: *Io.Writer,
+    allow_interactive: bool,
+    force_refresh: bool,
+) Error![]u8 {
+    return acquireArmAccessTokenForTenant(gpa, stderr, allow_interactive, force_refresh, null);
+}
+
+/// Obtain a Microsoft Entra access token scoped to Azure Resource Manager,
+/// optionally targeting a specific discovered registry tenant UUID rather than
+/// `/organizations`.
+pub fn acquireArmAccessTokenForTenant(
+    gpa: Allocator,
+    stderr: *Io.Writer,
+    allow_interactive: bool,
+    force_refresh: bool,
+    tenant_id: ?[]const u8,
+) Error![]u8 {
+    const normalized_tid = if (tenant_id) |raw_tid|
+        try normalizeEntraTenantIdAlloc(gpa, raw_tid)
+    else
+        null;
+    defer if (normalized_tid) |tid| gpa.free(tid);
+
+    const cache_key = try armCacheKeyAlloc(gpa, normalized_tid);
+    defer gpa.free(cache_key);
+
+    const now = unixNow();
+    var loaded = try loadCache(gpa);
+    defer loaded.deinit(gpa);
+    var cache: Cache = loaded.cache;
+
+    if (!force_refresh) {
+        if (cache.session_tokens.map.get(cache_key)) |cached| {
+            if (cached.expires_at > now + 60 and cached.token.len > 0) {
+                return gpa.dupe(u8, cached.token);
+            }
+        }
+    } else {
+        _ = cache.session_tokens.map.orderedRemove(cache_key);
+        evictSessionDatEntry(gpa, cache_key);
+    }
+
+    var token_parsed = try acquireAccessTokenForTenant(
+        gpa,
+        stderr,
+        cache.refresh_token,
+        arm_scope,
+        normalized_tid,
+        allow_interactive,
+    );
+    defer token_parsed.deinit();
+
+    const access_token = token_parsed.value.access_token;
+    if (access_token.len == 0) return error.AuthenticationFailed;
+
+    if (token_parsed.value.refresh_token) |rt| {
+        cache.refresh_token = rt;
+    }
+    const expires_at = now + token_parsed.value.expires_in;
+
+    const owned_token = try gpa.dupe(u8, access_token);
+    errdefer {
+        std.crypto.secureZero(u8, owned_token);
+        gpa.free(owned_token);
+    }
+
+    try saveCache(gpa, &cache, cache_key, owned_token, expires_at);
+    return owned_token;
+}
 
 /// Obtain an Azure DevOps credential suitable for Git over HTTPS (`dev.azure.com`
 /// and `*.visualstudio.com`). Uses the Entra OAuth access token for resource
@@ -463,9 +588,40 @@ pub fn eraseGitCredential(gpa: Allocator, service_url: []const u8) Error!void {
 /// initial acquisition and to recover when a cached access token is rejected
 /// by Azure DevOps.
 fn acquireAccessToken(gpa: Allocator, stderr: *Io.Writer, refresh_token: ?[]const u8) Error!std.json.Parsed(TokenResponse) {
+    return acquireAccessTokenWithScope(gpa, stderr, refresh_token, scope, true);
+}
+
+var acquire_token_override: ?*const fn (
+    gpa: Allocator,
+    requested_scope: []const u8,
+    allow_interactive: bool,
+) Error!std.json.Parsed(TokenResponse) = null;
+var skip_platform_secret_store_for_test: bool = false;
+
+fn acquireAccessTokenWithScope(
+    gpa: Allocator,
+    stderr: *Io.Writer,
+    refresh_token: ?[]const u8,
+    requested_scope: []const u8,
+    allow_interactive: bool,
+) Error!std.json.Parsed(TokenResponse) {
+    return acquireAccessTokenForTenant(gpa, stderr, refresh_token, requested_scope, null, allow_interactive);
+}
+
+fn acquireAccessTokenForTenant(
+    gpa: Allocator,
+    stderr: *Io.Writer,
+    refresh_token: ?[]const u8,
+    requested_scope: []const u8,
+    normalized_tid: ?[]const u8,
+    allow_interactive: bool,
+) Error!std.json.Parsed(TokenResponse) {
+    if (acquire_token_override) |override_fn| {
+        return override_fn(gpa, requested_scope, allow_interactive);
+    }
     if (refresh_token) |rt| {
         log(stderr, "{s} Refreshing access token...\n", .{log_prefix});
-        if (refreshAccessToken(gpa, rt)) |parsed| {
+        if (refreshAccessTokenForTenant(gpa, rt, requested_scope, normalized_tid)) |parsed| {
             return parsed;
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -475,20 +631,33 @@ fn acquireAccessToken(gpa: Allocator, stderr: *Io.Writer, refresh_token: ?[]cons
 
     // Read-only SSO with az login and friends: redeem a Family Refresh Token
     // from the shared MSAL cache using our own client id (issue #19).
-    if (tryMsalAuth(gpa, stderr)) |parsed| return parsed;
+    if (tryMsalAuthForTenant(gpa, stderr, requested_scope, normalized_tid)) |parsed| return parsed;
 
-    if (isNonInteractive() or !canLaunchBrowser()) return error.NoStorageAccess;
+    if (!allow_interactive or isNonInteractive() or !canLaunchBrowser()) return error.NoStorageAccess;
     log(stderr, "{s} No cached token, starting browser auth...\n", .{log_prefix});
-    return browserAuth(gpa, stderr);
+    return browserAuthForTenant(gpa, stderr, requested_scope, normalized_tid);
 }
 
 /// Attempt to redeem a FOCI refresh token from the shared MSAL cache. Returns
 /// null on any failure so the caller can fall through to browser auth. The
 /// MSAL cache is never written back to.
 fn tryMsalAuth(gpa: Allocator, stderr: *Io.Writer) ?std.json.Parsed(TokenResponse) {
+    return tryMsalAuthForTenant(gpa, stderr, scope, null);
+}
+
+fn tryMsalAuthForTenant(
+    gpa: Allocator,
+    stderr: *Io.Writer,
+    requested_scope: []const u8,
+    normalized_tid: ?[]const u8,
+) ?std.json.Parsed(TokenResponse) {
     const candidate = msal_cache.findFociRefreshToken(gpa) orelse return null;
+    defer {
+        gpa.free(candidate.secret);
+        gpa.free(candidate.home_account_id);
+    }
     log(stderr, "{s} Trying refresh token from MSAL cache (az login SSO)...\n", .{log_prefix});
-    return refreshAccessToken(gpa, candidate.secret) catch |err| {
+    return refreshAccessTokenForTenant(gpa, candidate.secret, requested_scope, normalized_tid) catch |err| {
         log(stderr, "{s} MSAL cache refresh failed ({s})\n", .{ log_prefix, @errorName(err) });
         return null;
     };
@@ -681,6 +850,19 @@ pub fn generatePkce(verifier_out: *[43]u8, challenge_out: *[43]u8) void {
 }
 
 fn browserAuth(gpa: Allocator, stderr: *Io.Writer) Error!std.json.Parsed(TokenResponse) {
+    return browserAuthWithScope(gpa, stderr, scope);
+}
+
+fn browserAuthWithScope(gpa: Allocator, stderr: *Io.Writer, requested_scope: []const u8) Error!std.json.Parsed(TokenResponse) {
+    return browserAuthForTenant(gpa, stderr, requested_scope, null);
+}
+
+fn browserAuthForTenant(
+    gpa: Allocator,
+    stderr: *Io.Writer,
+    requested_scope: []const u8,
+    normalized_tid: ?[]const u8,
+) Error!std.json.Parsed(TokenResponse) {
     if (isNonInteractive() or !canLaunchBrowser()) return error.NoStorageAccess;
 
     var verifier: [43]u8 = undefined;
@@ -703,10 +885,10 @@ fn browserAuth(gpa: Allocator, stderr: *Io.Writer) Error!std.json.Parsed(TokenRe
     const redirect_uri = try std.fmt.allocPrint(gpa, "http://localhost:{d}", .{bound_port});
     defer gpa.free(redirect_uri);
 
-    const url = try buildAuthorizeUrl(gpa, redirect_uri, &challenge, state);
+    const url = try buildAuthorizeUrlForTenant(gpa, redirect_uri, &challenge, state, requested_scope, normalized_tid);
     defer gpa.free(url);
 
-    log(stderr, "{s} Opening browser for Azure DevOps authentication...\n", .{log_prefix});
+    log(stderr, "{s} Opening browser for Microsoft Entra authentication...\n", .{log_prefix});
     log(stderr, "{s} If the browser does not open, visit:\n{s}\n", .{ log_prefix, url });
     try openBrowser(gpa, stderr, url);
 
@@ -721,20 +903,55 @@ fn browserAuth(gpa: Allocator, stderr: *Io.Writer) Error!std.json.Parsed(TokenRe
     defer gpa.free(code);
     try sendHtml(io, stream, success_html);
 
-    return exchangeCode(gpa, code, redirect_uri, &verifier);
+    return exchangeCodeForTenant(gpa, code, redirect_uri, &verifier, normalized_tid);
+}
+
+fn oauthTokenEndpointAlloc(gpa: Allocator, normalized_tid: ?[]const u8) Error![]u8 {
+    if (normalized_tid) |tid| {
+        return std.fmt.allocPrint(gpa, "https://login.microsoftonline.com/{s}/oauth2/v2.0/token", .{tid});
+    }
+    return gpa.dupe(u8, token_url);
+}
+
+fn oauthAuthorizeEndpointAlloc(gpa: Allocator, normalized_tid: ?[]const u8) Error![]u8 {
+    if (normalized_tid) |tid| {
+        return std.fmt.allocPrint(gpa, "https://login.microsoftonline.com/{s}/oauth2/v2.0/authorize", .{tid});
+    }
+    return gpa.dupe(u8, auth_url);
 }
 
 fn refreshAccessToken(gpa: Allocator, refresh_token: []const u8) Error!std.json.Parsed(TokenResponse) {
+    return refreshAccessTokenForTenant(gpa, refresh_token, scope, null);
+}
+
+fn refreshAccessTokenForTenant(
+    gpa: Allocator,
+    refresh_token: []const u8,
+    requested_scope: []const u8,
+    normalized_tid: ?[]const u8,
+) Error!std.json.Parsed(TokenResponse) {
+    const endpoint = try oauthTokenEndpointAlloc(gpa, normalized_tid);
+    defer gpa.free(endpoint);
+
     var body = std.Io.Writer.Allocating.init(gpa);
     defer body.deinit();
     try formField(&body.writer, "client_id", client_id, true);
     try formField(&body.writer, "grant_type", "refresh_token", false);
     try formField(&body.writer, "refresh_token", refresh_token, false);
-    try formField(&body.writer, "scope", scope, false);
-    return postJson(TokenResponse, gpa, token_url, body.written(), "application/x-www-form-urlencoded", &.{});
+    try formField(&body.writer, "scope", requested_scope, false);
+    return postJson(TokenResponse, gpa, endpoint, body.written(), "application/x-www-form-urlencoded", &.{});
 }
 
-fn exchangeCode(gpa: Allocator, code: []const u8, redirect_uri: []const u8, verifier: []const u8) Error!std.json.Parsed(TokenResponse) {
+fn exchangeCodeForTenant(
+    gpa: Allocator,
+    code: []const u8,
+    redirect_uri: []const u8,
+    verifier: []const u8,
+    normalized_tid: ?[]const u8,
+) Error!std.json.Parsed(TokenResponse) {
+    const endpoint = try oauthTokenEndpointAlloc(gpa, normalized_tid);
+    defer gpa.free(endpoint);
+
     var body = std.Io.Writer.Allocating.init(gpa);
     defer body.deinit();
     try formField(&body.writer, "client_id", client_id, true);
@@ -742,7 +959,7 @@ fn exchangeCode(gpa: Allocator, code: []const u8, redirect_uri: []const u8, veri
     try formField(&body.writer, "code", code, false);
     try formField(&body.writer, "redirect_uri", redirect_uri, false);
     try formField(&body.writer, "code_verifier", verifier, false);
-    return postJson(TokenResponse, gpa, token_url, body.written(), "application/x-www-form-urlencoded", &.{});
+    return postJson(TokenResponse, gpa, endpoint, body.written(), "application/x-www-form-urlencoded", &.{});
 }
 
 pub fn exchangeForSessionToken(
@@ -831,17 +1048,31 @@ fn percentEncodeForm(writer: *Io.Writer, value: []const u8) Error!void {
 }
 
 fn buildAuthorizeUrl(gpa: Allocator, redirect_uri: []const u8, challenge: []const u8, state: []const u8) Error![]u8 {
+    return buildAuthorizeUrlForTenant(gpa, redirect_uri, challenge, state, scope, null);
+}
+
+fn buildAuthorizeUrlForTenant(
+    gpa: Allocator,
+    redirect_uri: []const u8,
+    challenge: []const u8,
+    state: []const u8,
+    requested_scope: []const u8,
+    normalized_tid: ?[]const u8,
+) Error![]u8 {
+    const base_url = try oauthAuthorizeEndpointAlloc(gpa, normalized_tid);
+    defer gpa.free(base_url);
+
     var query = std.Io.Writer.Allocating.init(gpa);
     defer query.deinit();
     try formField(&query.writer, "client_id", client_id, true);
     try formField(&query.writer, "response_type", "code", false);
     try formField(&query.writer, "redirect_uri", redirect_uri, false);
-    try formField(&query.writer, "scope", scope, false);
+    try formField(&query.writer, "scope", requested_scope, false);
     try formField(&query.writer, "code_challenge", challenge, false);
     try formField(&query.writer, "code_challenge_method", "S256", false);
     try formField(&query.writer, "state", state, false);
     try formField(&query.writer, "prompt", "select_account", false);
-    return std.fmt.allocPrint(gpa, "{s}?{s}", .{ auth_url, query.written() });
+    return std.fmt.allocPrint(gpa, "{s}?{s}", .{ base_url, query.written() });
 }
 
 fn parseRequestPath(request_line: []const u8) ?[]const u8 {
@@ -1241,6 +1472,7 @@ fn loadCache(gpa: Allocator) Error!LoadedCache {
 /// Manager / macOS Keychain). The access token is intentionally not persisted
 /// there (see `LongLived`); it stays in memory for the lifetime of this process.
 fn loadRefreshSecretStore(a: Allocator, cache: *Cache, comptime os: std.Target.Os.Tag) void {
+    if (skip_platform_secret_store_for_test) return;
     const blob = switch (os) {
         .windows => wincred.get(a, wcm_service) catch return,
         .macos => keychain.get(a, wcm_service, wcm_key) catch return,
@@ -1435,15 +1667,31 @@ fn datExists(a: Allocator, name: []const u8) bool {
 
 fn saveCache(gpa: Allocator, cache: *const Cache, org: []const u8, token: []const u8, expires_at: i64) Error!void {
     if (diskCacheDisabled()) return;
-    switch (builtin.os.tag) {
-        .windows => try saveLongLivedWindows(gpa, cache),
-        .macos => try saveLongLivedMacos(gpa, cache),
-        else => switch (try selectedStore()) {
-            .file => try saveRefreshDat(gpa, cache),
-            .secret => try saveRefreshSecret(gpa, cache),
-        },
+    if (!skip_platform_secret_store_for_test) {
+        switch (builtin.os.tag) {
+            .windows => try saveLongLivedWindows(gpa, cache),
+            .macos => try saveLongLivedMacos(gpa, cache),
+            else => switch (try selectedStore()) {
+                .file => try saveRefreshDat(gpa, cache),
+                .secret => try saveRefreshSecret(gpa, cache),
+            },
+        }
     }
     return saveSessionDat(gpa, org, token, expires_at);
+}
+
+fn evictSessionDatEntry(gpa: Allocator, key: []const u8) void {
+    if (diskCacheDisabled()) return;
+    var lock = acquireCacheLock(gpa);
+    defer lock.release();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var disk: Cache = .{};
+    loadSessionDat(arena.allocator(), &disk);
+
+    if (!disk.session_tokens.map.orderedRemove(key)) return;
+    writeSessionDatUnlocked(gpa, &disk, null, null, 0) catch {};
 }
 
 /// Persist the long-lived tokens into the Windows Credential Manager.
@@ -2810,4 +3058,59 @@ test "canLaunchBrowserWithEnv checks SSH, DISPLAY, WAYLAND_DISPLAY, BROWSER, WSL
         .{ .k = "BROWSER", .v = "/home/user/.vscode-server/bin/helpers/browser.sh" },
     };
     try std.testing.expect(!canLaunchBrowserWithEnv(gpa, EnvHelper.lookup, true, .linux, false));
+}
+
+test "acquireArmAccessTokenWithOptions reuses cached __arm_oauth__ unless force_refresh is set" {
+    const gpa = std.testing.allocator;
+    var tc = try TempCache.init(gpa);
+    defer tc.deinit(gpa);
+
+    skip_platform_secret_store_for_test = true;
+    defer skip_platform_secret_store_for_test = false;
+
+    const MockAcquire = struct {
+        var calls: usize = 0;
+
+        fn acquire(
+            alloc: Allocator,
+            requested_scope: []const u8,
+            allow_interactive: bool,
+        ) Error!std.json.Parsed(TokenResponse) {
+            calls += 1;
+            if (!std.mem.eql(u8, requested_scope, arm_scope)) return error.AuthenticationFailed;
+            if (allow_interactive) return error.AuthenticationFailed;
+            return std.json.parseFromSlice(
+                TokenResponse,
+                alloc,
+                "{\"access_token\":\"fresh-arm-jwt\",\"expires_in\":3600}",
+                .{ .allocate = .alloc_always },
+            ) catch return error.OutOfMemory;
+        }
+    };
+    MockAcquire.calls = 0;
+    acquire_token_override = MockAcquire.acquire;
+    defer acquire_token_override = null;
+
+    try saveSessionDat(gpa, arm_oauth_cache_key, "cached-arm-jwt", unixNow() + 3600);
+
+    var stderr = std.Io.Writer.Allocating.init(gpa);
+    defer stderr.deinit();
+
+    // Default `acquireArmAccessToken` (`force_refresh = false`) returns cached token.
+    const cached = try acquireArmAccessToken(gpa, &stderr.writer, false);
+    defer gpa.free(cached);
+    try std.testing.expectEqualStrings("cached-arm-jwt", cached);
+    try std.testing.expectEqual(@as(usize, 0), MockAcquire.calls);
+
+    // `force_refresh = true` bypasses `__arm_oauth__`, mints a fresh ARM token, and updates `session.dat`.
+    const refreshed = try acquireArmAccessTokenWithOptions(gpa, &stderr.writer, false, true);
+    defer gpa.free(refreshed);
+    try std.testing.expectEqualStrings("fresh-arm-jwt", refreshed);
+    try std.testing.expectEqual(@as(usize, 1), MockAcquire.calls);
+
+    // Subsequent `force_refresh = false` returns the newly cached token without another refresh.
+    const cached_after = try acquireArmAccessToken(gpa, &stderr.writer, false);
+    defer gpa.free(cached_after);
+    try std.testing.expectEqualStrings("fresh-arm-jwt", cached_after);
+    try std.testing.expectEqual(@as(usize, 1), MockAcquire.calls);
 }

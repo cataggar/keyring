@@ -68,6 +68,12 @@ keyring devops-npm
 keyring devops-npm -c path/to/.npmrc -f
 keyring devops-npm --validate-only
 
+# Authenticate container registries for wslc (GHCR, Azure Container Registry, generic).
+keyring wslc login ghcr.io myregistry.azurecr.io
+keyring wslc login -f
+keyring wslc status
+keyring wslc logout myregistry.azurecr.io
+
 # Disable storage for this process.
 keyring --disable
 keyring --disable get my-service alice
@@ -92,6 +98,15 @@ Run `keyring git config` to configure `keyring` globally as your Git credential 
 
 `-g` is a short alias for `--global` (the default). Use `--local` to configure
 only the current repository; when multiple scope flags are given, the last wins.
+
+## WSL Container CLI (`keyring wslc`)
+
+`keyring wslc` manages container registry credentials for Microsoft's WSL Container CLI (`wslc`):
+
+- `keyring wslc login [<server>...] [-u|--username <user>] [--password-stdin] [-f|--force]` resolves credentials for GitHub Container Registry (`ghcr.io`, `containers.<tenant>.ghe.com`, requesting `read:packages` and `write:packages` OAuth scopes when authenticating interactively), Azure Container Registry (`<name>.azurecr.io`, discovering the registry's Microsoft Entra tenant via `/v2/` when available and exchanging an Entra ARM token from `az login` MSAL SSO or `ado-keyring` via `POST /oauth2/exchange`), or generic registries (`--username <user> --password-stdin` or refreshing existing `keyring` entries), and writes them directly into `wslc`'s configured `credentialStore` (`wincred` `wslc-credential/<server>` by default, or `%LOCALAPPDATA%\wslc\registry-credentials.json` when `credentialStore: file` is set in `%LOCALAPPDATA%\wslc\settings.yaml`). Passing `-f` / `--force` re-authenticates GHCR via OAuth with package scopes, bypasses cached ACR/ARM tokens, and refreshes generic or ACR repository-token secrets from `keyring`. Running `keyring wslc login` without arguments refreshes all registries currently present in `wslc` storage.
+- `keyring wslc logout <server>...` removes the selected registry entry from `wslc` storage without revoking shared `gh` or Entra tokens.
+- `keyring wslc status` reports `wslc`'s `settings.yaml` path, active `credentialStore` mode, and configured registries (including ACR JWT expiration status).
+- `keyring wslc credential <get|store|erase>` provides a strictly noninteractive credential-helper protocol endpoint over `stdin`/`stdout`.
 
 See also [Environment variables](environment-variables.md) and
 [Exit codes](exit-codes.md).

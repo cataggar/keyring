@@ -31,6 +31,7 @@ const ado = @import("ado.zig");
 const dpapi = @import("dpapi.zig");
 const gh = @import("gh.zig");
 const msal_cache = @import("msal_cache.zig");
+const registry_auth = @import("registry_auth.zig");
 const wincred = @import("wincred.zig");
 
 const Allocator = std.mem.Allocator;
@@ -41,9 +42,9 @@ pub const wslc_cred_filter = "wslc-credential/*";
 pub const settings_filename = "settings.yaml";
 pub const credentials_filename = "registry-credentials.json";
 pub const lock_filename = "wslc.lock";
-pub const docker_hub_legacy_url = "https://index.docker.io/v1/";
-pub const acr_token_username = "00000000-0000-0000-0000-000000000000";
-pub const identity_token_username = "<token>";
+pub const docker_hub_legacy_url = registry_auth.docker_hub_legacy_url;
+pub const acr_token_username = registry_auth.acr_token_username;
+pub const identity_token_username = registry_auth.identity_token_username;
 pub const wincred_max_blob_bytes: usize = 2560;
 
 pub const CredentialStoreKind = enum {
@@ -351,80 +352,14 @@ fn parseLoginArgs(args: []const []const u8) ?Subcommand {
 ///   `https://index.docker.io/v1/`
 /// - Lowercases the authority while preserving any `:port`
 pub fn normalizeServerAlloc(gpa: Allocator, raw_server: []const u8) Error![]u8 {
-    var s = std.mem.trim(u8, raw_server, " \t\r\n");
-    if (s.len == 0) return error.InvalidServer;
-
-    if (std.mem.indexOf(u8, s, "://")) |scheme_idx| {
-        if (scheme_idx == 0) return error.InvalidServer;
-        const scheme = s[0..scheme_idx];
-        if (!std.ascii.eqlIgnoreCase(scheme, "https") and !std.ascii.eqlIgnoreCase(scheme, "http")) {
-            return error.InvalidServer;
-        }
-        s = s[scheme_idx + 3 ..];
-    }
-
-    // Reject query or fragment before stripping path.
-    if (std.mem.indexOfAny(u8, s, "?#") != null) return error.InvalidServer;
-
-    if (std.mem.indexOfScalar(u8, s, '/')) |slash_idx| {
-        s = s[0..slash_idx];
-    }
-
-    if (s.len == 0) return error.InvalidServer;
-    if (std.mem.indexOfAny(u8, s, " \t\r\n\\@") != null) return error.InvalidServer;
-    for (s) |c| {
-        if (std.ascii.isControl(c)) return error.InvalidServer;
-    }
-
-    // Validate optional `:port` (handling IPv6 `[::1]:5000` or `host:5000`).
-    const host_only = try extractHostWithoutPort(s);
-    if (host_only.len == 0) return error.InvalidServer;
-
-    const lowered = try gpa.dupe(u8, s);
-    errdefer gpa.free(lowered);
-    _ = std.ascii.lowerString(lowered, lowered);
-
-    if (std.mem.eql(u8, lowered, "docker.io") or
-        std.mem.eql(u8, lowered, "index.docker.io") or
-        std.mem.eql(u8, lowered, "registry-1.docker.io"))
-    {
-        gpa.free(lowered);
-        return gpa.dupe(u8, docker_hub_legacy_url);
-    }
-
-    return lowered;
-}
-
-fn parseValidPort(port_str: []const u8) Error!u16 {
-    if (port_str.len == 0) return error.InvalidServer;
-    for (port_str) |c| {
-        if (!std.ascii.isDigit(c)) return error.InvalidServer;
-    }
-    const port = std.fmt.parseUnsigned(u16, port_str, 10) catch return error.InvalidServer;
-    if (port == 0) return error.InvalidServer;
-    return port;
+    return registry_auth.normalizeServerAlloc(gpa, raw_server, .legacy_v1_url) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidServer,
+    };
 }
 
 fn extractHostWithoutPort(authority: []const u8) Error![]const u8 {
-    if (authority.len == 0) return error.InvalidServer;
-    if (authority[0] == '[') {
-        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return error.InvalidServer;
-        if (close <= 1) return error.InvalidServer;
-        if (close + 1 < authority.len) {
-            if (authority[close + 1] != ':') return error.InvalidServer;
-            _ = try parseValidPort(authority[close + 2 ..]);
-        }
-        return authority[0 .. close + 1];
-    }
-    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon_idx| {
-        if (std.mem.indexOfScalar(u8, authority[0..colon_idx], ':') != null) {
-            // Unbracketed IPv6 literal.
-            return error.InvalidServer;
-        }
-        _ = try parseValidPort(authority[colon_idx + 1 ..]);
-        return authority[0..colon_idx];
-    }
-    return authority;
+    return registry_auth.extractHostWithoutPort(authority) catch error.InvalidServer;
 }
 
 /// If `normalized_server` is a GitHub Container Registry endpoint (`ghcr.io`,
@@ -432,104 +367,28 @@ fn extractHostWithoutPort(authority: []const u8) Error![]const u8 {
 /// corresponding GitHub host (`github.com`, `<tenant>.ghe.com`, or GHES host)
 /// owned by `gpa`.
 pub fn resolveGhcrGitHubHostAlloc(gpa: Allocator, normalized_server: []const u8) Error!?[]u8 {
-    const host = extractHostWithoutPort(normalized_server) catch return null;
-    if (std.ascii.eqlIgnoreCase(host, "ghcr.io")) {
-        return try gpa.dupe(u8, "github.com");
-    }
-    if (std.ascii.startsWithIgnoreCase(host, "containers.") and
-        host.len > "containers..ghe.com".len and
-        std.ascii.endsWithIgnoreCase(host, ".ghe.com"))
-    {
-        return try gpa.dupe(u8, host["containers.".len..]);
-    }
-    if (std.ascii.startsWithIgnoreCase(host, "docker.") and host.len > "docker.".len) {
-        const candidate = host["docker.".len..];
-        if (gh.isGitHubHost(gpa, candidate)) {
-            return try gpa.dupe(u8, candidate);
-        }
-    }
-    return null;
+    return registry_auth.resolveGhcrGitHubHostAlloc(gpa, normalized_server) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidServer,
+    };
 }
 
 /// Return true if `normalized_server` is an Azure Container Registry host
 /// (`<name>.azurecr.io`, `<name>.azurecr.cn`, `<name>.azurecr.de`, `<name>.azurecr.us`).
 pub fn isAcrServer(normalized_server: []const u8) bool {
-    const host = extractHostWithoutPort(normalized_server) catch return false;
-    const suffixes = [_][]const u8{
-        ".azurecr.io",
-        ".azurecr.cn",
-        ".azurecr.de",
-        ".azurecr.us",
-    };
-    for (suffixes) |suffix| {
-        if (host.len > suffix.len and std.ascii.endsWithIgnoreCase(host, suffix)) {
-            const prefix = host[0 .. host.len - suffix.len];
-            if (prefix.len > 0 and prefix[0] != '.' and prefix[prefix.len - 1] != '.') {
-                return true;
-            }
-        }
-    }
-    return false;
+    return registry_auth.isAcrServer(normalized_server);
 }
-
-const JwtClaims = struct {
-    exp: ?i64 = null,
-    tid: ?[]const u8 = null,
-};
 
 /// Extract the `exp` UNIX timestamp from a JWT string (`header.payload.sig`),
 /// or return `null` if the string is not a JWT with a numeric `exp` claim.
 pub fn extractJwtExpiration(gpa: Allocator, token: []const u8) ?i64 {
-    const payload = decodeJwtPayloadAlloc(gpa, token) orelse return null;
-    defer gpa.free(payload);
-    const parsed = std.json.parseFromSlice(JwtClaims, gpa, payload, .{
-        .ignore_unknown_fields = true,
-    }) catch return null;
-    defer parsed.deinit();
-    return parsed.value.exp;
+    return registry_auth.extractJwtExpiration(gpa, token);
 }
 
 /// Extract the `tid` (Microsoft Entra tenant ID) claim from a JWT string,
 /// returning an owned slice when present.
 pub fn extractJwtTenantIdAlloc(gpa: Allocator, token: []const u8) ?[]u8 {
-    const payload = decodeJwtPayloadAlloc(gpa, token) orelse return null;
-    defer gpa.free(payload);
-    const parsed = std.json.parseFromSlice(JwtClaims, gpa, payload, .{
-        .ignore_unknown_fields = true,
-    }) catch return null;
-    defer parsed.deinit();
-    const tid = parsed.value.tid orelse return null;
-    if (tid.len == 0) return null;
-    return gpa.dupe(u8, tid) catch null;
-}
-
-fn decodeJwtPayloadAlloc(gpa: Allocator, token: []const u8) ?[]u8 {
-    const trimmed = std.mem.trim(u8, token, " \t\r\n");
-    const first_dot = std.mem.indexOfScalar(u8, trimmed, '.') orelse return null;
-    const after_first = trimmed[first_dot + 1 ..];
-    const second_dot = std.mem.indexOfScalar(u8, after_first, '.') orelse return null;
-    const raw_b64 = std.mem.trimEnd(u8, after_first[0..second_dot], "=");
-    if (raw_b64.len == 0 or raw_b64.len > 64 * 1024) return null;
-
-    if (std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(raw_b64)) |dec_len| {
-        const out = gpa.alloc(u8, dec_len) catch return null;
-        if (std.base64.url_safe_no_pad.Decoder.decode(out, raw_b64)) |_| {
-            return out;
-        } else |_| {
-            gpa.free(out);
-        }
-    } else |_| {}
-
-    if (std.base64.standard_no_pad.Decoder.calcSizeForSlice(raw_b64)) |dec_len| {
-        const out = gpa.alloc(u8, dec_len) catch return null;
-        if (std.base64.standard_no_pad.Decoder.decode(out, raw_b64)) |_| {
-            return out;
-        } else |_| {
-            gpa.free(out);
-        }
-    } else |_| {}
-
-    return null;
+    return registry_auth.extractJwtTenantIdAlloc(gpa, token);
 }
 
 /// Resolve the `wslc` configuration directory (`%LOCALAPPDATA%\wslc` on Windows).
@@ -1071,164 +930,15 @@ fn listFileCred(gpa: Allocator) Error![]StoredCredential {
 // Provider Resolution (GHCR, ACR OAuth2 exchange, and Generic keyring)
 // ---------------------------------------------------------------------------
 
-const AcrExchangeResponse = struct {
-    refresh_token: ?[]const u8 = null,
-};
+pub const AcrExchangeRequest = registry_auth.AcrExchangeRequest;
 
-/// Parse a `WWW-Authenticate` response header from an ACR `/v2/` challenge and
-/// return the registry's canonicalized lowercase Microsoft Entra tenant UUID
-/// when advertised (`tenant="<uuid>"`, `tenant_id="<uuid>"`, or
-/// `authorization_uri="https://login.microsoftonline.com/<uuid>..."`).
 pub fn parseWwwAuthenticateTenantIdAlloc(gpa: Allocator, header_value: []const u8) ?[]u8 {
-    var in_bearer = false;
-    var i: usize = 0;
-    while (i < header_value.len) {
-        while (i < header_value.len and (header_value[i] == ' ' or header_value[i] == '\t' or header_value[i] == ',')) {
-            i += 1;
-        }
-        if (i >= header_value.len) break;
-
-        const tok_start = i;
-        while (i < header_value.len and isAuthTokenChar(header_value[i])) {
-            i += 1;
-        }
-        if (i == tok_start) {
-            i += 1;
-            continue;
-        }
-        const token = header_value[tok_start..i];
-
-        while (i < header_value.len and (header_value[i] == ' ' or header_value[i] == '\t')) {
-            i += 1;
-        }
-
-        // A bare token not followed by `=` starts a new auth-scheme challenge (RFC 7235).
-        if (i >= header_value.len or header_value[i] != '=') {
-            in_bearer = std.ascii.eqlIgnoreCase(token, "Bearer");
-            continue;
-        }
-
-        i += 1; // skip '='
-        while (i < header_value.len and (header_value[i] == ' ' or header_value[i] == '\t')) {
-            i += 1;
-        }
-        if (i >= header_value.len) break;
-
-        var raw_val: []const u8 = "";
-        if (header_value[i] == '"') {
-            i += 1;
-            const val_start = i;
-            while (i < header_value.len and header_value[i] != '"') {
-                if (header_value[i] == '\\' and i + 1 < header_value.len) {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            raw_val = header_value[val_start..i];
-            if (i < header_value.len and header_value[i] == '"') i += 1;
-        } else {
-            const val_start = i;
-            while (i < header_value.len and header_value[i] != ',' and header_value[i] != ' ' and header_value[i] != '\t') {
-                i += 1;
-            }
-            raw_val = header_value[val_start..i];
-        }
-
-        if (!in_bearer) continue;
-
-        if (std.ascii.eqlIgnoreCase(token, "tenant") or std.ascii.eqlIgnoreCase(token, "tenant_id")) {
-            if (ado.normalizeEntraTenantIdAlloc(gpa, raw_val)) |tid| {
-                return tid;
-            } else |_| {}
-        } else if (std.ascii.eqlIgnoreCase(token, "authorization_uri") or std.ascii.eqlIgnoreCase(token, "authorization")) {
-            if (extractTenantFromAuthorityUrlAlloc(gpa, raw_val)) |tid| {
-                return tid;
-            }
-        }
-    }
-    return null;
-}
-
-fn isAuthTokenChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or switch (c) {
-        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
-        else => false,
-    };
-}
-
-fn extractTenantFromAuthorityUrlAlloc(gpa: Allocator, raw_url: []const u8) ?[]u8 {
-    const trimmed = std.mem.trim(u8, raw_url, " \t\r\n");
-    if (!std.ascii.startsWithIgnoreCase(trimmed, "https://")) return null;
-    const after_scheme = trimmed["https://".len..];
-    const slash_idx = std.mem.indexOfScalar(u8, after_scheme, '/') orelse return null;
-    const host = after_scheme[0..slash_idx];
-    const trusted_hosts = [_][]const u8{
-        "login.microsoftonline.com",
-        "login.microsoftonline.us",
-        "login.chinacloudapi.cn",
-        "login.microsoftonline.de",
-        "sts.windows.net",
-    };
-    var trusted = false;
-    for (trusted_hosts) |th| {
-        if (std.ascii.eqlIgnoreCase(host, th)) {
-            trusted = true;
-            break;
-        }
-    }
-    if (!trusted) return null;
-
-    var path = after_scheme[slash_idx + 1 ..];
-    while (path.len > 0 and path[0] == '/') path = path[1..];
-    var seg_end: usize = 0;
-    while (seg_end < path.len and path[seg_end] != '/' and path[seg_end] != '?' and path[seg_end] != '#') {
-        seg_end += 1;
-    }
-    if (seg_end == 0) return null;
-    return ado.normalizeEntraTenantIdAlloc(gpa, path[0..seg_end]) catch null;
+    return registry_auth.parseWwwAuthenticateTenantIdAlloc(gpa, header_value);
 }
 
 fn liveDiscoverAcrTenant(gpa: Allocator, server: []const u8) ?[]u8 {
-    const url = std.fmt.allocPrint(gpa, "https://{s}/v2/", .{server}) catch return null;
-    defer gpa.free(url);
-    const uri = std.Uri.parse(url) catch return null;
-
-    var client: std.http.Client = .{
-        .allocator = gpa,
-        .io = Io.Threaded.global_single_threaded.io(),
-    };
-    defer client.deinit();
-
-    var req = client.request(.GET, uri, .{
-        .redirect_behavior = .unhandled,
-    }) catch return null;
-    defer req.deinit();
-
-    req.sendBodiless() catch return null;
-    const response = req.receiveHead(&.{}) catch return null;
-
-    var it = response.head.iterateHeaders();
-    while (it.next()) |hdr| {
-        if (std.ascii.eqlIgnoreCase(hdr.name, "www-authenticate")) {
-            if (parseWwwAuthenticateTenantIdAlloc(gpa, hdr.value)) |tid| {
-                return tid;
-            }
-        }
-    }
-    return null;
+    return registry_auth.liveDiscoverAcrTenant(gpa, server);
 }
-
-pub const AcrExchangeRequest = struct {
-    url: []u8,
-    form_body: []u8,
-
-    pub fn deinit(self: *const AcrExchangeRequest, gpa: Allocator) void {
-        gpa.free(self.url);
-        std.crypto.secureZero(u8, self.form_body);
-        gpa.free(self.form_body);
-    }
-};
 
 pub fn buildAcrExchangeRequest(
     gpa: Allocator,
@@ -1236,25 +946,9 @@ pub fn buildAcrExchangeRequest(
     arm_access_token: []const u8,
     tenant_id: ?[]const u8,
 ) Error!AcrExchangeRequest {
-    const service_host = try extractHostWithoutPort(server);
-    const url = try std.fmt.allocPrint(gpa, "https://{s}/oauth2/exchange", .{server});
-    errdefer gpa.free(url);
-
-    var body = Io.Writer.Allocating.init(gpa);
-    errdefer body.deinit();
-    try writeFormField(&body.writer, "grant_type", "access_token", true);
-    try writeFormField(&body.writer, "service", service_host, false);
-    if (tenant_id) |tid| {
-        if (tid.len > 0) {
-            try writeFormField(&body.writer, "tenant", tid, false);
-        }
-    }
-    try writeFormField(&body.writer, "access_token", arm_access_token, false);
-
-    const form_body = body.toOwnedSlice() catch return error.OutOfMemory;
-    return .{
-        .url = url,
-        .form_body = form_body,
+    return registry_auth.buildAcrExchangeRequest(gpa, server, arm_access_token, tenant_id) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidServer,
     };
 }
 
@@ -1264,62 +958,12 @@ fn liveExchangeAcrToken(
     arm_access_token: []const u8,
     tenant_id: ?[]const u8,
 ) Error![]u8 {
-    const req = try buildAcrExchangeRequest(gpa, server, arm_access_token, tenant_id);
-    defer req.deinit(gpa);
-
-    var response = Io.Writer.Allocating.init(gpa);
-    defer {
-        std.crypto.secureZero(u8, response.written());
-        response.deinit();
-    }
-
-    var client: std.http.Client = .{
-        .allocator = gpa,
-        .io = Io.Threaded.global_single_threaded.io(),
+    return registry_auth.liveExchangeAcrToken(gpa, server, arm_access_token, tenant_id) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.NetworkFailure => error.NetworkFailure,
+        error.InvalidServer => error.InvalidServer,
+        else => error.AuthenticationFailed,
     };
-    defer client.deinit();
-
-    const result = client.fetch(.{
-        .location = .{ .url = req.url },
-        .method = .POST,
-        .payload = req.form_body,
-        .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
-        .redirect_behavior = .not_allowed,
-        .response_writer = &response.writer,
-    }) catch return error.NetworkFailure;
-
-    if (result.status.class() != .success) return error.AuthenticationFailed;
-
-    var parsed = std.json.parseFromSlice(AcrExchangeResponse, gpa, response.written(), .{
-        .ignore_unknown_fields = true,
-    }) catch return error.AuthenticationFailed;
-    defer parsed.deinit();
-
-    const rt = parsed.value.refresh_token orelse return error.AuthenticationFailed;
-    if (rt.len == 0) return error.AuthenticationFailed;
-    return gpa.dupe(u8, rt);
-}
-
-fn writeFormField(writer: *Io.Writer, key: []const u8, value: []const u8, first: bool) Error!void {
-    if (!first) writer.writeByte('&') catch return error.OutOfMemory;
-    try writePercentEncodedForm(writer, key);
-    writer.writeByte('=') catch return error.OutOfMemory;
-    try writePercentEncodedForm(writer, value);
-}
-
-fn writePercentEncodedForm(writer: *Io.Writer, value: []const u8) Error!void {
-    const hex = "0123456789ABCDEF";
-    for (value) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
-            writer.writeByte(c) catch return error.OutOfMemory;
-        } else if (c == ' ') {
-            writer.writeByte('+') catch return error.OutOfMemory;
-        } else {
-            writer.writeByte('%') catch return error.OutOfMemory;
-            writer.writeByte(hex[c >> 4]) catch return error.OutOfMemory;
-            writer.writeByte(hex[c & 0x0f]) catch return error.OutOfMemory;
-        }
-    }
 }
 
 /// Resolve a credential for `normalized_server` from GHCR (`src/gh.zig`),
@@ -2154,41 +1798,17 @@ fn readBoundedStdinSecret(gpa: Allocator, stdin: *Io.Reader) Error![]u8 {
 }
 
 fn readBoundedStdinLine(gpa: Allocator, stdin: *Io.Reader, max_bytes: usize) Error![]u8 {
-    const raw = try readBoundedStdinAll(gpa, stdin, max_bytes);
-    errdefer {
-        std.crypto.secureZero(u8, raw);
-        gpa.free(raw);
-    }
-
-    var slice: []const u8 = raw;
-    if (std.mem.endsWith(u8, slice, "\n")) {
-        slice = slice[0 .. slice.len - 1];
-    }
-    if (std.mem.endsWith(u8, slice, "\r")) {
-        slice = slice[0 .. slice.len - 1];
-    }
-    if (slice.len == 0 or
-        std.mem.indexOfScalar(u8, slice, 0) != null or
-        std.mem.indexOfAny(u8, slice, "\r\n") != null)
-    {
-        return error.InvalidInput;
-    }
-
-    const out = try gpa.dupe(u8, slice);
-    std.crypto.secureZero(u8, raw);
-    gpa.free(raw);
-    return out;
+    return registry_auth.readBoundedStdinLine(gpa, stdin, max_bytes) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidInput,
+    };
 }
 
 fn readBoundedStdinAll(gpa: Allocator, stdin: *Io.Reader, max_bytes: usize) Error![]u8 {
-    var writer = Io.Writer.Allocating.init(gpa);
-    errdefer writer.deinit();
-    _ = stdin.streamRemaining(&writer.writer) catch return error.InvalidInput;
-    const written = writer.written();
-    if (written.len == 0 or written.len > max_bytes) {
-        return error.InvalidInput;
-    }
-    return writer.toOwnedSlice() catch error.OutOfMemory;
+    return registry_auth.readBoundedStdinAll(gpa, stdin, max_bytes) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidInput,
+    };
 }
 
 fn reportError(stderr: *Io.Writer, cmd_label: []const u8, server: []const u8, err: Error) !u8 {

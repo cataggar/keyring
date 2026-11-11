@@ -1103,6 +1103,7 @@ pub const default_oauth_client_secret = "34ddeff2b558a23d38fba8a6de74f086ede1cc0
 pub const gcm_oauth_client_id = "0120e057bd645470c1ed";
 pub const gcm_oauth_client_secret = "18867509d956965542b521a529a79bb883344c90";
 pub const default_oauth_scopes = "repo read:org gist workflow";
+pub const registry_oauth_scopes = "repo read:org gist workflow read:packages write:packages";
 pub const token_username = "x-access-token";
 
 pub const HostClass = enum {
@@ -1162,14 +1163,26 @@ pub const AuthError = error{
     OutOfMemory,
 };
 
+pub const UserJsonResponse = struct {
+    body: []u8,
+    oauth_scopes: ?[]u8 = null,
+
+    pub fn deinit(self: *const UserJsonResponse, gpa: Allocator) void {
+        gpa.free(self.body);
+        if (self.oauth_scopes) |scopes| gpa.free(scopes);
+    }
+};
+
 pub const HttpTransport = struct {
     postFormJson: *const fn (gpa: Allocator, url: []const u8, form_body: []const u8) AuthError![]u8,
     getJsonWithToken: *const fn (gpa: Allocator, url: []const u8, token: []const u8) AuthError![]u8,
+    getUserResponseWithToken: ?*const fn (gpa: Allocator, url: []const u8, token: []const u8) AuthError!UserJsonResponse = null,
 };
 
 const live_http_transport: HttpTransport = .{
     .postFormJson = livePostFormJson,
     .getJsonWithToken = liveGetJsonWithToken,
+    .getUserResponseWithToken = liveGetUserResponseWithToken,
 };
 
 var http_transport_override: ?HttpTransport = null;
@@ -1680,22 +1693,227 @@ pub fn getOrLoginGitCredential(
     if (try lookupStoredCredential(gpa, raw_host, requested_username)) |cred| {
         return cred;
     }
-    if (!allow_interactive or ado.isNonInteractive()) {
+    if (!allow_interactive or isNonInteractiveForGh(gpa)) {
         return null;
     }
     const cred = try loginOAuth(gpa, .{ .hostname = raw_host }, stderr);
     errdefer cred.deinit(gpa);
 
+    try verifyRequestedUsername(requested_username, cred.username);
+    return cred;
+}
+
+/// Return true if an `X-OAuth-Scopes` header value satisfies GHCR package access.
+/// Fine-grained PATs (`github_pat_`) and GitHub App tokens omit `X-OAuth-Scopes`
+/// (`null`) and are accepted as-is; classic OAuth (`gho_`) and PAT (`ghp_`)
+/// tokens include `X-OAuth-Scopes` and must grant `read:packages` (or `write:packages`).
+pub fn hasPackageReadScope(oauth_scopes_header: ?[]const u8) bool {
+    const raw = oauth_scopes_header orelse return true;
+    var it = std.mem.tokenizeAny(u8, raw, ", \t\r\n");
+    while (it.next()) |part| {
+        if (std.ascii.eqlIgnoreCase(part, "read:packages") or
+            std.ascii.eqlIgnoreCase(part, "write:packages"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub const ScopeCheckResult = enum {
+    ok,
+    missing_packages_scope,
+    unauthorized,
+    skipped,
+};
+
+pub fn checkTokenPackageScopes(
+    gpa: Allocator,
+    canonical_host: []const u8,
+    token: []const u8,
+    allow_interactive: bool,
+) AuthError!ScopeCheckResult {
+    // GitHub App / Actions installation tokens (`ghs_`, where `GET /user`
+    // returns 403) and fine-grained PATs (`github_pat_`, which never emit
+    // `X-OAuth-Scopes`) cannot be scope-probed via `/user`; non-interactive
+    // lookups (`credential get`) also skip network probes for latency and
+    // offline resilience.
+    if (std.mem.startsWith(u8, token, "ghs_") or
+        std.mem.startsWith(u8, token, "github_pat_"))
+    {
+        return .ok;
+    }
+    if (!allow_interactive) return .skipped;
+
+    const get_user_fn = activeHttpTransport().getUserResponseWithToken orelse return .skipped;
+
+    const endpoints = try resolveEndpoints(gpa, canonical_host);
+    defer endpoints.deinit(gpa);
+
+    const trimmed_base = std.mem.trimEnd(u8, endpoints.api_base_url, "/");
+    const user_url = try std.fmt.allocPrint(gpa, "{s}/user", .{trimmed_base});
+    defer gpa.free(user_url);
+
+    const resp = get_user_fn(gpa, user_url, token) catch |err| return switch (err) {
+        error.AuthenticationFailed => .unauthorized,
+        error.NetworkFailure => .skipped,
+        else => err,
+    };
+    defer resp.deinit(gpa);
+
+    if (hasPackageReadScope(resp.oauth_scopes)) return .ok;
+    return .missing_packages_scope;
+}
+
+/// Resolve or interactively acquire a GitHub credential suitable for container
+/// registry authentication (`ghcr.io`, `containers.<tenant>.ghe.com`, `docker.<host>`):
+/// - When `force_login` is true and interactive login is allowed, triggers a
+///   fresh `loginOAuth` requesting `registry_oauth_scopes` (`read:packages write:packages`).
+/// - When `force_login` is false and a stored token exists, accepts `ghs_` and
+///   `github_pat_` tokens immediately, skips network scope probes in non-interactive
+///   mode (`!allow_interactive`) or on transient `NetworkFailure`, and during
+///   interactive login checks `X-OAuth-Scopes` from `<api_base_url>/user`,
+///   reauthorizing with `registry_oauth_scopes` when `read:packages` is missing.
+pub fn getOrLoginRegistryCredential(
+    gpa: Allocator,
+    raw_host: []const u8,
+    requested_username: ?[]const u8,
+    allow_interactive: bool,
+    force_login: bool,
+    stderr: *Io.Writer,
+) AuthError!?GitCredential {
+    const canonical = try normalizeHostnameAlloc(gpa, raw_host);
+    defer gpa.free(canonical);
+
+    const can_interact = allow_interactive and !isNonInteractiveForGh(gpa);
+
+    if (force_login) {
+        if (!can_interact) {
+            stderr.print(
+                "keyring: gh: cannot force interactive login for {s} in non-interactive mode\n",
+                .{canonical},
+            ) catch {};
+            stderr.flush() catch {};
+            return error.NoStorageAccess;
+        }
+        const cred = try loginOAuth(gpa, .{
+            .hostname = canonical,
+            .scopes = registry_oauth_scopes,
+        }, stderr);
+        errdefer cred.deinit(gpa);
+        try verifyRequestedUsername(requested_username, cred.username);
+        return cred;
+    }
+
+    if (try lookupStoredCredential(gpa, canonical, requested_username)) |cred| {
+        const scope_status = checkTokenPackageScopes(gpa, canonical, cred.token, can_interact) catch |err| {
+            cred.deinit(gpa);
+            return err;
+        };
+        switch (scope_status) {
+            .ok, .skipped => return cred,
+            .missing_packages_scope => {
+                cred.deinit(gpa);
+                if (can_interact) {
+                    stderr.print(
+                        "[keyring gh] Stored token for {s} lacks 'read:packages' scope; re-authenticating...\n",
+                        .{canonical},
+                    ) catch {};
+                    stderr.flush() catch {};
+                    const refreshed = try loginOAuth(gpa, .{
+                        .hostname = canonical,
+                        .scopes = registry_oauth_scopes,
+                    }, stderr);
+                    errdefer refreshed.deinit(gpa);
+                    try verifyRequestedUsername(requested_username, refreshed.username);
+                    return refreshed;
+                }
+
+                const server_hint = try registryServerHintAlloc(gpa, canonical);
+                defer gpa.free(server_hint);
+                stderr.print(
+                    "keyring: gh: stored token for {s} is missing 'read:packages' scope; run 'keyring wslc login -f {s}' or 'gh auth refresh -h {s} -s write:packages,read:packages'\n",
+                    .{ canonical, server_hint, canonical },
+                ) catch {};
+                stderr.flush() catch {};
+                return error.AuthenticationFailed;
+            },
+            .unauthorized => {
+                cred.deinit(gpa);
+                if (!can_interact) return error.AuthenticationFailed;
+                stderr.print(
+                    "[keyring gh] Stored token for {s} was rejected; re-authenticating...\n",
+                    .{canonical},
+                ) catch {};
+                stderr.flush() catch {};
+                const refreshed = try loginOAuth(gpa, .{
+                    .hostname = canonical,
+                    .scopes = registry_oauth_scopes,
+                }, stderr);
+                errdefer refreshed.deinit(gpa);
+                try verifyRequestedUsername(requested_username, refreshed.username);
+                return refreshed;
+            },
+        }
+    }
+
+    if (!can_interact) {
+        return null;
+    }
+
+    const cred = try loginOAuth(gpa, .{
+        .hostname = canonical,
+        .scopes = registry_oauth_scopes,
+    }, stderr);
+    errdefer cred.deinit(gpa);
+    try verifyRequestedUsername(requested_username, cred.username);
+    return cred;
+}
+
+fn verifyRequestedUsername(requested_username: ?[]const u8, actual_username: []const u8) AuthError!void {
     if (requested_username) |wanted| {
         const trimmed = std.mem.trim(u8, wanted, " \t\r\n");
         if (trimmed.len > 0 and
             !std.ascii.eqlIgnoreCase(trimmed, token_username) and
-            !std.ascii.eqlIgnoreCase(trimmed, cred.username))
+            !std.ascii.eqlIgnoreCase(trimmed, actual_username))
         {
             return error.AuthenticationFailed;
         }
     }
-    return cred;
+}
+
+fn registryServerHintAlloc(gpa: Allocator, canonical_host: []const u8) AuthError![]u8 {
+    return switch (classifyHost(canonical_host)) {
+        .dotcom => gpa.dupe(u8, "ghcr.io"),
+        .tenancy => std.fmt.allocPrint(gpa, "containers.{s}", .{canonical_host}),
+        .enterprise => std.fmt.allocPrint(gpa, "docker.{s}", .{canonical_host}),
+    };
+}
+
+fn isNonInteractiveForGh(gpa: Allocator) bool {
+    if (env_override_fn == null) return ado.isNonInteractive();
+    if (getEnvVarOwned(gpa, "ADO_KEYRING_NONINTERACTIVE")) |value| {
+        defer gpa.free(value);
+        if (std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1")) return true;
+    }
+    if (getEnvVarOwned(gpa, "KEYRING_NONINTERACTIVE")) |value| {
+        defer gpa.free(value);
+        if (std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1")) return true;
+    }
+    if (getEnvVarOwned(gpa, "GIT_TERMINAL_PROMPT")) |value| {
+        defer gpa.free(value);
+        if (std.ascii.eqlIgnoreCase(value, "false") or std.mem.eql(u8, value, "0")) return true;
+    }
+    if (getEnvVarOwned(gpa, "GCM_INTERACTIVE")) |value| {
+        defer gpa.free(value);
+        if (std.ascii.eqlIgnoreCase(value, "never") or
+            std.ascii.eqlIgnoreCase(value, "false") or
+            std.ascii.eqlIgnoreCase(value, "0"))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Parse CLI arguments for `keyring gh login [-h|--hostname <host>] [--scopes <scopes>] [--web|--device]`.
@@ -2169,6 +2387,77 @@ fn liveGetJsonWithToken(gpa: Allocator, url: []const u8, token: []const u8) Auth
     return response.toOwnedSlice() catch {
         response.deinit();
         return error.OutOfMemory;
+    };
+}
+
+fn liveGetUserResponseWithToken(gpa: Allocator, url: []const u8, token: []const u8) AuthError!UserJsonResponse {
+    const uri = std.Uri.parse(url) catch return error.InvalidHostname;
+
+    var client: std.http.Client = .{
+        .allocator = gpa,
+        .io = Io.Threaded.global_single_threaded.io(),
+    };
+    defer client.deinit();
+
+    const auth_header = try std.fmt.allocPrint(gpa, "Bearer {s}", .{token});
+    defer gpa.free(auth_header);
+
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "authorization", .value = auth_header },
+        .{ .name = "accept", .value = "application/vnd.github+json" },
+        .{ .name = "user-agent", .value = "keyring" },
+    };
+
+    var req = client.request(.GET, uri, .{
+        .redirect_behavior = .not_allowed,
+        .extra_headers = &extra_headers,
+    }) catch return error.NetworkFailure;
+    defer req.deinit();
+
+    req.sendBodiless() catch return error.NetworkFailure;
+
+    var response = req.receiveHead(&.{}) catch return error.NetworkFailure;
+    if (response.head.status.class() != .success) {
+        if (response.head.status.class() == .server_error or
+            response.head.status == .too_many_requests)
+        {
+            return error.NetworkFailure;
+        }
+        return error.AuthenticationFailed;
+    }
+
+    var oauth_scopes: ?[]u8 = null;
+    errdefer if (oauth_scopes) |s| gpa.free(s);
+    {
+        var it = response.head.iterateHeaders();
+        while (it.next()) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, "x-oauth-scopes")) {
+                if (oauth_scopes) |prev| gpa.free(prev);
+                oauth_scopes = try gpa.dupe(u8, hdr.value);
+            }
+        }
+    }
+
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => client.allocator.alloc(u8, std.compress.zstd.default_window_len) catch return error.OutOfMemory,
+        .deflate, .gzip => client.allocator.alloc(u8, std.compress.flate.max_window_len) catch return error.OutOfMemory,
+        .compress => return error.NetworkFailure,
+    };
+    defer if (decompress_buffer.len > 0) client.allocator.free(decompress_buffer);
+
+    var body_writer = Io.Writer.Allocating.init(gpa);
+    errdefer body_writer.deinit();
+
+    var transfer_buffer: [256]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = reader.streamRemaining(&body_writer.writer) catch return error.NetworkFailure;
+
+    const body = body_writer.toOwnedSlice() catch return error.OutOfMemory;
+    return .{
+        .body = body,
+        .oauth_scopes = oauth_scopes,
     };
 }
 
@@ -3159,3 +3448,260 @@ test "saveUserCredential returns Locked and does not write plaintext hosts.yml w
     try std.testing.expect(readFileIfExists(gpa, hosts_path) == null);
 }
 
+test "getOrLoginRegistryCredential checks X-OAuth-Scopes, accepts fine-grained PATs, and reauthorizes on missing read:packages or --force" {
+    const gpa = std.testing.allocator;
+    FakeStore.reset(gpa);
+    defer FakeStore.reset(gpa);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const config_dir = try std.fs.path.join(gpa, &.{ root, "gh-config" });
+    defer gpa.free(config_dir);
+
+    const hosts_yaml =
+        \\github.com:
+        \\    git_protocol: https
+        \\    users:
+        \\        cataggar:
+        \\    user: cataggar
+        \\
+    ;
+    try writePrivateFile(config_dir, hosts_filename, hosts_yaml);
+    try FakeStore.set(gpa, "gh:github.com", "cataggar", "gho_no_pkg_scope");
+    try FakeStore.set(gpa, "gh:github.com", "", "gho_no_pkg_scope");
+
+    const MockRegistryHttp = struct {
+        var oauth_calls: usize = 0;
+        var get_user_calls: usize = 0;
+        var saw_read_packages: bool = false;
+        var saw_write_packages: bool = false;
+        var fail_with_network_error: bool = false;
+
+        fn postFormJson(alloc: Allocator, url: []const u8, body: []const u8) AuthError![]u8 {
+            if (std.mem.eql(u8, "https://github.com/login/device/code", url)) {
+                oauth_calls += 1;
+                saw_read_packages = std.mem.indexOf(u8, body, "read%3Apackages") != null;
+                saw_write_packages = std.mem.indexOf(u8, body, "write%3Apackages") != null;
+                return alloc.dupe(
+                    u8,
+                    "{\"device_code\":\"dev_pkg\",\"user_code\":\"PKG1-2345\",\"verification_uri\":\"https://github.com/login/device\",\"expires_in\":900,\"interval\":1}",
+                );
+            }
+            if (std.mem.eql(u8, "https://github.com/login/oauth/access_token", url)) {
+                return alloc.dupe(u8, "{\"access_token\":\"gho_with_pkg_scope\"}");
+            }
+            return error.AuthenticationFailed;
+        }
+
+        fn getJsonWithToken(alloc: Allocator, _: []const u8, token: []const u8) AuthError![]u8 {
+            if (std.mem.eql(u8, token, "gho_with_pkg_scope")) {
+                return alloc.dupe(u8, "{\"login\":\"cataggar\"}");
+            }
+            return error.AuthenticationFailed;
+        }
+
+        fn getUserResponseWithToken(alloc: Allocator, url: []const u8, token: []const u8) AuthError!UserJsonResponse {
+            get_user_calls += 1;
+            if (fail_with_network_error) return error.NetworkFailure;
+            if (!std.mem.eql(u8, "https://api.github.com/user", url)) return error.AuthenticationFailed;
+            if (std.mem.eql(u8, token, "gho_no_pkg_scope")) {
+                return .{
+                    .body = try alloc.dupe(u8, "{\"login\":\"cataggar\"}"),
+                    .oauth_scopes = try alloc.dupe(u8, "repo, read:org, gist, workflow"),
+                };
+            }
+            if (std.mem.eql(u8, token, "gho_with_pkg_scope")) {
+                return .{
+                    .body = try alloc.dupe(u8, "{\"login\":\"cataggar\"}"),
+                    .oauth_scopes = try alloc.dupe(u8, "repo, read:org, gist, workflow, read:packages, write:packages"),
+                };
+            }
+            // GitHub App / Actions `ghs_` and fine-grained `github_pat_` tokens must never hit `/user`.
+            return error.AuthenticationFailed;
+        }
+
+        fn openBrowser(_: Allocator, _: *Io.Writer, _: []const u8) AuthError!void {
+            return error.NoStorageAccess;
+        }
+
+        fn noSleep(_: u32) void {}
+    };
+
+    MockRegistryHttp.oauth_calls = 0;
+    MockRegistryHttp.get_user_calls = 0;
+    MockRegistryHttp.saw_read_packages = false;
+    MockRegistryHttp.saw_write_packages = false;
+    MockRegistryHttp.fail_with_network_error = false;
+
+    secret_store_override = FakeStore.store;
+    defer secret_store_override = null;
+    gh_config_dir_override = config_dir;
+    defer gh_config_dir_override = null;
+    http_transport_override = .{
+        .postFormJson = MockRegistryHttp.postFormJson,
+        .getJsonWithToken = MockRegistryHttp.getJsonWithToken,
+        .getUserResponseWithToken = MockRegistryHttp.getUserResponseWithToken,
+    };
+    defer http_transport_override = null;
+    browser_open_override = MockRegistryHttp.openBrowser;
+    defer browser_open_override = null;
+    poll_sleep_override = MockRegistryHttp.noSleep;
+    defer poll_sleep_override = null;
+    env_override_fn = struct {
+        fn get(name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "SSH_TTY")) return "/dev/pts/0";
+            return null;
+        }
+    }.get;
+    defer env_override_fn = null;
+
+    // 1. Noninteractive lookup (`credential get`, `allow_interactive = false`) skips `GET /user` and returns the stored token offline.
+    {
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        const cred = (try getOrLoginRegistryCredential(gpa, "github.com", null, false, false, &stderr.writer)).?;
+        defer cred.deinit(gpa);
+        try std.testing.expectEqualStrings("cataggar", cred.username);
+        try std.testing.expectEqualStrings("gho_no_pkg_scope", cred.token);
+        try std.testing.expectEqual(@as(usize, 0), MockRegistryHttp.get_user_calls);
+        try std.testing.expectEqual(@as(usize, 0), MockRegistryHttp.oauth_calls);
+    }
+
+    // 2. Interactive login (`force_login = false`) detects missing `read:packages` and reauthorizes with package scopes.
+    {
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        const cred = (try getOrLoginRegistryCredential(gpa, "github.com", null, true, false, &stderr.writer)).?;
+        defer cred.deinit(gpa);
+        try std.testing.expectEqualStrings("cataggar", cred.username);
+        try std.testing.expectEqualStrings("gho_with_pkg_scope", cred.token);
+        try std.testing.expectEqual(@as(usize, 1), MockRegistryHttp.get_user_calls);
+        try std.testing.expectEqual(@as(usize, 1), MockRegistryHttp.oauth_calls);
+        try std.testing.expect(MockRegistryHttp.saw_read_packages);
+        try std.testing.expect(MockRegistryHttp.saw_write_packages);
+    }
+
+    // 3. Subsequent interactive login (`force_login = false`) reuses the scoped token without re-prompting.
+    {
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        const cred = (try getOrLoginRegistryCredential(gpa, "github.com", null, true, false, &stderr.writer)).?;
+        defer cred.deinit(gpa);
+        try std.testing.expectEqualStrings("gho_with_pkg_scope", cred.token);
+        try std.testing.expectEqual(@as(usize, 2), MockRegistryHttp.get_user_calls);
+        try std.testing.expectEqual(@as(usize, 1), MockRegistryHttp.oauth_calls);
+    }
+
+    // 4. `force_login = true` triggers fresh OAuth with `registry_oauth_scopes` even when valid token is cached.
+    {
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        const cred = (try getOrLoginRegistryCredential(gpa, "github.com", null, true, true, &stderr.writer)).?;
+        defer cred.deinit(gpa);
+        try std.testing.expectEqualStrings("gho_with_pkg_scope", cred.token);
+        try std.testing.expectEqual(@as(usize, 2), MockRegistryHttp.oauth_calls);
+    }
+
+    // 5. Fine-grained `github_pat_` and GitHub App / Actions `ghs_` tokens skip `GET /user` and are accepted immediately.
+    for ([_][]const u8{ "github_pat_finegrained", "ghs_installation_token" }) |special_tok| {
+        try FakeStore.set(gpa, "gh:github.com", "cataggar", special_tok);
+        try FakeStore.set(gpa, "gh:github.com", "", special_tok);
+        const before_user_calls = MockRegistryHttp.get_user_calls;
+
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        const cred = (try getOrLoginRegistryCredential(gpa, "github.com", null, true, false, &stderr.writer)).?;
+        defer cred.deinit(gpa);
+        try std.testing.expectEqualStrings(special_tok, cred.token);
+        try std.testing.expectEqual(before_user_calls, MockRegistryHttp.get_user_calls);
+        try std.testing.expectEqual(@as(usize, 2), MockRegistryHttp.oauth_calls);
+    }
+
+    // 6. Transient `NetworkFailure` (e.g. GitHub API 5xx/429/offline) during non-forced interactive lookup preserves stored token.
+    try FakeStore.set(gpa, "gh:github.com", "cataggar", "gho_with_pkg_scope");
+    try FakeStore.set(gpa, "gh:github.com", "", "gho_with_pkg_scope");
+    MockRegistryHttp.fail_with_network_error = true;
+    {
+        var stderr = Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        const cred = (try getOrLoginRegistryCredential(gpa, "github.com", null, true, false, &stderr.writer)).?;
+        defer cred.deinit(gpa);
+        try std.testing.expectEqualStrings("gho_with_pkg_scope", cred.token);
+        try std.testing.expectEqual(@as(usize, 2), MockRegistryHttp.oauth_calls);
+    }
+}
+
+test "liveGetUserResponseWithToken maps 5xx and 429 to NetworkFailure, 401 to AuthenticationFailed, and avoids double-free on truncated stream" {
+    const gpa = std.testing.allocator;
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var address: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(0) };
+    var server = try Io.net.IpAddress.listen(&address, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const port = server.socket.address.getPort();
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/user", .{port});
+    defer gpa.free(url);
+
+    const ServerThread = struct {
+        fn serve(srv: *Io.net.Server) void {
+            const thread_io = Io.Threaded.global_single_threaded.io();
+            const responses = [_][]const u8{
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                // Advertise a 32-byte chunk ("20\r\n") and close mid-chunk after 8 bytes to trigger streamRemaining failure!
+                "HTTP/1.1 200 OK\r\nX-OAuth-Scopes: read:packages\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n20\r\n{\"login\"",
+            };
+            for (responses) |raw_resp| {
+                var stream = srv.accept(thread_io) catch return;
+                defer stream.socket.close(thread_io);
+
+                var read_buf: [2048]u8 = undefined;
+                var reader = stream.reader(thread_io, &read_buf);
+                while (true) {
+                    const line = reader.interface.takeDelimiterExclusive('\n') catch break;
+                    if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
+                }
+
+                var write_buf: [512]u8 = undefined;
+                var writer = stream.writer(thread_io, &write_buf);
+                writer.interface.writeAll(raw_resp) catch {};
+                writer.interface.flush() catch {};
+            }
+        }
+    };
+
+    const thread = try std.Thread.spawn(.{}, ServerThread.serve, .{&server});
+    defer thread.join();
+
+    // 1. HTTP 500 -> error.NetworkFailure (not AuthenticationFailed)
+    try std.testing.expectError(
+        error.NetworkFailure,
+        liveGetUserResponseWithToken(gpa, url, "gho_test"),
+    );
+
+    // 2. HTTP 429 -> error.NetworkFailure (not AuthenticationFailed)
+    try std.testing.expectError(
+        error.NetworkFailure,
+        liveGetUserResponseWithToken(gpa, url, "gho_test"),
+    );
+
+    // 3. HTTP 401 -> error.AuthenticationFailed
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        liveGetUserResponseWithToken(gpa, url, "gho_test"),
+    );
+
+    // 4. Truncated HTTP 200 chunked stream -> error.NetworkFailure with single errdefer body_writer.deinit() (no double-free or leak)
+    try std.testing.expectError(
+        error.NetworkFailure,
+        liveGetUserResponseWithToken(gpa, url, "gho_test"),
+    );
+}

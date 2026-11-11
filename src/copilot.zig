@@ -83,6 +83,16 @@ fn activeSecretStore() SecretStore {
     return secret_store_override orelse live_secret_store;
 }
 
+pub fn isDefaultNativeStoreActive() bool {
+    if (secret_store_override != null) return false;
+    return switch (builtin.os.tag) {
+        .windows => keyring_zig.currentBackend() == .win_credential,
+        .macos => keyring_zig.currentBackend() == .keychain,
+        .linux => keyring_zig.currentBackend() == .secret_service,
+        else => false,
+    };
+}
+
 pub const ShellKind = enum {
     sh,
     pwsh,
@@ -470,9 +480,12 @@ fn resolveLockPath(gpa: Allocator, config_path: []const u8) ![]u8 {
 
 /// Strip `//` line comments, `/* ... */` block comments, and trailing commas
 /// before `}` or `]`, while preserving string literals (`"https://..."`, `\"`).
-pub fn stripJsonCommentsAndTrailingCommasAlloc(gpa: Allocator, raw: []const u8) ![]u8 {
+pub fn stripJsonCommentsAndTrailingCommasAlloc(gpa: Allocator, raw: []const u8) Error![]u8 {
     var pass1: std.ArrayList(u8) = .empty;
-    defer pass1.deinit(gpa);
+    defer {
+        std.crypto.secureZero(u8, pass1.items);
+        pass1.deinit(gpa);
+    }
 
     const start_idx: usize = if (std.mem.startsWith(u8, raw, "\xEF\xBB\xBF")) 3 else 0;
     var i: usize = start_idx;
@@ -511,7 +524,7 @@ pub fn stripJsonCommentsAndTrailingCommasAlloc(gpa: Allocator, raw: []const u8) 
             if (i + 1 < raw.len) {
                 i += 2;
             } else {
-                i = raw.len;
+                return error.InvalidJson;
             }
             continue;
         }
@@ -522,7 +535,10 @@ pub fn stripJsonCommentsAndTrailingCommasAlloc(gpa: Allocator, raw: []const u8) 
 
     // Second pass: remove trailing commas outside string literals.
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
+    errdefer {
+        std.crypto.secureZero(u8, out.items);
+        out.deinit(gpa);
+    }
 
     in_string = false;
     i = 0;
@@ -564,9 +580,30 @@ pub fn stripJsonCommentsAndTrailingCommasAlloc(gpa: Allocator, raw: []const u8) 
     return out.toOwnedSlice(gpa);
 }
 
+fn zeroCopilotTokensInObject(root: *const std.json.ObjectMap) void {
+    for ([_][]const u8{ "copilotTokens", "copilot_tokens" }) |field_name| {
+        if (root.get(field_name)) |tv| {
+            if (tv == .object) {
+                for (tv.object.values()) |v| {
+                    if (v == .string) {
+                        std.crypto.secureZero(u8, @constCast(v.string));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn zeroSnapshotSecrets(snap: *const ParsedConfigSnapshot) void {
+    for (snap.plaintext_tokens.values()) |v| {
+        std.crypto.secureZero(u8, @constCast(v));
+    }
+}
+
 fn parseJsoncObjectLeaky(a: Allocator, maybe_bytes: ?[]const u8) Error!std.json.ObjectMap {
     if (maybe_bytes) |bytes| {
         const stripped = try stripJsonCommentsAndTrailingCommasAlloc(a, bytes);
+        defer std.crypto.secureZero(u8, stripped);
         const trimmed = std.mem.trim(u8, stripped, " \t\r\n");
         if (trimmed.len > 0) {
             const val = std.json.parseFromSliceLeaky(std.json.Value, a, trimmed, .{
@@ -614,6 +651,7 @@ fn mutateConfigFileWithCas(
         const initial_hash = sha256Bytes(initial_bytes);
 
         var root = try parseJsoncObjectLeaky(a, initial_bytes);
+        defer zeroCopilotTokensInObject(&root);
         const changed = try mutateFn(a, &root, ctx);
         if (!changed and initial_bytes != null) {
             return false;
@@ -661,41 +699,63 @@ pub fn encodeWindowsPasswordUtf16LeAlloc(gpa: Allocator, utf8: []const u8) Error
     return out;
 }
 
-pub fn decodeWindowsCredentialBlobAlloc(gpa: Allocator, blob: []const u8) Error![]u8 {
+pub fn decodeWindowsUtf16LeBlobAlloc(gpa: Allocator, blob: []const u8) Error![]u8 {
     if (blob.len == 0) return gpa.dupe(u8, "");
+    if (blob.len % 2 != 0) return error.StorageFailure;
 
-    // `windows-native-keyring-store` encodes passwords as UTF-16LE without BOM;
-    // legacy `keytar` stored raw UTF-8 bytes. Detect UTF-16LE reliably by
-    // checking for NUL high bytes (ASCII tokens) or UTF-16LE BOM / invalid UTF-8.
-    if (looksLikeUtf16LePassword(blob)) {
-        var byte_slice = blob;
-        if (std.mem.startsWith(u8, byte_slice, "\xFF\xFE")) {
-            byte_slice = byte_slice[2..];
-        }
-        const unit_count = byte_slice.len / 2;
-        const units = try gpa.alloc(u16, unit_count);
-        defer {
-            std.crypto.secureZero(u16, units);
-            gpa.free(units);
-        }
-        for (0..unit_count) |idx| {
-            units[idx] = std.mem.readInt(u16, byte_slice[idx * 2 ..][0..2], .little);
-        }
-        var trimmed_units: []const u16 = units;
-        while (trimmed_units.len > 0 and trimmed_units[trimmed_units.len - 1] == 0) {
-            trimmed_units = trimmed_units[0 .. trimmed_units.len - 1];
-        }
-        return std.unicode.utf16LeToUtf8Alloc(gpa, trimmed_units) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.StorageFailure,
-        };
+    var byte_slice = blob;
+    if (std.mem.startsWith(u8, byte_slice, "\xFF\xFE")) {
+        byte_slice = byte_slice[2..];
     }
+    const unit_count = byte_slice.len / 2;
+    const units = try gpa.alloc(u16, unit_count);
+    defer {
+        std.crypto.secureZero(u16, units);
+        gpa.free(units);
+    }
+    for (0..unit_count) |idx| {
+        units[idx] = std.mem.readInt(u16, byte_slice[idx * 2 ..][0..2], .little);
+    }
+    var trimmed_units: []const u16 = units;
+    while (trimmed_units.len > 0 and trimmed_units[trimmed_units.len - 1] == 0) {
+        trimmed_units = trimmed_units[0 .. trimmed_units.len - 1];
+    }
+    if (std.mem.indexOfScalar(u16, trimmed_units, 0) != null) return error.StorageFailure;
+    return std.unicode.utf16LeToUtf8Alloc(gpa, trimmed_units) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.StorageFailure,
+    };
+}
 
+pub fn decodeWindowsUtf8BlobAlloc(gpa: Allocator, blob: []const u8) Error![]u8 {
     var trimmed = blob;
     while (trimmed.len > 0 and trimmed[trimmed.len - 1] == 0) {
         trimmed = trimmed[0 .. trimmed.len - 1];
     }
+    if (std.mem.indexOfScalar(u8, trimmed, 0) != null) return error.StorageFailure;
+    if (!std.unicode.utf8ValidateSlice(trimmed)) return error.StorageFailure;
     return gpa.dupe(u8, trimmed);
+}
+
+pub fn decodeWindowsCredentialBlobAlloc(gpa: Allocator, blob: []const u8) Error![]u8 {
+    if (blob.len == 0) return gpa.dupe(u8, "");
+    if (looksLikeUtf16LePassword(blob)) {
+        return decodeWindowsUtf16LeBlobAlloc(gpa, blob);
+    }
+    return decodeWindowsUtf8BlobAlloc(gpa, blob);
+}
+
+fn decodeWindowsNativeTargetBlobAlloc(gpa: Allocator, blob: []const u8) SecretError![]u8 {
+    if (decodeWindowsUtf16LeBlobAlloc(gpa, blob)) |decoded| {
+        return decoded;
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StorageFailure => return decodeWindowsUtf8BlobAlloc(gpa, blob) catch |uerr| switch (uerr) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.StorageFailure,
+        },
+        else => return error.StorageFailure,
+    }
 }
 
 fn looksLikeUtf16LePassword(blob: []const u8) bool {
@@ -722,6 +782,8 @@ fn windowsAtTargetAlloc(gpa: Allocator, service: []const u8, account: []const u8
 }
 
 fn liveSecretGet(gpa: Allocator, service: []const u8, account: []const u8) SecretError![]u8 {
+    if (keyring_zig.currentBackend() == .null_backend) return error.NoStorageAccess;
+
     if (builtin.os.tag == .windows and keyring_zig.currentBackend() == .win_credential) {
         const target_dot = windowsDotTargetAlloc(gpa, service, account) catch return error.OutOfMemory;
         defer gpa.free(target_dot);
@@ -730,10 +792,7 @@ fn liveSecretGet(gpa: Allocator, service: []const u8, account: []const u8) Secre
                 std.crypto.secureZero(u8, raw);
                 gpa.free(raw);
             }
-            return decodeWindowsCredentialBlobAlloc(gpa, raw) catch |err| switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.StorageFailure,
-            };
+            return decodeWindowsNativeTargetBlobAlloc(gpa, raw);
         } else |err| switch (err) {
             error.EntryNotFound => {},
             error.OutOfMemory => return error.OutOfMemory,
@@ -747,7 +806,7 @@ fn liveSecretGet(gpa: Allocator, service: []const u8, account: []const u8) Secre
                 std.crypto.secureZero(u8, raw);
                 gpa.free(raw);
             }
-            return decodeWindowsCredentialBlobAlloc(gpa, raw) catch |err| switch (err) {
+            return decodeWindowsUtf8BlobAlloc(gpa, raw) catch |err| switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.StorageFailure,
             };
@@ -764,10 +823,7 @@ fn liveSecretGet(gpa: Allocator, service: []const u8, account: []const u8) Secre
                 std.crypto.secureZero(u8, raw);
                 gpa.free(raw);
             }
-            return decodeWindowsCredentialBlobAlloc(gpa, raw) catch |err| switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.StorageFailure,
-            };
+            return decodeWindowsNativeTargetBlobAlloc(gpa, raw);
         } else |err| return switch (err) {
             error.EntryNotFound => error.EntryNotFound,
             error.OutOfMemory => error.OutOfMemory,
@@ -801,6 +857,8 @@ fn liveSecretGet(gpa: Allocator, service: []const u8, account: []const u8) Secre
 }
 
 fn liveSecretSet(gpa: Allocator, service: []const u8, account: []const u8, value: []const u8) SecretError!void {
+    if (keyring_zig.currentBackend() == .null_backend) return error.NoStorageAccess;
+
     if (builtin.os.tag == .windows and keyring_zig.currentBackend() == .win_credential) {
         const target_dot = windowsDotTargetAlloc(gpa, service, account) catch return error.OutOfMemory;
         defer gpa.free(target_dot);
@@ -817,10 +875,14 @@ fn liveSecretSet(gpa: Allocator, service: []const u8, account: []const u8, value
             else => error.StorageFailure,
         };
 
-        // Best-effort cleanup of any stale legacy keytar target for the same account.
+        // Best-effort cleanup of any stale legacy keytar or `@copilot-cli` targets for the same account.
         if (windowsKeytarTargetAlloc(gpa, service, account)) |target_slash| {
             defer gpa.free(target_slash);
             wincred.delete(gpa, target_slash) catch {};
+        } else |_| {}
+        if (windowsAtTargetAlloc(gpa, service, account)) |target_at| {
+            defer gpa.free(target_at);
+            wincred.delete(gpa, target_at) catch {};
         } else |_| {}
         return;
     }
@@ -828,13 +890,36 @@ fn liveSecretSet(gpa: Allocator, service: []const u8, account: []const u8, value
     if (builtin.os.tag == .macos and keyring_zig.currentBackend() == .keychain) {
         if (macosSecuritySetRaw(gpa, service, account, value)) |_| {
             return;
-        } else |_| {
-            return keychain.set(service, account, value) catch |err| switch (err) {
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return keychain.set(service, account, value) catch |kerr| switch (kerr) {
                 error.NoStorageAccess => error.NoStorageAccess,
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.StorageFailure,
+            },
+        }
+    }
+
+    if (builtin.os.tag == .linux and keyring_zig.currentBackend() == .secret_service) {
+        // Copilot CLI (`zbus-secret-service-keyring-store`) stores 2 attributes
+        // (`service`, `username`), whereas `keyring_zig` adds `xdg:schema`. Delete
+        // any existing matching items first so `CreateItem` never leaves 2 items
+        // that cause `Error::Ambiguous` in Copilot CLI.
+        for (0..64) |_| {
+            keyring_zig.deleteAlloc(gpa, service, account) catch |err| switch (err) {
+                error.EntryNotFound => break,
+                error.Locked => return error.Locked,
+                error.NoStorageAccess => return error.NoStorageAccess,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.StorageFailure,
             };
         }
+        return keyring_zig.setAlloc(gpa, service, account, value) catch |err| switch (err) {
+            error.Locked => error.Locked,
+            error.NoStorageAccess => error.NoStorageAccess,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.StorageFailure,
+        };
     }
 
     return keyring_zig.setAlloc(gpa, service, account, value) catch |err| switch (err) {
@@ -845,6 +930,8 @@ fn liveSecretSet(gpa: Allocator, service: []const u8, account: []const u8, value
 }
 
 fn liveSecretDelete(gpa: Allocator, service: []const u8, account: []const u8) SecretError!void {
+    if (keyring_zig.currentBackend() == .null_backend) return error.NoStorageAccess;
+
     if (builtin.os.tag == .windows and keyring_zig.currentBackend() == .win_credential) {
         var deleted_any = false;
         const target_dot = windowsDotTargetAlloc(gpa, service, account) catch return error.OutOfMemory;
@@ -867,6 +954,16 @@ fn liveSecretDelete(gpa: Allocator, service: []const u8, account: []const u8) Se
             else => return error.StorageFailure,
         }
 
+        const target_at = windowsAtTargetAlloc(gpa, service, account) catch return error.OutOfMemory;
+        defer gpa.free(target_at);
+        if (wincred.delete(gpa, target_at)) |_| {
+            deleted_any = true;
+        } else |err| switch (err) {
+            error.EntryNotFound => {},
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.StorageFailure,
+        }
+
         if (!deleted_any) return error.EntryNotFound;
         return;
     }
@@ -878,6 +975,23 @@ fn liveSecretDelete(gpa: Allocator, service: []const u8, account: []const u8) Se
             error.OutOfMemory => error.OutOfMemory,
             else => error.StorageFailure,
         };
+    }
+
+    if (builtin.os.tag == .linux and keyring_zig.currentBackend() == .secret_service) {
+        var deleted_count: usize = 0;
+        for (0..64) |_| {
+            if (keyring_zig.deleteAlloc(gpa, service, account)) |_| {
+                deleted_count += 1;
+            } else |err| switch (err) {
+                error.EntryNotFound => break,
+                error.Locked => return error.Locked,
+                error.NoStorageAccess => return error.NoStorageAccess,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.StorageFailure,
+            }
+        }
+        if (deleted_count == 0) return error.EntryNotFound;
+        return;
     }
 
     return keyring_zig.deleteAlloc(gpa, service, account) catch |err| switch (err) {
@@ -938,12 +1052,64 @@ fn macosSecurityGetRaw(gpa: Allocator, service: []const u8, account: []const u8)
     return copy;
 }
 
+fn validateMacosSecurityIdentifier(s: []const u8) Error!void {
+    if (s.len == 0) return error.InvalidInput;
+    for (s) |c| {
+        if (c <= 0x20 or c >= 0x7f or c == '\'' or c == '"' or c == '\\') {
+            return error.InvalidInput;
+        }
+    }
+}
+
+pub fn buildMacosSecurityAddHexCommandAlloc(
+    gpa: Allocator,
+    service: []const u8,
+    account: []const u8,
+    raw_secret: []const u8,
+) Error![]u8 {
+    try validateMacosSecurityIdentifier(service);
+    try validateMacosSecurityIdentifier(account);
+
+    if (raw_secret.len == 0) {
+        return std.fmt.allocPrint(
+            gpa,
+            "add-generic-password -U -s '{s}' -a '{s}' -w ''\n",
+            .{ service, account },
+        );
+    }
+
+    const hex_alphabet = "0123456789abcdef";
+    var out: std.ArrayList(u8) = .empty;
+    errdefer {
+        std.crypto.secureZero(u8, out.items);
+        out.deinit(gpa);
+    }
+    const prefix = "add-generic-password -U -s '";
+    const mid = "' -a '";
+    const flag = "' -X ";
+    try out.ensureTotalCapacity(gpa, prefix.len + service.len + mid.len + account.len + flag.len + raw_secret.len * 2 + 1);
+    out.appendSliceAssumeCapacity(prefix);
+    out.appendSliceAssumeCapacity(service);
+    out.appendSliceAssumeCapacity(mid);
+    out.appendSliceAssumeCapacity(account);
+    out.appendSliceAssumeCapacity(flag);
+    for (raw_secret) |b| {
+        out.appendAssumeCapacity(hex_alphabet[b >> 4]);
+        out.appendAssumeCapacity(hex_alphabet[b & 0x0f]);
+    }
+    out.appendAssumeCapacity('\n');
+    return out.toOwnedSlice(gpa);
+}
+
 fn macosSecuritySetRaw(gpa: Allocator, service: []const u8, account: []const u8, raw_value: []const u8) SecretError!void {
     var threaded = Io.Threaded.init(gpa, .{ .environ = ado.currentProcessEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
 
-    const cmd = gh.buildSecurityAddCommand(gpa, service, account, raw_value) catch return error.OutOfMemory;
+    const cmd = buildMacosSecurityAddHexCommandAlloc(gpa, service, account, raw_value) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.StorageFailure,
+    };
     defer {
         std.crypto.secureZero(u8, cmd);
         gpa.free(cmd);
@@ -1013,11 +1179,15 @@ fn extractAccountObject(val: std.json.Value) ?AccountSpec {
     const login_v = val.object.get("login") orelse return null;
     if (host_v != .string or login_v != .string) return null;
     if (host_v.string.len == 0 or login_v.string.len == 0) return null;
+    if (std.mem.indexOfAny(u8, login_v.string, "/ \t\r\n:\x00") != null) return null;
     return .{ .host = host_v.string, .login = login_v.string };
 }
 
 fn appendUniqueAccountLeaky(a: Allocator, list: *std.ArrayListUnmanaged(AccountSpec), spec: AccountSpec) !void {
-    const norm_host = normalizeCopilotHostUrlAlloc(a, spec.host) catch spec.host;
+    const norm_host = normalizeCopilotHostUrlAlloc(a, spec.host) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
     for (list.items) |existing| {
         if (std.ascii.eqlIgnoreCase(existing.host, norm_host) and
             std.ascii.eqlIgnoreCase(existing.login, spec.login))
@@ -1034,8 +1204,12 @@ fn readConfigSnapshotLeaky(a: Allocator, root: std.json.ObjectMap) !ParsedConfig
     const last_val = root.get("lastLoggedInUser") orelse root.get("last_logged_in_user");
     if (last_val) |lv| {
         if (extractAccountObject(lv)) |spec| {
-            const norm_host = normalizeCopilotHostUrlAlloc(a, spec.host) catch spec.host;
-            snap.last_user = .{ .host = norm_host, .login = spec.login };
+            if (normalizeCopilotHostUrlAlloc(a, spec.host)) |norm_host| {
+                snap.last_user = .{ .host = norm_host, .login = spec.login };
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {},
+            }
         }
     }
 
@@ -1056,12 +1230,18 @@ fn readConfigSnapshotLeaky(a: Allocator, root: std.json.ObjectMap) !ParsedConfig
                 var it = tv.object.iterator();
                 while (it.next()) |entry| {
                     if (entry.value_ptr.* != .string) continue;
-                    const tok = std.mem.trim(u8, entry.value_ptr.*.string, " \t\r\n");
+                    const raw_tok = entry.value_ptr.*.string;
+                    if (std.mem.indexOfAny(u8, raw_tok, "\r\n\x00") != null) continue;
+                    const tok = std.mem.trim(u8, raw_tok, " \t");
                     if (tok.len == 0) continue;
                     if (parseAccountKey(entry.key_ptr.*)) |parsed| {
-                        const norm_host = normalizeCopilotHostUrlAlloc(a, parsed.host) catch parsed.host;
+                        const norm_host = normalizeCopilotHostUrlAlloc(a, parsed.host) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => continue,
+                        };
                         const norm_key = try formatAccountKeyAlloc(a, norm_host, parsed.login);
-                        try snap.plaintext_tokens.put(a, norm_key, tok);
+                        const tok_copy = try a.dupe(u8, tok);
+                        try snap.plaintext_tokens.put(a, norm_key, tok_copy);
                         try appendUniqueAccountLeaky(a, &snap.users, .{ .host = norm_host, .login = parsed.login });
                     }
                 }
@@ -1076,6 +1256,20 @@ fn readConfigSnapshotLeaky(a: Allocator, root: std.json.ObjectMap) !ParsedConfig
     return snap;
 }
 
+fn resolveCanonicalLogin(snap: ParsedConfigSnapshot, https_host: []const u8, requested: []const u8) []const u8 {
+    if (snap.last_user) |lu| {
+        if (sameHost(lu.host, https_host) and std.ascii.eqlIgnoreCase(lu.login, requested)) {
+            return lu.login;
+        }
+    }
+    for (snap.users.items) |u| {
+        if (sameHost(u.host, https_host) and std.ascii.eqlIgnoreCase(u.login, requested)) {
+            return u.login;
+        }
+    }
+    return requested;
+}
+
 fn readStoreTokenPlaintextSetting(gpa: Allocator, config_dir: []const u8) bool {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1084,7 +1278,9 @@ fn readStoreTokenPlaintextSetting(gpa: Allocator, config_dir: []const u8) bool {
     for ([_][]const u8{ settings_filename, config_filename }) |fname| {
         const path = std.fs.path.join(a, &.{ config_dir, fname }) catch continue;
         const bytes = (registry_auth.readFileIfExists(a, path) catch null) orelse continue;
+        defer std.crypto.secureZero(u8, bytes);
         const root = parseJsoncObjectLeaky(a, bytes) catch continue;
+        defer zeroCopilotTokensInObject(&root);
         const v = root.get("storeTokenPlaintext") orelse root.get("store_token_plaintext") orelse continue;
         if (v == .bool) return v.bool;
     }
@@ -1098,7 +1294,28 @@ fn makeAccountJsonValueLeaky(a: Allocator, host: []const u8, login: []const u8) 
     return .{ .object = obj };
 }
 
-fn scrubPlaintextAccountFromRoot(root: *std.json.ObjectMap, https_host: []const u8, login: []const u8) bool {
+fn hasMatchingExpectedToken(
+    exp_map: *const std.StringArrayHashMapUnmanaged([]const u8),
+    https_host: []const u8,
+    login: []const u8,
+    current_token: []const u8,
+) bool {
+    var it = exp_map.iterator();
+    while (it.next()) |entry| {
+        const parsed = parseAccountKey(entry.key_ptr.*) orelse continue;
+        if (sameHost(parsed.host, https_host) and std.ascii.eqlIgnoreCase(parsed.login, login)) {
+            return std.mem.eql(u8, entry.value_ptr.*, current_token);
+        }
+    }
+    return false;
+}
+
+fn scrubPlaintextAccountFromRoot(
+    root: *std.json.ObjectMap,
+    https_host: []const u8,
+    login: []const u8,
+    expected_tokens: ?*const std.StringArrayHashMapUnmanaged([]const u8),
+) bool {
     var changed = false;
     for ([_][]const u8{ "copilotTokens", "copilot_tokens" }) |field_name| {
         if (root.getPtr(field_name)) |tv| {
@@ -1106,11 +1323,23 @@ fn scrubPlaintextAccountFromRoot(root: *std.json.ObjectMap, https_host: []const 
                 var idx: usize = 0;
                 while (idx < tv.object.count()) {
                     const k = tv.object.keys()[idx];
-                    const matches = if (parseAccountKey(k)) |parsed|
+                    const v = tv.object.values()[idx];
+                    const matches_account = if (parseAccountKey(k)) |parsed|
                         sameHost(parsed.host, https_host) and std.ascii.eqlIgnoreCase(parsed.login, login)
                     else
                         false;
-                    if (matches) {
+                    const should_remove = if (!matches_account)
+                        false
+                    else if (expected_tokens) |exp_map| blk: {
+                        if (v != .string) break :blk false;
+                        const cur_tok = std.mem.trim(u8, v.string, " \t");
+                        break :blk hasMatchingExpectedToken(exp_map, https_host, login, cur_tok);
+                    } else true;
+
+                    if (should_remove) {
+                        if (v == .string) {
+                            std.crypto.secureZero(u8, @constCast(v.string));
+                        }
                         _ = tv.object.orderedRemoveAt(idx);
                         changed = true;
                     } else {
@@ -1147,6 +1376,7 @@ fn upsertAccountAndScrubPlaintextMutation(a: Allocator, root: *std.json.ObjectMa
     var changed = false;
 
     const snap = readConfigSnapshotLeaky(a, root.*) catch return error.OutOfMemory;
+    defer zeroSnapshotSecrets(&snap);
     var new_users = std.json.Array.init(a);
     var found_target = false;
     for (snap.users.items) |u| {
@@ -1175,7 +1405,7 @@ fn upsertAccountAndScrubPlaintextMutation(a: Allocator, root: *std.json.ObjectMa
         changed = true;
     }
 
-    if (scrubPlaintextAccountFromRoot(root, ctx.https_host, ctx.login)) {
+    if (scrubPlaintextAccountFromRoot(root, ctx.https_host, ctx.login, null)) {
         changed = true;
     }
     return changed;
@@ -1230,11 +1460,13 @@ fn resolveStoredCredential(
     const a = arena_state.allocator();
 
     var snap: ParsedConfigSnapshot = .{};
+    defer zeroSnapshotSecrets(&snap);
     if (resolveCopilotConfigDir(a)) |config_dir| {
         const config_path = try std.fs.path.join(a, &.{ config_dir, config_filename });
         if (registry_auth.readFileIfExists(a, config_path) catch null) |bytes| {
             defer std.crypto.secureZero(u8, bytes);
             if (parseJsoncObjectLeaky(a, bytes)) |root| {
+                defer zeroCopilotTokensInObject(&root);
                 snap = try readConfigSnapshotLeaky(a, root);
             } else |_| {}
         }
@@ -1252,25 +1484,49 @@ fn resolveStoredCredential(
     const store = activeSecretStore();
     var saw_locked = false;
     var saw_no_access = false;
+    var saw_storage_failure = false;
 
-    // 1. Explicit username requested -> check `copilot-cli` vault directly.
+    // 1. Explicit username requested -> canonicalize case against `config.json` and check `copilot-cli` vault.
     if (opts.username) |wanted_user| {
-        const key = try formatAccountKeyAlloc(a, target_https_host, wanted_user);
-        if (store.get(gpa, service_name, key)) |tok| {
+        const canonical_user = resolveCanonicalLogin(snap, target_https_host, wanted_user);
+        const key_canon = try formatAccountKeyAlloc(a, target_https_host, canonical_user);
+        if (store.get(gpa, service_name, key_canon)) |tok| {
             errdefer {
                 std.crypto.secureZero(u8, tok);
                 gpa.free(tok);
             }
             return .{
                 .https_host = try gpa.dupe(u8, target_https_host),
-                .login = try gpa.dupe(u8, wanted_user),
+                .login = try gpa.dupe(u8, canonical_user),
                 .token = tok,
             };
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Locked => saw_locked = true,
             error.NoStorageAccess => saw_no_access = true,
-            else => {},
+            error.StorageFailure => saw_storage_failure = true,
+            error.EntryNotFound => {
+                if (!std.mem.eql(u8, canonical_user, wanted_user)) {
+                    const key_raw = try formatAccountKeyAlloc(a, target_https_host, wanted_user);
+                    if (store.get(gpa, service_name, key_raw)) |tok| {
+                        errdefer {
+                            std.crypto.secureZero(u8, tok);
+                            gpa.free(tok);
+                        }
+                        return .{
+                            .https_host = try gpa.dupe(u8, target_https_host),
+                            .login = try gpa.dupe(u8, wanted_user),
+                            .token = tok,
+                        };
+                    } else |err2| switch (err2) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.Locked => saw_locked = true,
+                        error.NoStorageAccess => saw_no_access = true,
+                        error.StorageFailure => saw_storage_failure = true,
+                        error.EntryNotFound => {},
+                    }
+                }
+            },
         }
     } else {
         // 2. Try `lastLoggedInUser` first when it matches `target_https_host`, then `loggedInUsers`.
@@ -1284,6 +1540,10 @@ fn resolveStoredCredential(
             if (sameHost(u.host, target_https_host)) {
                 try appendUniqueAccountLeaky(a, &candidates, u);
             }
+        }
+
+        if (candidates.items.len == 0 and secret_store_override == null and keyring_zig.currentBackend() == .null_backend) {
+            saw_no_access = true;
         }
 
         for (candidates.items) |cand| {
@@ -1302,18 +1562,29 @@ fn resolveStoredCredential(
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Locked => saw_locked = true,
                 error.NoStorageAccess => saw_no_access = true,
-                else => {},
+                error.StorageFailure => saw_storage_failure = true,
+                error.EntryNotFound => {},
             }
         }
     }
 
-    // 3. Fall back to stored GitHub CLI (`gh:<host>`) credential when using live store
-    //    (skipping classic PATs `ghp_` which Copilot CLI rejects).
-    if (secret_store_override == null) {
+    // 3. Fall back to stored GitHub CLI (`gh:<host>`) keyring credential ONLY when
+    //    the platform's native OS store is active (skipping `GH_TOKEN`, plaintext
+    //    `hosts.yml`, synthetic `"x-access-token"`, and classic `ghp_` PATs).
+    if (isDefaultNativeStoreActive()) {
         const bare_host = try extractBareHostAlloc(a, target_https_host);
-        if (gh.lookupStoredCredential(gpa, bare_host, opts.username) catch null) |gh_cred| {
+        const lookup_user = if (opts.username) |wanted|
+            resolveCanonicalLogin(snap, target_https_host, wanted)
+        else
+            null;
+        if (gh.lookupStoredKeyringCredential(gpa, bare_host, lookup_user) catch null) |gh_cred| {
             defer gh_cred.deinit(gpa);
-            if (!gh_cred.from_env and !isClassicPat(gh_cred.token)) {
+            if (!gh_cred.from_env and
+                gh_cred.stored_in_keyring and
+                !std.mem.eql(u8, gh_cred.username, gh.token_username) and
+                !std.ascii.eqlIgnoreCase(gh_cred.username, gh.token_username) and
+                !isClassicPat(gh_cred.token))
+            {
                 return .{
                     .https_host = try gpa.dupe(u8, target_https_host),
                     .login = try gpa.dupe(u8, gh_cred.username),
@@ -1326,6 +1597,7 @@ fn resolveStoredCredential(
 
     if (saw_locked) return error.Locked;
     if (saw_no_access) return error.NoStorageAccess;
+    if (saw_storage_failure) return error.StorageFailure;
     return error.EntryNotFound;
 }
 
@@ -1352,6 +1624,12 @@ fn runLogin(
     };
     defer gpa.free(config_dir);
 
+    if (secret_store_override == null and keyring_zig.currentBackend() == .null_backend) {
+        try stderr.writeAll("keyring: copilot login: no access to OS keyring (run 'keyring diagnose' for guidance)\n");
+        try stderr.flush();
+        return 4;
+    }
+
     var resolved_user: ?[]u8 = null;
     defer if (resolved_user) |u| gpa.free(u);
     var resolved_token: ?[]u8 = null;
@@ -1372,6 +1650,22 @@ fn runLogin(
             }
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.Locked => {
+                try stderr.writeAll("keyring: copilot login: OS keyring is locked (run 'keyring unlock' first)\n");
+                try stderr.flush();
+                return 1;
+            },
+            error.NoStorageAccess => {
+                try stderr.writeAll("keyring: copilot login: no access to OS keyring (run 'keyring diagnose' for guidance)\n");
+                try stderr.flush();
+                return 4;
+            },
+            error.StorageFailure => {
+                try stderr.writeAll("keyring: copilot login: failed to read from OS keyring\n");
+                try stderr.flush();
+                return 1;
+            },
+            error.EntryNotFound => {},
             else => {},
         }
     }
@@ -1471,8 +1765,10 @@ const LogoutMutationCtx = struct {
 fn applyLogoutConfigMutation(a: Allocator, root: *std.json.ObjectMap, ctx: LogoutMutationCtx) Error!bool {
     var changed = false;
     const snap = readConfigSnapshotLeaky(a, root.*) catch return error.OutOfMemory;
+    defer zeroSnapshotSecrets(&snap);
 
     if (ctx.all) {
+        zeroCopilotTokensInObject(root);
         if (root.orderedRemove("loggedInUsers")) changed = true;
         if (root.orderedRemove("logged_in_users")) changed = true;
         if (root.orderedRemove("lastLoggedInUser")) changed = true;
@@ -1494,7 +1790,7 @@ fn applyLogoutConfigMutation(a: Allocator, root: *std.json.ObjectMap, ctx: Logou
         const match_user = if (target_user) |tu| std.ascii.eqlIgnoreCase(u.login, tu) else true;
         if (match_host and match_user) {
             changed = true;
-            _ = scrubPlaintextAccountFromRoot(root, u.host, u.login);
+            _ = scrubPlaintextAccountFromRoot(root, u.host, u.login, null);
         } else {
             remaining.append(makeAccountJsonValueLeaky(a, u.host, u.login) catch return error.OutOfMemory) catch
                 return error.OutOfMemory;
@@ -1502,7 +1798,7 @@ fn applyLogoutConfigMutation(a: Allocator, root: *std.json.ObjectMap, ctx: Logou
     }
 
     if (target_user) |tu| {
-        if (scrubPlaintextAccountFromRoot(root, target_host, tu)) changed = true;
+        if (scrubPlaintextAccountFromRoot(root, target_host, tu, null)) changed = true;
     }
 
     if (changed) {
@@ -1528,6 +1824,41 @@ fn applyLogoutConfigMutation(a: Allocator, root: *std.json.ObjectMap, ctx: Logou
     return changed;
 }
 
+const LogoutDeleteOutcome = union(enum) {
+    deleted,
+    not_found,
+    abort_exit: u8,
+};
+
+fn deleteKeyringEntryForLogout(
+    a: Allocator,
+    store: SecretStore,
+    key: []const u8,
+    stderr: *Io.Writer,
+) !LogoutDeleteOutcome {
+    if (store.delete(a, service_name, key)) |_| {
+        return .deleted;
+    } else |err| switch (err) {
+        error.EntryNotFound => return .not_found,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Locked => {
+            try stderr.writeAll("keyring: copilot logout: OS keyring is locked (run 'keyring unlock' first)\n");
+            try stderr.flush();
+            return .{ .abort_exit = 1 };
+        },
+        error.NoStorageAccess => {
+            try stderr.writeAll("keyring: copilot logout: no access to OS keyring (run 'keyring diagnose' for guidance)\n");
+            try stderr.flush();
+            return .{ .abort_exit = 4 };
+        },
+        error.StorageFailure => {
+            try stderr.writeAll("keyring: copilot logout: failed to delete credential from OS keyring\n");
+            try stderr.flush();
+            return .{ .abort_exit = 1 };
+        },
+    }
+}
+
 fn runLogout(
     gpa: Allocator,
     opts: LogoutOptions,
@@ -1546,17 +1877,27 @@ fn runLogout(
         };
     } else null;
 
+    if (secret_store_override == null and keyring_zig.currentBackend() == .null_backend) {
+        try stderr.writeAll("keyring: copilot logout: no access to OS keyring (run 'keyring diagnose' for guidance)\n");
+        try stderr.flush();
+        return 4;
+    }
+
     var snap: ParsedConfigSnapshot = .{};
+    defer zeroSnapshotSecrets(&snap);
     const maybe_config_dir = resolveCopilotConfigDir(a);
     const maybe_config_path: ?[]const u8 = if (maybe_config_dir) |dir|
         try std.fs.path.join(a, &.{ dir, config_filename })
     else
         null;
 
+    var config_file_exists = false;
     if (maybe_config_path) |cp| {
         if (try registry_auth.readFileIfExists(a, cp)) |bytes| {
+            config_file_exists = true;
             defer std.crypto.secureZero(u8, bytes);
             if (parseJsoncObjectLeaky(a, bytes)) |root| {
+                defer zeroCopilotTokensInObject(&root);
                 snap = try readConfigSnapshotLeaky(a, root);
             } else |_| {}
         }
@@ -1568,41 +1909,46 @@ fn runLogout(
     if (opts.all) {
         for (snap.users.items) |u| {
             const key = try formatAccountKeyAlloc(a, u.host, u.login);
-            if (store.delete(a, service_name, key)) |_| {
-                removed_count += 1;
-            } else |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {},
+            switch (try deleteKeyringEntryForLogout(a, store, key, stderr)) {
+                .deleted => removed_count += 1,
+                .not_found => {},
+                .abort_exit => |code| return code,
             }
         }
     } else {
         const effective_host = maybe_https_host orelse if (snap.last_user) |lu| lu.host else "https://github.com";
         if (opts.username) |tu| {
-            const key = try formatAccountKeyAlloc(a, effective_host, tu);
-            if (store.delete(a, service_name, key)) |_| {
-                removed_count += 1;
-            } else |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {},
+            const canonical = resolveCanonicalLogin(snap, effective_host, tu);
+            const key_canon = try formatAccountKeyAlloc(a, effective_host, canonical);
+            switch (try deleteKeyringEntryForLogout(a, store, key_canon, stderr)) {
+                .deleted => removed_count += 1,
+                .not_found => {},
+                .abort_exit => |code| return code,
+            }
+            if (!std.mem.eql(u8, canonical, tu)) {
+                const key_raw = try formatAccountKeyAlloc(a, effective_host, tu);
+                switch (try deleteKeyringEntryForLogout(a, store, key_raw, stderr)) {
+                    .deleted => removed_count += 1,
+                    .not_found => {},
+                    .abort_exit => |code| return code,
+                }
             }
         } else if (maybe_https_host == null and snap.last_user != null) {
             const lu = snap.last_user.?;
             const key = try formatAccountKeyAlloc(a, lu.host, lu.login);
-            if (store.delete(a, service_name, key)) |_| {
-                removed_count += 1;
-            } else |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {},
+            switch (try deleteKeyringEntryForLogout(a, store, key, stderr)) {
+                .deleted => removed_count += 1,
+                .not_found => {},
+                .abort_exit => |code| return code,
             }
         } else {
             for (snap.users.items) |u| {
                 if (sameHost(u.host, effective_host)) {
                     const key = try formatAccountKeyAlloc(a, u.host, u.login);
-                    if (store.delete(a, service_name, key)) |_| {
-                        removed_count += 1;
-                    } else |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => {},
+                    switch (try deleteKeyringEntryForLogout(a, store, key, stderr)) {
+                        .deleted => removed_count += 1,
+                        .not_found => {},
+                        .abort_exit => |code| return code,
                     }
                 }
             }
@@ -1610,13 +1956,20 @@ fn runLogout(
     }
 
     var config_changed = false;
-    if (maybe_config_path) |cp| {
-        if ((registry_auth.readFileIfExists(a, cp) catch null) != null) {
+    if (config_file_exists) {
+        if (maybe_config_path) |cp| {
             config_changed = mutateConfigFileWithCas(a, cp, LogoutMutationCtx{
                 .all = opts.all,
                 .https_host = maybe_https_host,
                 .username = opts.username,
-            }, applyLogoutConfigMutation) catch false;
+            }, applyLogoutConfigMutation) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => blk: {
+                    try stderr.print("keyring: copilot logout: failed to update {s} ({s})\n", .{ cp, @errorName(err) });
+                    try stderr.flush();
+                    break :blk 1;
+                },
+            };
         }
     }
 
@@ -1657,6 +2010,11 @@ fn runToken(
             try stderr.writeAll("keyring: copilot token: no access to OS keyring\n");
             try stderr.flush();
             break :blk 4;
+        },
+        error.StorageFailure => blk: {
+            try stderr.writeAll("keyring: copilot token: failed to read from OS keyring\n");
+            try stderr.flush();
+            break :blk 1;
         },
         else => blk: {
             try stderr.writeAll("keyring: copilot token: no Copilot CLI token found (run 'keyring copilot login' first)\n");
@@ -1770,6 +2128,11 @@ fn runEnv(
             try stderr.flush();
             break :blk 4;
         },
+        error.StorageFailure => blk: {
+            try stderr.writeAll("keyring: copilot env: failed to read from OS keyring\n");
+            try stderr.flush();
+            break :blk 1;
+        },
         else => blk: {
             try stderr.writeAll("keyring: copilot env: no Copilot CLI token found (run 'keyring copilot login' first)\n");
             try stderr.flush();
@@ -1800,11 +2163,13 @@ fn runEnv(
 const ImportMergeCtx = struct {
     accounts: []const AccountSpec,
     last_user: ?AccountSpec,
+    expected_tokens: ?*const std.StringArrayHashMapUnmanaged([]const u8) = null,
 };
 
 fn applyImportMergeMutation(a: Allocator, root: *std.json.ObjectMap, ctx: ImportMergeCtx) Error!bool {
     var changed = false;
     const snap = readConfigSnapshotLeaky(a, root.*) catch return error.OutOfMemory;
+    defer zeroSnapshotSecrets(&snap);
 
     var merged: std.ArrayListUnmanaged(AccountSpec) = .empty;
     for (snap.users.items) |u| {
@@ -1814,7 +2179,7 @@ fn applyImportMergeMutation(a: Allocator, root: *std.json.ObjectMap, ctx: Import
         const before = merged.items.len;
         appendUniqueAccountLeaky(a, &merged, inc) catch return error.OutOfMemory;
         if (merged.items.len > before) changed = true;
-        if (scrubPlaintextAccountFromRoot(root, inc.host, inc.login)) changed = true;
+        if (scrubPlaintextAccountFromRoot(root, inc.host, inc.login, ctx.expected_tokens)) changed = true;
     }
 
     var arr = std.json.Array.init(a);
@@ -1901,7 +2266,9 @@ fn runImport(
         try stderr.flush();
         return 1;
     };
+    defer zeroCopilotTokensInObject(&parsed_root);
     const snap = try readConfigSnapshotLeaky(a, parsed_root);
+    defer zeroSnapshotSecrets(&snap);
 
     if (snap.plaintext_tokens.count() == 0) {
         try stderr.writeAll("keyring: copilot import: no plaintext copilotTokens found to import\n");
@@ -1942,6 +2309,7 @@ fn runImport(
     _ = mutateConfigFileWithCas(a, local_config_path, ImportMergeCtx{
         .accounts = imported_specs.items,
         .last_user = snap.last_user,
+        .expected_tokens = if (source == null) &snap.plaintext_tokens else null,
     }, applyImportMergeMutation) catch {
         try stderr.print("keyring: copilot import: failed to update {s}\n", .{local_config_path});
         try stderr.flush();
@@ -1987,7 +2355,9 @@ fn runExport(
         try stderr.flush();
         return 1;
     };
+    defer zeroCopilotTokensInObject(&root);
     const snap = try readConfigSnapshotLeaky(a, root);
+    defer zeroSnapshotSecrets(&snap);
     if (snap.users.items.len == 0) {
         try stderr.print("keyring: copilot export: no accounts configured in {s}\n", .{local_config_path});
         try stderr.flush();
@@ -1997,15 +2367,20 @@ fn runExport(
     const store = activeSecretStore();
     var exported_users = std.json.Array.init(a);
     var tokens_obj: std.json.ObjectMap = .empty;
+    defer {
+        for (tokens_obj.values()) |v| {
+            if (v == .string) std.crypto.secureZero(u8, @constCast(v.string));
+        }
+    }
     var exported_count: usize = 0;
     var saw_locked = false;
     var saw_no_access = false;
 
     for (snap.users.items) |u| {
         const key = try formatAccountKeyAlloc(a, u.host, u.login);
-        var tok_opt: ?[]const u8 = null;
+        var tok_owned: ?[]u8 = null;
         if (store.get(a, service_name, key)) |vault_tok| {
-            tok_opt = vault_tok;
+            tok_owned = vault_tok;
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Locked => saw_locked = true,
@@ -2013,20 +2388,28 @@ fn runExport(
             else => {},
         }
 
-        if (tok_opt == null) {
-            tok_opt = snap.plaintext_tokens.get(key);
+        if (tok_owned == null) {
+            if (snap.plaintext_tokens.get(key)) |pt| {
+                tok_owned = try a.dupe(u8, pt);
+            }
         }
-        if (tok_opt == null and secret_store_override == null) {
+        if (tok_owned == null and isDefaultNativeStoreActive()) {
             if (extractBareHostAlloc(a, u.host) catch null) |bare| {
-                if (gh.lookupStoredCredential(a, bare, u.login) catch null) |gh_cred| {
-                    if (!gh_cred.from_env and !isClassicPat(gh_cred.token)) {
-                        tok_opt = gh_cred.token;
+                if (gh.lookupStoredKeyringCredential(a, bare, u.login) catch null) |gh_cred| {
+                    defer gh_cred.deinit(a);
+                    if (!gh_cred.from_env and
+                        gh_cred.stored_in_keyring and
+                        !std.mem.eql(u8, gh_cred.username, gh.token_username) and
+                        !std.ascii.eqlIgnoreCase(gh_cred.username, gh.token_username) and
+                        !isClassicPat(gh_cred.token))
+                    {
+                        tok_owned = try a.dupe(u8, gh_cred.token);
                     }
                 }
             }
         }
 
-        if (tok_opt) |tok| {
+        if (tok_owned) |tok| {
             try exported_users.append(try makeAccountJsonValueLeaky(a, u.host, u.login));
             try tokens_obj.put(a, key, .{ .string = tok });
             exported_count += 1;
@@ -2125,7 +2508,9 @@ fn runStatus(
         try stderr.flush();
         return 1;
     };
+    defer zeroCopilotTokensInObject(&root);
     const snap = try readConfigSnapshotLeaky(a, root);
+    defer zeroSnapshotSecrets(&snap);
     if (snap.users.items.len == 0) {
         try stdout.writeAll("accounts: none configured\n");
         try stdout.flush();
@@ -2157,11 +2542,16 @@ fn runStatus(
             else => {
                 if (snap.plaintext_tokens.contains(key)) {
                     status_label = "stored in plaintext config.json";
-                } else if (secret_store_override == null) {
+                } else if (isDefaultNativeStoreActive()) {
                     if (extractBareHostAlloc(a, u.host) catch null) |bare| {
-                        if (gh.lookupStoredCredential(a, bare, u.login) catch null) |gh_cred| {
+                        if (gh.lookupStoredKeyringCredential(a, bare, u.login) catch null) |gh_cred| {
                             defer gh_cred.deinit(a);
-                            if (!gh_cred.from_env and !isClassicPat(gh_cred.token)) {
+                            if (!gh_cred.from_env and
+                                gh_cred.stored_in_keyring and
+                                !std.mem.eql(u8, gh_cred.username, gh.token_username) and
+                                !std.ascii.eqlIgnoreCase(gh_cred.username, gh.token_username) and
+                                !isClassicPat(gh_cred.token))
+                            {
                                 status_label = "available via gh keyring";
                             }
                         }
@@ -2191,7 +2581,9 @@ pub fn diagnose(gpa: Allocator, stdout: *Io.Writer) !void {
         try stdout.print("copilot: {s} (invalid JSON)\n", .{config_path});
         return;
     };
+    defer zeroCopilotTokensInObject(&root);
     const snap = try readConfigSnapshotLeaky(a, root);
+    defer zeroSnapshotSecrets(&snap);
     const store = activeSecretStore();
 
     var in_keyring: usize = 0;
@@ -2227,7 +2619,7 @@ pub fn diagnose(gpa: Allocator, stdout: *Io.Writer) !void {
 const MockStoreState = struct {
     var gpa_ref: Allocator = undefined;
     var entries: std.StringHashMapUnmanaged([]u8) = .empty;
-    var mode: enum { ok, locked, no_access } = .ok;
+    var mode: enum { ok, locked, no_access, storage_failure } = .ok;
 
     fn reset(gpa: Allocator) void {
         deinit();
@@ -2256,6 +2648,7 @@ const MockStoreState = struct {
         switch (mode) {
             .locked => return error.Locked,
             .no_access => return error.NoStorageAccess,
+            .storage_failure => return error.StorageFailure,
             .ok => {},
         }
         const k = try compoundKey(gpa, svc, acct);
@@ -2268,6 +2661,7 @@ const MockStoreState = struct {
         switch (mode) {
             .locked => return error.Locked,
             .no_access => return error.NoStorageAccess,
+            .storage_failure => return error.StorageFailure,
             .ok => {},
         }
         const k = try compoundKey(gpa_ref, svc, acct);
@@ -2287,6 +2681,7 @@ const MockStoreState = struct {
         switch (mode) {
             .locked => return error.Locked,
             .no_access => return error.NoStorageAccess,
+            .storage_failure => return error.StorageFailure,
             .ok => {},
         }
         const k = try compoundKey(gpa, svc, acct);
@@ -2532,4 +2927,315 @@ test "import scrubs plaintext copilotTokens, preserves unknown fields, and suppo
     const rc_tok2 = try run(gpa, .{ .token = .{} }, &empty_in, &out.writer, &err_out.writer);
     try std.testing.expectEqual(@as(u8, 0), rc_tok2);
     try std.testing.expectEqualStrings("gho_secret_token_alice", out.written());
+}
+
+test "stripJsonCommentsAndTrailingCommasAlloc rejects unterminated block comment" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidJson,
+        stripJsonCommentsAndTrailingCommasAlloc(gpa, "{ /* unterminated comment \"secret\": \"gho_123\" }"),
+    );
+    try std.testing.expectError(
+        error.InvalidJson,
+        stripJsonCommentsAndTrailingCommasAlloc(gpa, "/*"),
+    );
+    try std.testing.expectError(
+        error.InvalidJson,
+        stripJsonCommentsAndTrailingCommasAlloc(gpa, "/* *"),
+    );
+}
+
+test "buildMacosSecurityAddHexCommandAlloc emits hex secret and rejects unsafe identifiers" {
+    const gpa = std.testing.allocator;
+
+    const cmd = try buildMacosSecurityAddHexCommandAlloc(
+        gpa,
+        "copilot-cli",
+        "https://github.com:Alice",
+        "gho_A'B\"C\n",
+    );
+    defer gpa.free(cmd);
+    try std.testing.expectEqualStrings(
+        "add-generic-password -U -s 'copilot-cli' -a 'https://github.com:Alice' -X 67686f5f41274222430a\n",
+        cmd,
+    );
+
+    const empty_cmd = try buildMacosSecurityAddHexCommandAlloc(
+        gpa,
+        "copilot-cli",
+        "https://github.com:Alice",
+        "",
+    );
+    defer gpa.free(empty_cmd);
+    try std.testing.expectEqualStrings(
+        "add-generic-password -U -s 'copilot-cli' -a 'https://github.com:Alice' -w ''\n",
+        empty_cmd,
+    );
+
+    for ([_][]const u8{
+        "",
+        "https://github.com:al'ice",
+        "https://github.com:al\"ice",
+        "https://github.com:al\\ice",
+        "https://github.com:al ice",
+        "https://github.com:al\nice",
+        "https://github.com:al\x7fice",
+    }) |bad_acct| {
+        try std.testing.expectError(
+            error.InvalidInput,
+            buildMacosSecurityAddHexCommandAlloc(gpa, "copilot-cli", bad_acct, "gho_123"),
+        );
+    }
+    try std.testing.expectError(
+        error.InvalidInput,
+        buildMacosSecurityAddHexCommandAlloc(gpa, "", "https://github.com:alice", "gho_123"),
+    );
+}
+
+test "Windows target-specific UTF-16LE and UTF-8 decoders validate lengths and encodings" {
+    const gpa = std.testing.allocator;
+
+    const encoded = try encodeWindowsPasswordUtf16LeAlloc(gpa, "gho_WinCred123");
+    defer gpa.free(encoded);
+
+    const dec16 = try decodeWindowsUtf16LeBlobAlloc(gpa, encoded);
+    defer gpa.free(dec16);
+    try std.testing.expectEqualStrings("gho_WinCred123", dec16);
+
+    // BOM + trailing UTF-16 NUL units are stripped cleanly.
+    const with_bom_and_nul = try std.mem.concat(gpa, u8, &.{ "\xFF\xFE", encoded, "\x00\x00" });
+    defer gpa.free(with_bom_and_nul);
+    const dec_bom = try decodeWindowsUtf16LeBlobAlloc(gpa, with_bom_and_nul);
+    defer gpa.free(dec_bom);
+    try std.testing.expectEqualStrings("gho_WinCred123", dec_bom);
+
+    // Odd-length blob fails strict UTF-16LE decoding, then succeeds via UTF-8 fallback.
+    try std.testing.expectError(error.StorageFailure, decodeWindowsUtf16LeBlobAlloc(gpa, "gho_odd"));
+    const fallback = try decodeWindowsNativeTargetBlobAlloc(gpa, "gho_odd");
+    defer gpa.free(fallback);
+    try std.testing.expectEqualStrings("gho_odd", fallback);
+
+    // Legacy keytar UTF-8 decoder trims trailing NULs and rejects invalid UTF-8 / interior NULs.
+    const dec8 = try decodeWindowsUtf8BlobAlloc(gpa, "gho_keytar\x00\x00");
+    defer gpa.free(dec8);
+    try std.testing.expectEqualStrings("gho_keytar", dec8);
+    try std.testing.expectError(error.StorageFailure, decodeWindowsUtf8BlobAlloc(gpa, "\xff\xfe"));
+    try std.testing.expectError(error.StorageFailure, decodeWindowsUtf8BlobAlloc(gpa, "a\x00b"));
+}
+
+test "logout and login propagate Locked and NoStorageAccess without modifying config.json, and -u matches case-insensitively" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try testTmpDirPath(&tmp, gpa);
+    defer gpa.free(root_path);
+    const copilot_dir = try std.fs.path.join(gpa, &.{ root_path, "copilot-home" });
+    defer gpa.free(copilot_dir);
+    const config_path = try std.fs.path.join(gpa, &.{ copilot_dir, config_filename });
+    defer gpa.free(config_path);
+
+    MockStoreState.reset(gpa);
+    defer MockStoreState.deinit();
+    setTestOverrides(MockStoreState.store, copilot_dir, testNoColorEnv);
+    defer setTestOverrides(null, null, null);
+
+    try MockStoreState.setFn(gpa, service_name, "https://github.com:Alice", "gho_alice_cased_token");
+
+    const initial_config =
+        \\// User settings belong in settings.json.
+        \\{
+        \\  "loggedInUsers": [
+        \\    { "host": "https://github.com", "login": "Alice" }
+        \\  ],
+        \\  "lastLoggedInUser": { "host": "https://github.com", "login": "Alice" }
+        \\}
+    ;
+    try registry_auth.writeProtectedFileAtomic(gpa, config_path, initial_config);
+
+    var empty_in = Io.Reader.fixed("");
+    var out = Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    var err_out = Io.Writer.Allocating.init(gpa);
+    defer err_out.deinit();
+
+    // 1. Case-insensitive `-u alice` resolves `"Alice"` in `token`.
+    const rc_tok = try run(gpa, .{ .token = .{ .username = "alice" } }, &empty_in, &out.writer, &err_out.writer);
+    try std.testing.expectEqual(@as(u8, 0), rc_tok);
+    try std.testing.expectEqualStrings("gho_alice_cased_token", out.written());
+
+    // 2. When keyring is Locked, `logout` exits 1, `login` exits 1, and `config.json` is untouched!
+    MockStoreState.mode = .locked;
+    out.clearRetainingCapacity();
+    err_out.clearRetainingCapacity();
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        try run(gpa, .{ .logout = .{ .username = "alice" } }, &empty_in, &out.writer, &err_out.writer),
+    );
+    out.clearRetainingCapacity();
+    err_out.clearRetainingCapacity();
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        try run(gpa, .{ .login = .{ .username = "alice" } }, &empty_in, &out.writer, &err_out.writer),
+    );
+    {
+        const after_locked = (try registry_auth.readFileIfExists(gpa, config_path)).?;
+        defer gpa.free(after_locked);
+        try std.testing.expectEqualStrings(initial_config, after_locked);
+    }
+
+    // 3. When keyring has NoStorageAccess, `logout` exits 4, `login` exits 4, and `config.json` is untouched!
+    MockStoreState.mode = .no_access;
+    out.clearRetainingCapacity();
+    err_out.clearRetainingCapacity();
+    try std.testing.expectEqual(
+        @as(u8, 4),
+        try run(gpa, .{ .logout = .{ .all = true } }, &empty_in, &out.writer, &err_out.writer),
+    );
+    out.clearRetainingCapacity();
+    err_out.clearRetainingCapacity();
+    try std.testing.expectEqual(
+        @as(u8, 4),
+        try run(gpa, .{ .login = .{} }, &empty_in, &out.writer, &err_out.writer),
+    );
+    {
+        const after_no_access = (try registry_auth.readFileIfExists(gpa, config_path)).?;
+        defer gpa.free(after_no_access);
+        try std.testing.expectEqualStrings(initial_config, after_no_access);
+    }
+
+    // 4. Restoring `.ok` allows case-insensitive `-u alice` in `logout` to delete `"Alice"` from vault & config!
+    MockStoreState.mode = .ok;
+    out.clearRetainingCapacity();
+    err_out.clearRetainingCapacity();
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        try run(gpa, .{ .logout = .{ .username = "alice" } }, &empty_in, &out.writer, &err_out.writer),
+    );
+    try std.testing.expectEqual(@as(usize, 0), MockStoreState.entries.count());
+    {
+        const after_logout = (try registry_auth.readFileIfExists(gpa, config_path)).?;
+        defer gpa.free(after_logout);
+        try std.testing.expect(std.mem.indexOf(u8, after_logout, "Alice") == null);
+    }
+}
+
+test "concurrent import preserves newer plaintext token and snapshot skips invalid hosts or control-char tokens" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 1. Invalid hosts and tokens containing \r/\n/\x00 are skipped in readConfigSnapshotLeaky.
+    const dirty_json =
+        \\{
+        \\  "loggedInUsers": [
+        \\    { "host": "https://bad host/path", "login": "mallory" },
+        \\    { "host": "https://github.com", "login": "alice" }
+        \\  ],
+        \\  "copilotTokens": {
+        \\    "https://bad host:mallory": "gho_bad_host",
+        \\    "https://github.com:bob": "gho_bad\ntoken",
+        \\    "https://github.com:alice": "gho_old_token"
+        \\  }
+        \\}
+    ;
+    const initial_root = try parseJsoncObjectLeaky(a, dirty_json);
+    const snap = try readConfigSnapshotLeaky(a, initial_root);
+    try std.testing.expectEqual(@as(usize, 1), snap.users.items.len);
+    try std.testing.expectEqualStrings("alice", snap.users.items[0].login);
+    try std.testing.expectEqual(@as(usize, 1), snap.plaintext_tokens.count());
+
+    // 2. Simulate concurrent writer updating `alice`'s token in `config.json` before CAS mutation runs.
+    const concurrent_json =
+        \\{
+        \\  "loggedInUsers": [
+        \\    { "host": "https://github.com", "login": "alice" },
+        \\    { "host": "https://github.com", "login": "carol" }
+        \\  ],
+        \\  "copilotTokens": {
+        \\    "https://github.com:alice": "gho_concurrently_refreshed",
+        \\    "https://github.com:carol": "gho_carol_imported"
+        \\  }
+        \\}
+    ;
+    var expected: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    try expected.put(a, "https://github.com:alice", "gho_old_token");
+    try expected.put(a, "https://github.com:carol", "gho_carol_imported");
+
+    var live_root = try parseJsoncObjectLeaky(a, concurrent_json);
+    const imported_accounts = [_]AccountSpec{
+        .{ .host = "https://github.com", .login = "alice" },
+        .{ .host = "https://github.com", .login = "carol" },
+    };
+    _ = try applyImportMergeMutation(a, &live_root, .{
+        .accounts = &imported_accounts,
+        .last_user = null,
+        .expected_tokens = &expected,
+    });
+
+    const remaining_tokens = live_root.get("copilotTokens").?.object;
+    try std.testing.expectEqual(@as(usize, 1), remaining_tokens.count());
+    try std.testing.expectEqualStrings(
+        "gho_concurrently_refreshed",
+        remaining_tokens.get("https://github.com:alice").?.string,
+    );
+    try std.testing.expect(remaining_tokens.get("https://github.com:carol") == null);
+}
+
+test "null_backend (--disable) returns exit 4 across token, import, logout, and login without modifying config.json" {
+    const gpa = std.testing.allocator;
+    const prev_backend = keyring_zig.currentBackend();
+    defer keyring_zig.setDefaultBackend(prev_backend) catch {};
+    try keyring_zig.setDefaultBackend(.null_backend);
+
+    try std.testing.expect(!isDefaultNativeStoreActive());
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try testTmpDirPath(&tmp, gpa);
+    defer gpa.free(root_path);
+    const copilot_dir = try std.fs.path.join(gpa, &.{ root_path, "copilot-home" });
+    defer gpa.free(copilot_dir);
+    const config_path = try std.fs.path.join(gpa, &.{ copilot_dir, config_filename });
+    defer gpa.free(config_path);
+
+    setTestOverrides(null, copilot_dir, testNoColorEnv);
+    defer setTestOverrides(null, null, null);
+
+    const initial_config =
+        \\// User settings belong in settings.json.
+        \\{
+        \\  "loggedInUsers": [
+        \\    { "host": "https://github.com", "login": "alice" }
+        \\  ],
+        \\  "lastLoggedInUser": { "host": "https://github.com", "login": "alice" },
+        \\  "copilotTokens": {
+        \\    "https://github.com:alice": "gho_preserve_under_disable"
+        \\  }
+        \\}
+    ;
+    try registry_auth.writeProtectedFileAtomic(gpa, config_path, initial_config);
+
+    var empty_in = Io.Reader.fixed("");
+    var out = Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    var err_out = Io.Writer.Allocating.init(gpa);
+    defer err_out.deinit();
+
+    for ([_]Subcommand{
+        .{ .token = .{} },
+        .{ .import_cmd = .{ .source = null } },
+        .{ .logout = .{ .all = true } },
+        .{ .login = .{} },
+    }) |subcmd| {
+        out.clearRetainingCapacity();
+        err_out.clearRetainingCapacity();
+        try std.testing.expectEqual(@as(u8, 4), try run(gpa, subcmd, &empty_in, &out.writer, &err_out.writer));
+    }
+
+    const after = (try registry_auth.readFileIfExists(gpa, config_path)).?;
+    defer gpa.free(after);
+    try std.testing.expectEqualStrings(initial_config, after);
 }

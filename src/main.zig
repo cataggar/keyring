@@ -226,8 +226,7 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
         .service => |action| code: {
             switch (action) {
                 .run => |args| {
-                    _ = args.lock_timeout_seconds;
-                    service.runDaemon(arena, args.replace) catch |err| {
+                    service.runDaemon(arena, args.replace, args.lock_timeout_seconds) catch |err| {
                         try printAppError(stderr, normalizeServiceError(err), null, null);
                         break :code 1;
                     };
@@ -356,6 +355,11 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
             break :code try wslc.run(arena, subcmd, &stdin_reader.interface, stdout, stderr);
         },
         .copilot => |subcmd| code: {
+            if (backendEql(currentBackend(), .ado)) {
+                try stderr.writeAll("keyring: backend 'ado' does not support 'copilot' commands\n");
+                try stderr.flush();
+                break :code 4;
+            }
             var stdin_buffer: [4096]u8 = undefined;
             defer std.crypto.secureZero(u8, &stdin_buffer);
             var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
@@ -1123,7 +1127,9 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     gh.diagnoseHosts(arena, stdout) catch {};
     podman.diagnose(arena, stdout) catch {};
     wslc.diagnose(arena, stdout) catch {};
-    copilot.diagnose(arena, stdout) catch {};
+    if (!backendEql(current, .ado)) {
+        copilot.diagnose(arena, stdout) catch {};
+    }
     try stdout.flush();
 }
 
@@ -1354,6 +1360,8 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
 }
 
 test "runCommand dispatches help list-backends diagnose" {
+    const prev_backend = keyring_zig.currentBackend();
+    defer keyring_zig.setDefaultBackend(prev_backend) catch {};
     try keyring_zig.setDefaultBackend(.null_backend);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1381,6 +1389,33 @@ test "runCommand dispatches help list-backends diagnose" {
     defer std.testing.allocator.free(diagnose_output);
     try expectContains(diagnose_output, "current backend: null_backend");
     try expectContains(diagnose_output, "KEYRING_BACKEND env:");
+}
+
+test "runCommand rejects copilot subcommands when backend is ado" {
+    const prev_override = app_backend_override;
+    defer app_backend_override = prev_override;
+    app_backend_override = .ado;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer stderr.deinit();
+
+    const rc = try runCommand(
+        .{ .copilot = .{ .token = .{} } },
+        arena.allocator(),
+        std.Io.Threaded.global_single_threaded.io(),
+        &stdout.writer,
+        &stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 4), rc);
+    try std.testing.expectEqualStrings(
+        "keyring: backend 'ado' does not support 'copilot' commands\n",
+        stderr.written(),
+    );
 }
 
 test "parseArgs recognizes set get del" {

@@ -1149,6 +1149,7 @@ pub const GitCredential = struct {
 
     pub fn deinit(self: *const GitCredential, gpa: Allocator) void {
         gpa.free(self.username);
+        std.crypto.secureZero(u8, self.token);
         gpa.free(self.token);
     }
 };
@@ -1442,6 +1443,160 @@ pub fn lookupStoredCredential(
     } else |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {},
+    }
+
+    return null;
+}
+
+/// Look up an existing credential for `raw_host` exclusively from the OS keyring
+/// (`gh:<canonical_host>`) paired with `<gh_config_dir>/hosts.yml` account metadata.
+///
+/// Unlike `lookupStoredCredential`, this function:
+/// - Never reads environment variables (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`).
+/// - Never returns plaintext `oauth_token` entries from `hosts.yml`.
+/// - Never synthesizes `"x-access-token"` as a username; the `""` active-user
+///   mirror slot is only used when `hosts.yml` provides a real `active_user`.
+pub fn lookupStoredKeyringCredential(
+    gpa: Allocator,
+    raw_host: []const u8,
+    requested_username: ?[]const u8,
+) AuthError!?GitCredential {
+    const canonical = try normalizeHostnameAlloc(gpa, raw_host);
+    defer gpa.free(canonical);
+
+    const specific_user: ?[]const u8 = if (requested_username) |u| blk: {
+        const trimmed = std.mem.trim(u8, u, " \t\r\n");
+        if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, token_username)) return null;
+        break :blk trimmed;
+    } else null;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const service = try keyringServiceName(a, canonical);
+    const store = activeSecretStore();
+
+    var maybe_host_cfg: ?HostConfig = null;
+    if (resolveGhConfigDir(a)) |config_dir| {
+        const hosts_path = try std.fs.path.join(a, &.{ config_dir, hosts_filename });
+        if (readFileIfExists(a, hosts_path)) |yaml| {
+            defer std.crypto.secureZero(u8, yaml);
+            if (parseHostsYaml(a, yaml)) |hosts| {
+                for (hosts.items) |h| {
+                    if (std.ascii.eqlIgnoreCase(h.hostname, canonical)) {
+                        maybe_host_cfg = h;
+                        break;
+                    }
+                }
+            } else |_| {}
+        }
+    }
+
+    if (specific_user) |wanted_user| {
+        var canonical_user: []const u8 = wanted_user;
+        var is_active = false;
+
+        if (maybe_host_cfg) |h| {
+            for (h.users.items) |u| {
+                if (std.ascii.eqlIgnoreCase(u.username, wanted_user)) {
+                    canonical_user = u.username;
+                    break;
+                }
+            }
+            if (h.active_user) |active| {
+                if (std.ascii.eqlIgnoreCase(active, canonical_user)) {
+                    is_active = true;
+                }
+            }
+        }
+
+        if (resolveUserToken(gpa, store, service, canonical_user, is_active, null, null)) |tok| {
+            errdefer {
+                std.crypto.secureZero(u8, tok);
+                gpa.free(tok);
+            }
+            return .{
+                .username = try gpa.dupe(u8, canonical_user),
+                .token = tok,
+                .from_env = false,
+                .stored_in_keyring = true,
+            };
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        }
+
+        if (!std.mem.eql(u8, canonical_user, wanted_user)) {
+            if (store.get(gpa, service, wanted_user)) |tok| {
+                if (tok.len > 0) {
+                    errdefer {
+                        std.crypto.secureZero(u8, tok);
+                        gpa.free(tok);
+                    }
+                    return .{
+                        .username = try gpa.dupe(u8, wanted_user),
+                        .token = tok,
+                        .from_env = false,
+                        .stored_in_keyring = true,
+                    };
+                }
+                gpa.free(tok);
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    if (maybe_host_cfg) |h| {
+        if (h.active_user) |active| {
+            const trimmed_active = std.mem.trim(u8, active, " \t\r\n");
+            if (trimmed_active.len > 0 and !std.ascii.eqlIgnoreCase(trimmed_active, token_username)) {
+                if (resolveUserToken(gpa, store, service, trimmed_active, true, null, null)) |tok| {
+                    errdefer {
+                        std.crypto.secureZero(u8, tok);
+                        gpa.free(tok);
+                    }
+                    return .{
+                        .username = try gpa.dupe(u8, trimmed_active),
+                        .token = tok,
+                        .from_env = false,
+                        .stored_in_keyring = true,
+                    };
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                }
+            }
+        }
+
+        for (h.users.items) |u| {
+            const trimmed_u = std.mem.trim(u8, u.username, " \t\r\n");
+            if (trimmed_u.len == 0 or std.ascii.eqlIgnoreCase(trimmed_u, token_username)) continue;
+            if (h.active_user) |active| {
+                if (std.ascii.eqlIgnoreCase(trimmed_u, active)) continue;
+            }
+            if (store.get(gpa, service, trimmed_u)) |tok| {
+                if (tok.len > 0) {
+                    errdefer {
+                        std.crypto.secureZero(u8, tok);
+                        gpa.free(tok);
+                    }
+                    return .{
+                        .username = try gpa.dupe(u8, trimmed_u),
+                        .token = tok,
+                        .from_env = false,
+                        .stored_in_keyring = true,
+                    };
+                }
+                gpa.free(tok);
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {},
+            }
+        }
     }
 
     return null;
@@ -3704,4 +3859,67 @@ test "liveGetUserResponseWithToken maps 5xx and 429 to NetworkFailure, 401 to Au
         error.NetworkFailure,
         liveGetUserResponseWithToken(gpa, url, "gho_test"),
     );
+}
+
+test "lookupStoredKeyringCredential ignores GH_TOKEN, plaintext hosts.yml tokens, and synthetic usernames" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(Io.Threaded.global_single_threaded.io(), &root_buf);
+    const config_dir = try std.fs.path.join(gpa, &.{ root_buf[0..root_len], "gh" });
+    defer gpa.free(config_dir);
+
+    FakeStore.reset(gpa);
+    defer FakeStore.reset(gpa);
+
+    secret_store_override = FakeStore.store;
+    defer secret_store_override = null;
+    gh_config_dir_override = config_dir;
+    defer gh_config_dir_override = null;
+    env_override_fn = struct {
+        fn get(name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "GH_TOKEN")) return "ghp_shadow_env_token";
+            if (std.mem.eql(u8, name, "GITHUB_TOKEN")) return "ghp_shadow_github_token";
+            return null;
+        }
+    }.get;
+    defer env_override_fn = null;
+
+    // 1. Without hosts.yml, an anonymous `""` mirror slot must NOT synthesize `x-access-token`, and GH_TOKEN is ignored.
+    try FakeStore.set(gpa, "gh:github.com", "", "gho_anonymous_mirror");
+    try std.testing.expect((try lookupStoredKeyringCredential(gpa, "github.com", null)) == null);
+
+    // 2. Plaintext-only `hosts.yml` token (no keyring entry for `bob`, even if `active_user` is missing) is NOT returned.
+    FakeStore.reset(gpa);
+    try writePrivateFile(config_dir, hosts_filename,
+        \\github.com:
+        \\    git_protocol: https
+        \\    users:
+        \\        Alice:
+        \\            oauth_token: gho_plaintext_only
+        \\    user: Alice
+        \\    oauth_token: gho_plaintext_only
+        \\
+    );
+    try std.testing.expect((try lookupStoredKeyringCredential(gpa, "github.com", null)) == null);
+    try std.testing.expect((try lookupStoredKeyringCredential(gpa, "github.com", "alice")) == null);
+
+    // 3. Keyring-backed token for `Alice` (and case-insensitive `alice`) succeeds even while `GH_TOKEN=ghp_...` is set!
+    try FakeStore.set(gpa, "gh:github.com", "Alice", "gho_keyring_secret");
+    {
+        const cred = (try lookupStoredKeyringCredential(gpa, "github.com", null)).?;
+        defer cred.deinit(gpa);
+        try std.testing.expectEqualStrings("Alice", cred.username);
+        try std.testing.expectEqualStrings("gho_keyring_secret", cred.token);
+        try std.testing.expect(!cred.from_env);
+        try std.testing.expect(cred.stored_in_keyring);
+    }
+    {
+        const cred = (try lookupStoredKeyringCredential(gpa, "github.com", "alice")).?;
+        defer cred.deinit(gpa);
+        try std.testing.expectEqualStrings("Alice", cred.username);
+        try std.testing.expectEqualStrings("gho_keyring_secret", cred.token);
+    }
 }

@@ -12,8 +12,8 @@ esac
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BIN="${KEYRING_BIN:-$ROOT_DIR/zig-out/bin/keyring}"
 
-if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-  exec dbus-run-session -- "$0"
+if [ "${KEYRING_WEBAUTHN_ISOLATED_BUS:-0}" != "1" ]; then
+  exec env KEYRING_WEBAUTHN_ISOLATED_BUS=1 dbus-run-session -- "$0" "$@"
 fi
 
 [ -x "$BIN" ] || {
@@ -256,21 +256,28 @@ printf '%s\n' "$RECOVERY_KEY" | "$BIN" unlock --recover
 TEST_XDG_DATA="$TEST_DIR/xdg-data"
 TEST_XDG_CONFIG="$TEST_DIR/xdg-config"
 TEST_XDG_RUNTIME="$TEST_DIR/xdg-runtime"
+MOCK_BIN="$TEST_DIR/mock-bin"
 COPILOT_DIR="$TEST_DIR/copilot"
 COPILOT_CONFIG="$COPILOT_DIR/config.json"
 DBUS_SERVICE_FILE="$TEST_XDG_DATA/dbus-1/services/org.freedesktop.secrets.service"
 SYSTEMD_UNIT_FILE="$TEST_XDG_CONFIG/systemd/user/keyring.service"
-mkdir -p "$TEST_XDG_DATA" "$TEST_XDG_CONFIG" "$TEST_XDG_RUNTIME" "$COPILOT_DIR"
+mkdir -p "$TEST_XDG_DATA" "$TEST_XDG_CONFIG" "$TEST_XDG_RUNTIME" "$MOCK_BIN" "$COPILOT_DIR"
+
+cat >"$MOCK_BIN/systemctl" <<'SH'
+#!/usr/bin/env sh
+exit 0
+SH
+chmod +x "$MOCK_BIN/systemctl"
 
 SERVICE_STATUS="$(NO_COLOR=1 XDG_DATA_HOME="$TEST_XDG_DATA" XDG_CONFIG_HOME="$TEST_XDG_CONFIG" XDG_RUNTIME_DIR="$TEST_XDG_RUNTIME" "$BIN" service status 2>&1)" || fail "keyring service status failed"
 printf '%s\n' "$SERVICE_STATUS" | grep -Fqi 'enrolled' || fail "service status did not report enrolled: $SERVICE_STATUS"
 printf '%s\n' "$SERVICE_STATUS" | grep -Fqi 'running (unlocked' || fail "service status did not report running (unlocked): $SERVICE_STATUS"
 
-XDG_DATA_HOME="$TEST_XDG_DATA" XDG_CONFIG_HOME="$TEST_XDG_CONFIG" XDG_RUNTIME_DIR="$TEST_XDG_RUNTIME" "$BIN" service install >/dev/null || fail "keyring service install failed"
+PATH="$MOCK_BIN:$PATH" XDG_DATA_HOME="$TEST_XDG_DATA" XDG_CONFIG_HOME="$TEST_XDG_CONFIG" XDG_RUNTIME_DIR="$TEST_XDG_RUNTIME" "$BIN" service install >/dev/null || fail "keyring service install failed"
 [ -f "$DBUS_SERVICE_FILE" ] || fail "service install did not write $DBUS_SERVICE_FILE"
 [ -f "$SYSTEMD_UNIT_FILE" ] || fail "service install did not write $SYSTEMD_UNIT_FILE"
 
-XDG_DATA_HOME="$TEST_XDG_DATA" XDG_CONFIG_HOME="$TEST_XDG_CONFIG" XDG_RUNTIME_DIR="$TEST_XDG_RUNTIME" "$BIN" service uninstall >/dev/null || fail "keyring service uninstall failed"
+PATH="$MOCK_BIN:$PATH" XDG_DATA_HOME="$TEST_XDG_DATA" XDG_CONFIG_HOME="$TEST_XDG_CONFIG" XDG_RUNTIME_DIR="$TEST_XDG_RUNTIME" "$BIN" service uninstall >/dev/null || fail "keyring service uninstall failed"
 [ ! -e "$DBUS_SERVICE_FILE" ] || fail "service uninstall did not remove $DBUS_SERVICE_FILE"
 [ ! -e "$SYSTEMD_UNIT_FILE" ] || fail "service uninstall did not remove $SYSTEMD_UNIT_FILE"
 

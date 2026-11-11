@@ -201,6 +201,16 @@ pub const ServiceState = struct {
         self.unlocked = false;
     }
 
+    pub fn checkIdleTimeout(self: *ServiceState, now_sec: u64, last_activity_sec: u64, timeout_seconds: ?u32) bool {
+        if (!self.unlocked) return false;
+        const t = timeout_seconds orelse return false;
+        if (now_sec >= last_activity_sec +| @as(u64, t)) {
+            self.lockAll();
+            return true;
+        }
+        return false;
+    }
+
     fn clearItems(self: *ServiceState) void {
         for (self.items.items) |*item| deinitItem(self.gpa, item);
         self.items.clearRetainingCapacity();
@@ -398,15 +408,11 @@ pub const ServiceState = struct {
             var r = wire.Reader.init(call.body);
             const name = r.readString() catch return DispatchError.InvalidArgs;
             const collection = r.readObjectPath() catch return DispatchError.InvalidArgs;
-            if (collection.len == 0 or collection[0] != '/') return DispatchError.InvalidArgs;
-            if (!std.mem.eql(u8, collection, "/") and !isCollectionPath(collection)) {
-                return DispatchError.NoSuchObject;
-            }
-            if (name.len == 0) return DispatchError.InvalidArgs;
-            if (std.mem.eql(u8, name, "default") or std.mem.eql(u8, collection, "/")) {
-                return self.emptyReply(call);
-            }
-            return DispatchError.NotSupported;
+            if (name.len == 0 or collection.len == 0 or collection[0] != '/') return DispatchError.InvalidArgs;
+            if (!std.mem.eql(u8, name, "default")) return DispatchError.NotSupported;
+            if (isCollectionPath(collection)) return self.emptyReply(call);
+            if (std.mem.eql(u8, collection, "/")) return DispatchError.NotSupported;
+            return DispatchError.NoSuchObject;
         }
         if (std.mem.eql(u8, member, "CreateCollection")) {
             var r = wire.Reader.init(call.body);
@@ -1558,7 +1564,7 @@ pub fn resolveServicePathsFromDirs(
 ) !ServicePaths {
     const dbus_service_path = blk: {
         if (xdg_data_home) |data_dir| {
-            if (data_dir.len > 0) {
+            if (data_dir.len > 0 and std.fs.path.isAbsolute(data_dir)) {
                 break :blk try std.fs.path.join(gpa, &.{ data_dir, "dbus-1", "services", "org.freedesktop.secrets.service" });
             }
         }
@@ -1570,7 +1576,7 @@ pub fn resolveServicePathsFromDirs(
 
     const systemd_unit_path = blk: {
         if (xdg_config_home) |config_dir| {
-            if (config_dir.len > 0) {
+            if (config_dir.len > 0 and std.fs.path.isAbsolute(config_dir)) {
                 break :blk try std.fs.path.join(gpa, &.{ config_dir, "systemd", "user", "keyring.service" });
             }
         }
@@ -2053,9 +2059,9 @@ fn writeUnitInstallStatus(
     }
 }
 
-pub fn runDaemon(gpa: Allocator, replace: bool) !void {
+pub fn runDaemon(gpa: Allocator, replace: bool, lock_timeout_seconds: ?u32) !void {
     if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
-    return Linux.runDaemon(gpa, replace);
+    return Linux.runDaemon(gpa, replace, lock_timeout_seconds);
 }
 
 pub fn clientUnlockWithMasterKey(gpa: Allocator, master_key_value: [vault.dek_len]u8) !bool {
@@ -2077,7 +2083,7 @@ const Linux = if (builtin.os.tag == .linux) struct {
     const linux = std.os.linux;
     const connection = dbus.connection;
 
-    fn runDaemon(gpa: Allocator, replace: bool) !void {
+    fn runDaemon(gpa: Allocator, replace: bool, lock_timeout_seconds: ?u32) !void {
         var conn = try connection.connectSession(gpa);
         defer conn.deinit();
 
@@ -2103,7 +2109,26 @@ const Linux = if (builtin.os.tag == .linux) struct {
         var state = try ServiceState.init(gpa);
         defer state.deinit();
         state.next_serial = conn.next_serial;
+        var last_activity_sec: u64 = unixNow();
         while (true) {
+            if (state.unlocked) {
+                if (lock_timeout_seconds) |timeout_s| {
+                    const now = unixNow();
+                    if (state.checkIdleTimeout(now, last_activity_sec, timeout_s)) {
+                        continue;
+                    }
+                    const deadline = last_activity_sec +| @as(u64, timeout_s);
+                    const rem_sec = deadline - now;
+                    const timeout_ms: i32 = @intCast(@min(rem_sec *| 1000, @as(u64, std.math.maxInt(i32))));
+                    var pfd = [1]std.posix.pollfd{.{
+                        .fd = conn.fd,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    }};
+                    const ready = std.posix.poll(&pfd, timeout_ms) catch return error.ReadFailed;
+                    if (ready == 0) continue;
+                }
+            }
             const frame = try readFrame(gpa, conn.fd);
             defer {
                 std.crypto.secureZero(u8, frame);
@@ -2116,9 +2141,11 @@ const Linux = if (builtin.os.tag == .linux) struct {
                 const for_unique = conn.unique_name != null and std.mem.eql(u8, destination, conn.unique_name.?);
                 if (!for_service and !for_unique) continue;
             }
+            _ = state.checkIdleTimeout(unixNow(), last_activity_sec, lock_timeout_seconds);
             var outbound = try state.handleMessage(parsed);
             defer outbound.deinit();
             for (outbound.frames.items) |response| try writeAll(conn.fd, response);
+            last_activity_sec = unixNow();
         }
     }
 
@@ -2201,18 +2228,18 @@ const Linux = if (builtin.os.tag == .linux) struct {
             .destination = "org.freedesktop.DBus",
             .path = "/org/freedesktop/DBus",
             .interface = "org.freedesktop.DBus",
-            .member = "NameHasOwner",
+            .member = "GetNameOwner",
             .signature = "s",
             .body = owner_body.items,
         }) catch return null;
         defer owner_reply.deinit();
         if (owner_reply.err != null) return null;
         var owner_reader = wire.Reader.init(owner_reply.body);
-        const has_owner = owner_reader.readBool() catch return null;
-        if (!has_owner) return null;
+        const owner_unique_name = owner_reader.readString() catch return null;
+        if (owner_unique_name.len == 0) return null;
 
         var reply = connection.call(&conn, .{
-            .destination = service_destination,
+            .destination = owner_unique_name,
             .path = service_path,
             .interface = control_interface,
             .member = "GetStatus",
@@ -2995,7 +3022,7 @@ test "zbus secret-service Copilot CLI flow: empty-interface Properties, SetAlias
         var r = wire.Reader.init(reply.body);
         try std.testing.expectEqualStrings(collection_path, try r.readObjectPath());
     }
-    for ([_][]const u8{ collection_path, collection_alias_path, "/" }) |target| {
+    for ([_][]const u8{ collection_path, collection_alias_path }) |target| {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(gpa);
         var w = wire.Writer.init(gpa, &body);
@@ -3005,6 +3032,17 @@ test "zbus secret-service Copilot CLI flow: empty-interface Properties, SetAlias
         defer out.deinit();
         const reply = try expectReplyType(&out, .method_return);
         try std.testing.expectEqual(@as(usize, 0), reply.body.len);
+    }
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString("default");
+        try w.writeObjectPath("/");
+        var out = try testDispatch(&state, service_path, service_interface, "SetAlias", "so", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .error_reply);
+        try std.testing.expectEqualStrings("org.freedesktop.DBus.Error.NotSupported", reply.header.error_name.?);
     }
     {
         var body: std.ArrayList(u8) = .empty;
@@ -3486,10 +3524,76 @@ test "service install, status, foreign-unit protection, and uninstall lifecycle"
     }
 }
 
+test "ServiceState.checkIdleTimeout locks at deadline and SetAlias rejects clearing default or custom aliases" {
+    const gpa = std.testing.allocator;
+    var state = try ServiceState.init(gpa);
+    defer state.deinit();
+
+    // Simulate unlocked state with a dummy DEK.
+    state.unlocked = true;
+    state.dek = @splat(0xAB);
+
+    // No timeout configured -> stays unlocked.
+    try std.testing.expect(!state.checkIdleTimeout(1_000, 100, null));
+    try std.testing.expect(state.unlocked);
+
+    // Before deadline (`100 + 60 = 160`) -> stays unlocked.
+    try std.testing.expect(!state.checkIdleTimeout(159, 100, 60));
+    try std.testing.expect(state.unlocked);
+
+    // At deadline (`160 >= 160`) -> locks and zeroes DEK.
+    try std.testing.expect(state.checkIdleTimeout(160, 100, 60));
+    try std.testing.expect(!state.unlocked);
+    try std.testing.expect(state.dek == null);
+
+    // Once locked, subsequent checks return false.
+    try std.testing.expect(!state.checkIdleTimeout(500, 100, 60));
+
+    // SetAlias("default", "/") -> NotSupported; SetAlias("login", collection_path) -> NotSupported.
+    for ([_]struct { name: []const u8, target: []const u8 }{
+        .{ .name = "default", .target = "/" },
+        .{ .name = "login", .target = collection_path },
+        .{ .name = "login", .target = "/" },
+    }) |tc| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString(tc.name);
+        try w.writeObjectPath(tc.target);
+        var out = try testDispatch(&state, service_path, service_interface, "SetAlias", "so", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .error_reply);
+        try std.testing.expectEqualStrings("org.freedesktop.DBus.Error.NotSupported", reply.header.error_name.?);
+    }
+}
+
+test "resolveServicePathsFromDirs ignores relative XDG_DATA_HOME and XDG_CONFIG_HOME" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const home_dir = try std.fs.path.join(gpa, &.{ root, "home" });
+    defer gpa.free(home_dir);
+    const expected_dbus = try std.fs.path.join(gpa, &.{ home_dir, ".local", "share", "dbus-1", "services", "org.freedesktop.secrets.service" });
+    defer gpa.free(expected_dbus);
+    const expected_systemd = try std.fs.path.join(gpa, &.{ home_dir, ".config", "systemd", "user", "keyring.service" });
+    defer gpa.free(expected_systemd);
+
+    var rel_paths = try resolveServicePathsFromDirs(gpa, home_dir, "relative/xdg-data", "./relative-config");
+    defer rel_paths.deinit(gpa);
+    try std.testing.expectEqualStrings(expected_dbus, rel_paths.dbus_service_path);
+    try std.testing.expectEqualStrings(expected_systemd, rel_paths.systemd_unit_path);
+}
+
 test "non-Linux daemon and client helpers report unsupported platform" {
     if (builtin.os.tag == .linux) return;
     const gpa = std.testing.allocator;
-    try std.testing.expectError(error.UnsupportedPlatform, runDaemon(gpa, false));
+    try std.testing.expectError(error.UnsupportedPlatform, runDaemon(gpa, false, null));
     try std.testing.expectError(error.UnsupportedPlatform, clientUnlockWithMasterKey(gpa, @splat(0)));
     try std.testing.expectError(error.UnsupportedPlatform, clientLockAll(gpa));
     try std.testing.expectError(error.UnsupportedPlatform, clientGetStatus(gpa));
@@ -3525,7 +3629,7 @@ test "Linux daemon and client entry points compile" {
     const gpa = std.testing.allocator;
     const now = std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).toSeconds();
     if (now == std.math.minInt(i64)) {
-        try runDaemon(gpa, false);
+        try runDaemon(gpa, false, null);
         var stdout = std.Io.Writer.Allocating.init(gpa);
         defer stdout.deinit();
         var stderr = std.Io.Writer.Allocating.init(gpa);

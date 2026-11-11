@@ -30,6 +30,10 @@ keyring lock                     # immediately clear the in-memory master key
 keyring gh login --hostname example.ghe.com
 keyring git config --hostname example.ghe.com
 
+# Podman Desktop and Podman CLI registry authentication (GHCR, ACR, Docker Hub, generic):
+keyring podman login ghcr.io myregistry.azurecr.io
+keyring podman status
+
 # WSL Container CLI (wslc) registry authentication (GHCR, ACR, and generic registries):
 keyring wslc login ghcr.io myregistry.azurecr.io
 keyring wslc status
@@ -40,6 +44,7 @@ Use `keyring enroll --add-key`, `--list`, and `--revoke <id>` for multiple authe
 ## Documentation
 
 - [Usage](doc/usage.md) — commands, options, and backends
+- [Podman Desktop and Podman](doc/podman.md)
 - [Environment variables](doc/environment-variables.md)
 - [Azure DevOps feeds](doc/azure-devops.md) — the `ado` backend, token caching, and `az login` SSO
 - [Headless Linux](doc/headless-linux.md)

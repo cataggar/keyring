@@ -13,6 +13,8 @@ const vault = @import("vault.zig");
 const webauthn = @import("webauthn.zig");
 const tunnel_http = @import("tunnel_http.zig");
 const service = @import("service.zig");
+const registry_auth = @import("registry_auth.zig");
+const podman = @import("podman.zig");
 const wslc = @import("wslc.zig");
 
 test {
@@ -22,6 +24,8 @@ test {
     _ = webauthn;
     _ = tunnel_http;
     _ = service;
+    _ = registry_auth;
+    _ = podman;
     _ = wslc;
 }
 
@@ -56,6 +60,11 @@ const usage =
     \\  git credential <op>           Git credential helper protocol (get, store, erase).
     \\  git config [options]          Configure Git to use keyring as its credential helper.
     \\  devops-npm [options]          Authenticate Azure DevOps npm feeds in .npmrc.
+    \\  podman login [options] [<srv>] Authenticate container registries for Podman Desktop and Podman.
+    \\  podman config <server>...     Configure Podman credHelpers without writing secrets to auth.json.
+    \\  podman logout [<srv>...|--all] Remove registry credentials from Podman auth.json and keyring.
+    \\  podman status                 Show Podman auth.json, helper PATH, and registry status.
+    \\  podman credential <op>        Docker/Podman credential helper protocol (get, store, erase, list, version).
     \\  wslc login [options] [<srv>]  Authenticate container registries for wslc (GHCR, ACR, generic).
     \\  wslc logout <server>...       Remove registry credentials from wslc storage.
     \\  wslc status                   Show wslc credential store status and configured registries.
@@ -115,6 +124,7 @@ pub const Command = union(enum) {
     git_credential: git_credential.Operation,
     git_config: git_credential.ConfigOptions,
     devops_npm: devops_npm.Options,
+    podman: podman.Subcommand,
     wslc: wslc.Subcommand,
     usage_error: []const u8,
 };
@@ -320,8 +330,15 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
         .devops_npm => |opts| code: {
             break :code try devops_npm.run(arena, io, opts, stdout, stderr);
         },
+        .podman => |subcmd| code: {
+            var stdin_buffer: [4096]u8 = undefined;
+            defer std.crypto.secureZero(u8, &stdin_buffer);
+            var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+            break :code try podman.run(arena, subcmd, &stdin_reader.interface, stdout, stderr);
+        },
         .wslc => |subcmd| code: {
             var stdin_buffer: [4096]u8 = undefined;
+            defer std.crypto.secureZero(u8, &stdin_buffer);
             var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
             break :code try wslc.run(arena, subcmd, &stdin_reader.interface, stdout, stderr);
         },
@@ -343,6 +360,16 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
             }
         }
         parsed.command = .{ .usage_error = "usage: git-credential-keyring <get|store|erase>" };
+        return parsed;
+    }
+    if (args.len >= 1 and podman.isDockerCredentialArgv0(args[0])) {
+        if (args.len == 2) {
+            if (registry_auth.HelperOperation.fromString(args[1])) |op| {
+                parsed.command = .{ .podman = .{ .credential = op } };
+                return parsed;
+            }
+        }
+        parsed.command = .{ .usage_error = "usage: docker-credential-keyring <get|store|erase|list|version>" };
         return parsed;
     }
     if (args.len < 2) return parsed;
@@ -490,6 +517,14 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
             .{ .devops_npm = opts }
         else
             .{ .usage_error = "usage: keyring devops-npm [-c <path>] [-f|--force] [--validate-only]" };
+        return parsed;
+    }
+
+    if (std.mem.eql(u8, command, "podman")) {
+        parsed.command = if (podman.parseArgs(rest)) |subcmd|
+            .{ .podman = subcmd }
+        else
+            .{ .usage_error = "usage: keyring podman <login [<server>...] [-u <user>] [--password-stdin] [-f|--force] [--helper-only|--auths-only] [--authfile <path>] | config <server>... [--authfile <path>] | logout [<server>...|--all] [--authfile <path>] | status [--authfile <path>] | credential <get|store|erase|list|version>>" };
         return parsed;
     }
 
@@ -1072,6 +1107,7 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     msal_cache.diagnose(arena, stdout) catch {};
     ado.diagnoseCache(arena, stdout) catch {};
     gh.diagnoseHosts(arena, stdout) catch {};
+    podman.diagnose(arena, stdout) catch {};
     wslc.diagnose(arena, stdout) catch {};
     try stdout.flush();
 }

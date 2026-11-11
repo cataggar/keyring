@@ -68,6 +68,13 @@ keyring devops-npm
 keyring devops-npm -c path/to/.npmrc -f
 keyring devops-npm --validate-only
 
+# Authenticate container registries for Podman Desktop and Podman CLI.
+keyring podman login ghcr.io myregistry.azurecr.io
+keyring podman login -f
+keyring podman config ghcr.io myregistry.azurecr.io
+keyring podman status
+keyring podman logout myregistry.azurecr.io
+
 # Authenticate container registries for wslc (GHCR, Azure Container Registry, generic).
 keyring wslc login ghcr.io myregistry.azurecr.io
 keyring wslc login -f
@@ -107,6 +114,18 @@ only the current repository; when multiple scope flags are given, the last wins.
 - `keyring wslc logout <server>...` removes the selected registry entry from `wslc` storage without revoking shared `gh` or Entra tokens.
 - `keyring wslc status` reports `wslc`'s `settings.yaml` path, active `credentialStore` mode, and configured registries (including ACR JWT expiration status).
 - `keyring wslc credential <get|store|erase>` provides a strictly noninteractive credential-helper protocol endpoint over `stdin`/`stdout`.
+
+## Podman Desktop and Podman (`keyring podman`)
+
+`keyring podman` and `docker-credential-keyring` authenticate **Podman Desktop** and **Podman CLI** (`podman`, `podman.exe`, `buildah`, `skopeo`) across GitHub Container Registry (`ghcr.io`, `containers.<tenant>.ghe.com`, `docker.<ghes>`), Azure Container Registry (`*.azurecr.io`), Docker Hub (`docker.io`), and generic OCI registries:
+
+- `keyring podman login [<server>...] [-u|--username <user>] [--password-stdin] [-f|--force] [--helper-only | --auths-only] [--authfile <path>]` writes both `"auths"` (required by Podman Desktop) and `"credHelpers"` (checked first by Podman CLI for dynamic token refresh) to `auth.json` by default, provisions `docker-credential-keyring` onto `PATH`, and refreshes all configured bare registries when called with no `<server>` arguments. Use `--helper-only` to omit `"auths"` secrets or `--auths-only` to skip `"credHelpers"`.
+- `keyring podman config <server>... [--authfile <path>]` registers `"credHelpers": { "<host>": "keyring" }` and provisions `docker-credential-keyring` on `PATH` without writing secrets to `auth.json`.
+- `keyring podman logout [<server>...] [--all] [--authfile <path>]` removes matching `"auths"` and owned `"credHelpers"` entries from `auth.json` (and deletes stored generic registry credentials) without revoking shared `gh` or Entra tokens.
+- `keyring podman status [--authfile <path>]` reports `auth.json` paths, `docker-credential-keyring` `PATH` status, configured registries, and ACR JWT expiration status.
+- `keyring podman credential <get|store|erase|list|version>` (or invoking `docker-credential-keyring`) speaks the noninteractive Docker credential-helper protocol over `stdin`/`stdout`.
+
+See [Podman Desktop and Podman](podman.md) for Windows WinGet + WSL 2 setup, platform `auth.json` paths, `ghr` helper provisioning, and Podman Desktop file-watcher notes.
 
 See also [Environment variables](environment-variables.md) and
 [Exit codes](exit-codes.md).

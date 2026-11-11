@@ -40,6 +40,10 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const helper_name = if (target.result.os.tag == .windows) "docker-credential-keyring.exe" else "docker-credential-keyring";
+    const install_helper = b.addInstallBinFile(exe.getEmittedBin(), helper_name);
+    b.getInstallStep().dependOn(&install_helper.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();

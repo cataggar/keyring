@@ -253,4 +253,60 @@ wait "$UNLOCK_PID" || fail "keyring unlock failed"
 printf '%s\n' "$RECOVERY_KEY" | "$BIN" unlock --recover
 [ "$("$BIN" get test-svc test-user)" = "integration-secret" ] || fail "recovery unlock did not restore access"
 
+TEST_XDG_DATA="$TEST_DIR/xdg-data"
+TEST_XDG_CONFIG="$TEST_DIR/xdg-config"
+TEST_XDG_RUNTIME="$TEST_DIR/xdg-runtime"
+COPILOT_DIR="$TEST_DIR/copilot"
+COPILOT_CONFIG="$COPILOT_DIR/config.json"
+DBUS_SERVICE_FILE="$TEST_XDG_DATA/dbus-1/services/org.freedesktop.secrets.service"
+SYSTEMD_UNIT_FILE="$TEST_XDG_CONFIG/systemd/user/keyring.service"
+mkdir -p "$TEST_XDG_DATA" "$TEST_XDG_CONFIG" "$TEST_XDG_RUNTIME" "$COPILOT_DIR"
+
+SERVICE_STATUS="$(NO_COLOR=1 XDG_DATA_HOME="$TEST_XDG_DATA" XDG_CONFIG_HOME="$TEST_XDG_CONFIG" XDG_RUNTIME_DIR="$TEST_XDG_RUNTIME" "$BIN" service status 2>&1)" || fail "keyring service status failed"
+printf '%s\n' "$SERVICE_STATUS" | grep -Fqi 'enrolled' || fail "service status did not report enrolled: $SERVICE_STATUS"
+printf '%s\n' "$SERVICE_STATUS" | grep -Fqi 'running (unlocked)' || fail "service status did not report running (unlocked): $SERVICE_STATUS"
+
+XDG_DATA_HOME="$TEST_XDG_DATA" XDG_CONFIG_HOME="$TEST_XDG_CONFIG" XDG_RUNTIME_DIR="$TEST_XDG_RUNTIME" "$BIN" service install >/dev/null || fail "keyring service install failed"
+[ -f "$DBUS_SERVICE_FILE" ] || fail "service install did not write $DBUS_SERVICE_FILE"
+[ -f "$SYSTEMD_UNIT_FILE" ] || fail "service install did not write $SYSTEMD_UNIT_FILE"
+
+XDG_DATA_HOME="$TEST_XDG_DATA" XDG_CONFIG_HOME="$TEST_XDG_CONFIG" XDG_RUNTIME_DIR="$TEST_XDG_RUNTIME" "$BIN" service uninstall >/dev/null || fail "keyring service uninstall failed"
+[ ! -e "$DBUS_SERVICE_FILE" ] || fail "service uninstall did not remove $DBUS_SERVICE_FILE"
+[ ! -e "$SYSTEMD_UNIT_FILE" ] || fail "service uninstall did not remove $SYSTEMD_UNIT_FILE"
+
+cat >"$COPILOT_CONFIG" <<'JSON'
+// Sample Copilot CLI config with leading JSONC comment
+{
+  "loggedInUsers": [
+    {
+      "host": "https://github.com",
+      "login": "alice"
+    }
+  ],
+  "lastLoggedInUser": {
+    "host": "https://github.com",
+    "login": "alice"
+  },
+  "copilotTokens": {
+    "https://github.com:alice": "gho_test_copilot_secret"
+  },
+  "trustedFolders": [
+    "/tmp/work"
+  ]
+}
+JSON
+
+COPILOT_HOME="$TEST_DIR/copilot" "$BIN" copilot import >/dev/null || fail "keyring copilot import failed"
+! grep -Fq 'gho_test_copilot_secret' "$COPILOT_CONFIG" || fail "copilot import did not scrub secret from config.json"
+grep -Fq '"trustedFolders"' "$COPILOT_CONFIG" || fail "copilot import did not preserve trustedFolders"
+grep -Fq '/tmp/work' "$COPILOT_CONFIG" || fail "copilot import did not preserve trustedFolders value"
+
+[ "$(COPILOT_HOME="$TEST_DIR/copilot" "$BIN" copilot token)" = "gho_test_copilot_secret" ] || fail "copilot token output mismatch"
+[ "$("$BIN" get copilot-cli "https://github.com:alice")" = "gho_test_copilot_secret" ] || fail "keyring get copilot-cli output mismatch"
+[ "$(COPILOT_HOME="$TEST_DIR/copilot" "$BIN" copilot env --shell sh)" = "export COPILOT_GITHUB_TOKEN='gho_test_copilot_secret'" ] || fail "copilot env --shell sh output mismatch"
+
+COPILOT_STATUS="$(NO_COLOR=1 COPILOT_HOME="$TEST_DIR/copilot" "$BIN" copilot status 2>&1)" || fail "keyring copilot status failed"
+printf '%s\n' "$COPILOT_STATUS" | grep -Fq 'alice' || fail "copilot status did not report alice: $COPILOT_STATUS"
+printf '%s\n' "$COPILOT_STATUS" | grep -Fqi 'keyring' || fail "copilot status did not report keyring storage: $COPILOT_STATUS"
+
 echo "PASS: WebAuthn enrollment, browser unlock, recovery unlock, and Secret Service round-trip"

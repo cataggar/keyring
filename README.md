@@ -21,10 +21,15 @@ keyring del my-service alice     # delete it; exits 3 when not found
 keyring diagnose                 # report the resolved backend and its health
 
 # Headless Linux with a local browser and security key:
-keyring service                  # start the provider in its locked state
+keyring service install          # install D-Bus activation and systemd user unit
 keyring enroll                   # enroll a YubiKey and print a Recovery Key
 keyring unlock                   # unlock through the browser/SSH tunnel
 keyring lock                     # immediately clear the in-memory master key
+
+# GitHub Copilot CLI secure storage (Windows, macOS, Linux, and WSL):
+keyring copilot login            # store token in native OS keyring for copilot
+keyring copilot import           # migrate plaintext ~/.copilot/config.json tokens
+eval "$(keyring copilot env)"    # export COPILOT_GITHUB_TOKEN (e.g. WSL via ghr link)
 
 # Git credential helper for github.com, *.ghe.com, GHES, and Azure DevOps:
 keyring gh login --hostname example.ghe.com
@@ -44,6 +49,7 @@ Use `keyring enroll --add-key`, `--list`, and `--revoke <id>` for multiple authe
 ## Documentation
 
 - [Usage](doc/usage.md) — commands, options, and backends
+- [GitHub Copilot CLI](doc/copilot.md)
 - [Podman Desktop and Podman](doc/podman.md)
 - [Environment variables](doc/environment-variables.md)
 - [Azure DevOps feeds](doc/azure-devops.md) — the `ado` backend, token caching, and `az login` SSO

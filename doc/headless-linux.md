@@ -15,16 +15,30 @@ Requirements:
 - A browser supporting the WebAuthn `prf` extension.
 - A D-Bus session bus on the remote Linux account.
 
-Start the provider on the remote machine:
+For persistent login sessions, install the managed D-Bus session activation file and `systemd --user` unit directly:
 
 ```sh
-dbus-run-session -- bash
-keyring service &
+keyring service install
+keyring service status
 ```
 
-For persistent login sessions, install this user unit as `~/.config/systemd/user/keyring.service`:
+`keyring service install [--force]` writes `~/.local/share/dbus-1/services/org.freedesktop.secrets.service` (`$XDG_DATA_HOME/dbus-1/services/org.freedesktop.secrets.service`) and `~/.config/systemd/user/keyring.service` (`$XDG_CONFIG_HOME/systemd/user/keyring.service`) for the resolved `keyring` executable, and enables/starts `keyring.service` automatically when `systemd --user` is available. Pass `--force` to overwrite existing files not managed by `keyring`.
+
+- `keyring service status` reports vault enrollment, D-Bus activation and `systemd --user` unit installation status, and live daemon lock status.
+- `keyring service uninstall [--force]` disables/stops `keyring.service` and removes the managed `systemd --user` unit and D-Bus activation files.
+
+For reference, `keyring service install` generates D-Bus session activation (`~/.local/share/dbus-1/services/org.freedesktop.secrets.service`) and `systemd --user` (`~/.config/systemd/user/keyring.service`) units equivalent to:
 
 ```ini
+# ~/.local/share/dbus-1/services/org.freedesktop.secrets.service
+[D-BUS Service]
+Name=org.freedesktop.secrets
+Exec=/usr/local/bin/keyring service
+SystemdService=keyring.service
+```
+
+```ini
+# ~/.config/systemd/user/keyring.service
 [Unit]
 Description=Keyring Secret Service
 
@@ -36,7 +50,14 @@ Restart=on-failure
 WantedBy=default.target
 ```
 
-Then run `systemctl --user daemon-reload && systemctl --user enable --now keyring.service`.
+In containers or ad-hoc sessions without `systemd --user`, you can also start the daemon directly under `dbus-run-session`:
+
+```sh
+dbus-run-session -- bash
+keyring service &
+```
+
+Pass `--replace` to replace an existing `org.freedesktop.secrets` owner on the session bus, and `--lock-timeout <seconds>` to automatically clear the in-memory vault key after a timeout.
 
 ### Initial enrollment
 
@@ -48,11 +69,12 @@ ssh -L 42317:127.0.0.1:42317 remote.example
 
 Create that tunnel from the machine with the browser and YubiKey, open the printed `http://localhost:42317/#token=...` URL, and approve the registration. Save the one-time Recovery Key in a password manager or other offline location. The token is short-lived and remains in the URL fragment; it is not sent in HTTP request URLs.
 
-After enrollment, normal Secret Service clients work while the provider is unlocked:
+After enrollment, standard `org.freedesktop.secrets` clients—including GitHub Copilot CLI (`copilot login`, see [GitHub Copilot CLI](copilot.md)), Python `keyring`, and `secret-tool`—work automatically while the provider is unlocked:
 
 ```sh
 keyring set my-service alice
 keyring get my-service alice
+copilot login
 ```
 
 ### Locking and unlocking

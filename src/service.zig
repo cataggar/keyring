@@ -15,6 +15,82 @@ pub const collection_path = "/org/freedesktop/secrets/collection/default";
 pub const collection_alias_path = "/org/freedesktop/secrets/aliases/default";
 pub const prompt_locked_path = "/org/freedesktop/secrets/prompt/locked";
 pub const dh_algorithm = "dh-ietf1024-sha256-aes128-cbc-pkcs7";
+pub const managed_marker = "# Managed by cataggar/keyring";
+
+const unsupported_platform_message = "keyring: built-in service is only supported on Linux\n";
+
+pub const RunOptions = struct {
+    replace: bool = false,
+    lock_timeout_seconds: ?u32 = null,
+};
+
+pub const InstallOptions = struct {
+    force: bool = false,
+};
+
+pub const UninstallOptions = struct {
+    force: bool = false,
+};
+
+pub const Action = union(enum) {
+    run: RunOptions,
+    install: InstallOptions,
+    uninstall: UninstallOptions,
+    status,
+};
+
+pub const ServicePaths = struct {
+    dbus_service_path: []u8,
+    systemd_unit_path: []u8,
+
+    pub fn deinit(self: *ServicePaths, gpa: Allocator) void {
+        gpa.free(self.dbus_service_path);
+        gpa.free(self.systemd_unit_path);
+        self.* = undefined;
+    }
+};
+
+pub fn parseArgs(args: []const []const u8) ?Action {
+    if (args.len > 0) {
+        if (std.mem.eql(u8, args[0], "install")) {
+            var opts: InstallOptions = .{};
+            for (args[1..]) |arg| {
+                if (std.mem.eql(u8, arg, "--force")) {
+                    opts.force = true;
+                } else return null;
+            }
+            return .{ .install = opts };
+        }
+        if (std.mem.eql(u8, args[0], "uninstall")) {
+            var opts: UninstallOptions = .{};
+            for (args[1..]) |arg| {
+                if (std.mem.eql(u8, arg, "--force")) {
+                    opts.force = true;
+                } else return null;
+            }
+            return .{ .uninstall = opts };
+        }
+        if (std.mem.eql(u8, args[0], "status")) {
+            return if (args.len == 1) .status else null;
+        }
+    }
+
+    var opts: RunOptions = .{};
+    var index: usize = 0;
+    while (index < args.len) {
+        if (std.mem.eql(u8, args[index], "--replace")) {
+            opts.replace = true;
+            index += 1;
+        } else if (std.mem.eql(u8, args[index], "--lock-timeout")) {
+            if (index + 1 >= args.len) return null;
+            const parsed = std.fmt.parseInt(u32, args[index + 1], 10) catch return null;
+            if (parsed == 0) return null;
+            opts.lock_timeout_seconds = parsed;
+            index += 2;
+        } else return null;
+    }
+    return .{ .run = opts };
+}
 
 const service_interface = "org.freedesktop.Secret.Service";
 const collection_interface = "org.freedesktop.Secret.Collection";
@@ -123,6 +199,16 @@ pub const ServiceState = struct {
         self.store_id = null;
         self.clearItems();
         self.unlocked = false;
+    }
+
+    pub fn checkIdleTimeout(self: *ServiceState, now_sec: u64, last_activity_sec: u64, timeout_seconds: ?u32) bool {
+        if (!self.unlocked) return false;
+        const t = timeout_seconds orelse return false;
+        if (now_sec >= last_activity_sec +| @as(u64, t)) {
+            self.lockAll();
+            return true;
+        }
+        return false;
     }
 
     fn clearItems(self: *ServiceState) void {
@@ -257,8 +343,8 @@ pub const ServiceState = struct {
     fn dispatch(self: *ServiceState, call: message.Parsed) !OutboundMessages {
         if (call.header.msg_type != .method_call) return DispatchError.InvalidArgs;
         const path = call.header.path orelse return DispatchError.InvalidArgs;
-        const interface = call.header.interface orelse return DispatchError.InvalidArgs;
         const member = call.header.member orelse return DispatchError.InvalidArgs;
+        const interface = call.header.interface orelse (inferInterface(path, member) orelse return DispatchError.NoSuchObject);
 
         if (std.mem.eql(u8, interface, peer_interface)) {
             if (std.mem.eql(u8, member, "Ping")) return self.emptyReply(call);
@@ -317,6 +403,16 @@ pub const ServiceState = struct {
             var w = wire.Writer.init(self.gpa, &body);
             try w.writeObjectPath(path);
             return self.reply(call, "o", body.items);
+        }
+        if (std.mem.eql(u8, member, "SetAlias")) {
+            var r = wire.Reader.init(call.body);
+            const name = r.readString() catch return DispatchError.InvalidArgs;
+            const collection = r.readObjectPath() catch return DispatchError.InvalidArgs;
+            if (name.len == 0 or collection.len == 0 or collection[0] != '/') return DispatchError.InvalidArgs;
+            if (!std.mem.eql(u8, name, "default")) return DispatchError.NotSupported;
+            if (isCollectionPath(collection)) return self.emptyReply(call);
+            if (std.mem.eql(u8, collection, "/")) return DispatchError.NotSupported;
+            return DispatchError.NoSuchObject;
         }
         if (std.mem.eql(u8, member, "CreateCollection")) {
             var r = wire.Reader.init(call.body);
@@ -478,7 +574,7 @@ pub const ServiceState = struct {
         var properties = try readItemProperties(self.gpa, &r);
         defer properties.deinit(self.gpa);
         const encoded_secret = try readSecretTuple(&r);
-        _ = r.readBool() catch return DispatchError.InvalidArgs;
+        const replace = r.readBool() catch return DispatchError.InvalidArgs;
         const session = self.sessionForPath(encoded_secret.session) orelse return DispatchError.NoSuchObject;
         const plaintext = try decodeSecret(self.gpa, encoded_secret, session.*);
         defer {
@@ -488,7 +584,7 @@ pub const ServiceState = struct {
         const now = unixNow();
 
         var existing: ?*ItemRecord = null;
-        if (properties.attributes.count() > 0) {
+        if (replace and properties.attributes.count() > 0) {
             for (self.items.items) |*item| {
                 if (attributesEqual(&item.attributes, &properties.attributes)) {
                     existing = item;
@@ -540,7 +636,10 @@ pub const ServiceState = struct {
         var w = wire.Writer.init(self.gpa, &body);
         try w.writeObjectPath(path);
         try w.writeObjectPath("/");
-        return self.reply(call, "oo", body.items);
+        var out = try self.reply(call, "oo", body.items);
+        errdefer out.deinit();
+        try self.appendCollectionItemSignal(&out, if (existing != null) "ItemChanged" else "ItemCreated", path);
+        return out;
     }
 
     fn handleItem(self: *ServiceState, call: message.Parsed, member: []const u8, item_id: []const u8) !OutboundMessages {
@@ -572,9 +671,16 @@ pub const ServiceState = struct {
             item.modified = unixNow();
             self.modified = item.modified;
             try self.persist();
-            return self.emptyReply(call);
+            const item_path = try itemPathAlloc(self.gpa, item_id);
+            defer self.gpa.free(item_path);
+            var out = try self.emptyReply(call);
+            errdefer out.deinit();
+            try self.appendCollectionItemSignal(&out, "ItemChanged", item_path);
+            return out;
         }
         if (std.mem.eql(u8, member, "Delete")) {
+            const deleted_path = try itemPathAlloc(self.gpa, item_id);
+            defer self.gpa.free(deleted_path);
             var removed = self.items.orderedRemove(index);
             deinitItem(self.gpa, &removed);
             self.modified = unixNow();
@@ -583,7 +689,10 @@ pub const ServiceState = struct {
             defer body.deinit(self.gpa);
             var w = wire.Writer.init(self.gpa, &body);
             try w.writeObjectPath("/");
-            return self.reply(call, "o", body.items);
+            var out = try self.reply(call, "o", body.items);
+            errdefer out.deinit();
+            try self.appendCollectionItemSignal(&out, "ItemDeleted", deleted_path);
+            return out;
         }
         return DispatchError.UnknownMethod;
     }
@@ -643,8 +752,9 @@ pub const ServiceState = struct {
     fn handleProperties(self: *ServiceState, call: message.Parsed, path: []const u8, member: []const u8) !OutboundMessages {
         var r = wire.Reader.init(call.body);
         if (std.mem.eql(u8, member, "Get")) {
-            const interface = r.readString() catch return DispatchError.InvalidArgs;
+            const raw_interface = r.readString() catch return DispatchError.InvalidArgs;
             const property = r.readString() catch return DispatchError.InvalidArgs;
+            const interface = try resolvePropertiesInterface(path, raw_interface);
             var body: std.ArrayList(u8) = .empty;
             defer body.deinit(self.gpa);
             var w = wire.Writer.init(self.gpa, &body);
@@ -652,7 +762,8 @@ pub const ServiceState = struct {
             return self.reply(call, "v", body.items);
         }
         if (std.mem.eql(u8, member, "GetAll")) {
-            const interface = r.readString() catch return DispatchError.InvalidArgs;
+            const raw_interface = r.readString() catch return DispatchError.InvalidArgs;
+            const interface = try resolvePropertiesInterface(path, raw_interface);
             var body: std.ArrayList(u8) = .empty;
             defer body.deinit(self.gpa);
             var w = wire.Writer.init(self.gpa, &body);
@@ -660,23 +771,31 @@ pub const ServiceState = struct {
             return self.reply(call, "a{sv}", body.items);
         }
         if (std.mem.eql(u8, member, "Set")) {
-            const interface = r.readString() catch return DispatchError.InvalidArgs;
+            const raw_interface = r.readString() catch return DispatchError.InvalidArgs;
             const property = r.readString() catch return DispatchError.InvalidArgs;
             const signature = r.readSignatureValue() catch return DispatchError.InvalidArgs;
-            try self.setProperty(path, interface, property, signature, &r);
-            return self.emptyReply(call);
+            const interface = try resolvePropertiesInterface(path, raw_interface);
+            const item_changed = try self.setProperty(path, interface, property, signature, &r);
+            var out = try self.emptyReply(call);
+            errdefer out.deinit();
+            if (item_changed) {
+                try self.appendCollectionItemSignal(&out, "ItemChanged", path);
+            }
+            return out;
         }
         return DispatchError.UnknownMethod;
     }
 
     fn writeProperty(self: *ServiceState, w: *wire.Writer, path: []const u8, interface: []const u8, property: []const u8) !void {
-        if (std.mem.eql(u8, path, service_path) and std.mem.eql(u8, interface, service_interface)) {
+        if (std.mem.eql(u8, path, service_path)) {
+            if (!std.mem.eql(u8, interface, service_interface)) return DispatchError.UnknownInterface;
             if (!std.mem.eql(u8, property, "Collections")) return DispatchError.UnknownProperty;
             try w.writeSignatureValue("ao");
             try writeObjectPathArray(w, &.{collection_path});
             return;
         }
-        if (isCollectionPath(path) and std.mem.eql(u8, interface, collection_interface)) {
+        if (isCollectionPath(path)) {
+            if (!std.mem.eql(u8, interface, collection_interface)) return DispatchError.UnknownInterface;
             if (std.mem.eql(u8, property, "Items")) {
                 try w.writeSignatureValue("ao");
                 try self.writeAllItemPaths(w);
@@ -724,10 +843,12 @@ pub const ServiceState = struct {
 
     fn writeAllProperties(self: *ServiceState, w: *wire.Writer, path: []const u8, interface: []const u8) !void {
         const array = try w.beginArray(8);
-        if (std.mem.eql(u8, path, service_path) and std.mem.eql(u8, interface, service_interface)) {
+        if (std.mem.eql(u8, path, service_path)) {
+            if (!std.mem.eql(u8, interface, service_interface)) return DispatchError.UnknownInterface;
             try writePropertyEntryStart(w, "Collections", "ao");
             try writeObjectPathArray(w, &.{collection_path});
-        } else if (isCollectionPath(path) and std.mem.eql(u8, interface, collection_interface)) {
+        } else if (isCollectionPath(path)) {
+            if (!std.mem.eql(u8, interface, collection_interface)) return DispatchError.UnknownInterface;
             try writePropertyEntryStart(w, "Items", "ao");
             try self.writeAllItemPaths(w);
             try writePropertyEntryStart(w, "Label", "s");
@@ -757,14 +878,16 @@ pub const ServiceState = struct {
         w.endArray(array);
     }
 
-    fn setProperty(self: *ServiceState, path: []const u8, interface: []const u8, property: []const u8, signature: []const u8, r: *wire.Reader) !void {
-        if (isCollectionPath(path) and std.mem.eql(u8, interface, collection_interface)) {
+    fn setProperty(self: *ServiceState, path: []const u8, interface: []const u8, property: []const u8, signature: []const u8, r: *wire.Reader) !bool {
+        if (isCollectionPath(path)) {
+            if (!std.mem.eql(u8, interface, collection_interface)) return DispatchError.UnknownInterface;
             if (!std.mem.eql(u8, property, "Label") or !std.mem.eql(u8, signature, "s")) return DispatchError.UnknownProperty;
             if (!self.unlocked) return DispatchError.IsLocked;
             const label = r.readString() catch return DispatchError.InvalidArgs;
             try replaceOwned(self.gpa, &self.label, label);
             self.modified = unixNow();
-            return self.persist();
+            try self.persist();
+            return false;
         }
         if (itemIdFromPath(path)) |item_id| {
             if (!self.unlocked) return DispatchError.IsLocked;
@@ -780,7 +903,12 @@ pub const ServiceState = struct {
             } else return DispatchError.UnknownProperty;
             item.modified = unixNow();
             self.modified = item.modified;
-            return self.persist();
+            try self.persist();
+            return true;
+        }
+        if (std.mem.eql(u8, path, service_path)) {
+            if (!std.mem.eql(u8, interface, service_interface)) return DispatchError.UnknownInterface;
+            return DispatchError.UnknownProperty;
         }
         return DispatchError.NoSuchObject;
     }
@@ -842,6 +970,21 @@ pub const ServiceState = struct {
         return out;
     }
 
+    fn appendCollectionItemSignal(self: *ServiceState, out: *OutboundMessages, member: []const u8, item_path: []const u8) !void {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.gpa);
+        var w = wire.Writer.init(self.gpa, &body);
+        try w.writeObjectPath(item_path);
+        try self.appendFrame(out, .{
+            .msg_type = .signal,
+            .serial = self.takeSerial(),
+            .path = collection_path,
+            .interface = collection_interface,
+            .member = member,
+            .signature = "o",
+        }, body.items);
+    }
+
     fn emptyReply(self: *ServiceState, call: message.Parsed) !OutboundMessages {
         return self.reply(call, null, &.{});
     }
@@ -849,31 +992,35 @@ pub const ServiceState = struct {
     fn reply(self: *ServiceState, call: message.Parsed, signature: ?[]const u8, body: []const u8) !OutboundMessages {
         var out: OutboundMessages = .{ .gpa = self.gpa };
         errdefer out.deinit();
-        try self.appendFrame(&out, .{
-            .msg_type = .method_return,
-            .serial = self.takeSerial(),
-            .reply_serial = call.header.serial,
-            .destination = call.header.sender,
-            .signature = signature,
-        }, body);
+        if (!call.header.flags.no_reply_expected) {
+            try self.appendFrame(&out, .{
+                .msg_type = .method_return,
+                .serial = self.takeSerial(),
+                .reply_serial = call.header.serial,
+                .destination = call.header.sender,
+                .signature = signature,
+            }, body);
+        }
         return out;
     }
 
     fn errorReply(self: *ServiceState, call: message.Parsed, name: []const u8, text: []const u8) !OutboundMessages {
-        var body: std.ArrayList(u8) = .empty;
-        defer body.deinit(self.gpa);
-        var w = wire.Writer.init(self.gpa, &body);
-        try w.writeString(text);
         var out: OutboundMessages = .{ .gpa = self.gpa };
         errdefer out.deinit();
-        try self.appendFrame(&out, .{
-            .msg_type = .error_reply,
-            .serial = self.takeSerial(),
-            .error_name = name,
-            .reply_serial = call.header.serial,
-            .destination = call.header.sender,
-            .signature = "s",
-        }, body.items);
+        if (!call.header.flags.no_reply_expected) {
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(self.gpa);
+            var w = wire.Writer.init(self.gpa, &body);
+            try w.writeString(text);
+            try self.appendFrame(&out, .{
+                .msg_type = .error_reply,
+                .serial = self.takeSerial(),
+                .error_name = name,
+                .reply_serial = call.header.serial,
+                .destination = call.header.sender,
+                .signature = "s",
+            }, body.items);
+        }
         return out;
     }
 
@@ -908,6 +1055,40 @@ const EncodedSecret = struct {
     content_type: []const u8,
 };
 
+fn inferInterface(path: []const u8, member: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, member, "Ping") or std.mem.eql(u8, member, "GetMachineId")) {
+        return peer_interface;
+    }
+    if (std.mem.eql(u8, member, "Introspect")) {
+        return introspectable_interface;
+    }
+    if (std.mem.eql(u8, member, "Get") or std.mem.eql(u8, member, "GetAll") or std.mem.eql(u8, member, "Set")) {
+        return properties_interface;
+    }
+    if (std.mem.eql(u8, path, service_path)) {
+        if (std.mem.eql(u8, member, "UnlockWithMasterKey") or
+            std.mem.eql(u8, member, "LockAll") or
+            std.mem.eql(u8, member, "GetStatus"))
+        {
+            return control_interface;
+        }
+        return service_interface;
+    }
+    if (isCollectionPath(path)) return collection_interface;
+    if (std.mem.eql(u8, path, prompt_locked_path)) return prompt_interface;
+    if (sessionIdFromPath(path) != null) return session_interface;
+    if (itemIdFromPath(path) != null) return item_interface;
+    return null;
+}
+
+fn resolvePropertiesInterface(path: []const u8, raw_interface: []const u8) DispatchError![]const u8 {
+    if (raw_interface.len != 0) return raw_interface;
+    if (std.mem.eql(u8, path, service_path)) return service_interface;
+    if (isCollectionPath(path)) return collection_interface;
+    if (itemIdFromPath(path) != null) return item_interface;
+    return DispatchError.NoSuchObject;
+}
+
 fn readItemProperties(gpa: Allocator, r: *wire.Reader) !ItemProperties {
     var result: ItemProperties = .{};
     errdefer result.deinit(gpa);
@@ -919,7 +1100,9 @@ fn readItemProperties(gpa: Allocator, r: *wire.Reader) !ItemProperties {
         if ((std.mem.eql(u8, key, "org.freedesktop.Secret.Item.Label") or std.mem.eql(u8, key, "Label")) and std.mem.eql(u8, signature, "s")) {
             result.label = r.readString() catch return DispatchError.InvalidArgs;
         } else if ((std.mem.eql(u8, key, "org.freedesktop.Secret.Item.Attributes") or std.mem.eql(u8, key, "Attributes")) and std.mem.eql(u8, signature, "a{ss}")) {
-            result.attributes = try readAttributes(gpa, r);
+            const attributes = try readAttributes(gpa, r);
+            deinitAttributes(gpa, &result.attributes);
+            result.attributes = attributes;
         } else {
             try skipValue(r, signature);
         }
@@ -991,9 +1174,13 @@ fn skipDictSv(r: *wire.Reader) !void {
 fn skipValue(r: *wire.Reader, signature: []const u8) !void {
     if (std.mem.eql(u8, signature, "s") or std.mem.eql(u8, signature, "o")) {
         _ = r.readString() catch return DispatchError.InvalidArgs;
-    } else if (std.mem.eql(u8, signature, "b") or std.mem.eql(u8, signature, "u")) {
+    } else if (std.mem.eql(u8, signature, "y")) {
+        _ = r.readByte() catch return DispatchError.InvalidArgs;
+    } else if (std.mem.eql(u8, signature, "n") or std.mem.eql(u8, signature, "q")) {
+        _ = r.readU16() catch return DispatchError.InvalidArgs;
+    } else if (std.mem.eql(u8, signature, "b") or std.mem.eql(u8, signature, "u") or std.mem.eql(u8, signature, "i")) {
         _ = r.readU32() catch return DispatchError.InvalidArgs;
-    } else if (std.mem.eql(u8, signature, "t")) {
+    } else if (std.mem.eql(u8, signature, "t") or std.mem.eql(u8, signature, "x")) {
         _ = r.readU64() catch return DispatchError.InvalidArgs;
     } else if (std.mem.eql(u8, signature, "ay")) {
         _ = try readByteArray(r);
@@ -1352,9 +1539,529 @@ fn deriveDhSharedKey(private: [dh_prime_bytes]u8, peer: []const u8) ![16]u8 {
     return key;
 }
 
-pub fn runDaemon(gpa: Allocator, replace: bool) !void {
+const DaemonRuntimeState = union(enum) {
+    not_running,
+    locked,
+    unlocked: u32,
+};
+
+const TestEnvironment = struct {
+    home: ?[]const u8 = null,
+    xdg_data_home: ?[]const u8 = null,
+    xdg_config_home: ?[]const u8 = null,
+    exe_path: ?[]const u8 = null,
+    systemctl_fn: ?*const fn (argv: []const []const u8) bool = null,
+    daemon_state: DaemonRuntimeState = .not_running,
+};
+
+var test_env_override: ?TestEnvironment = null;
+
+pub fn resolveServicePathsFromDirs(
+    gpa: Allocator,
+    home: ?[]const u8,
+    xdg_data_home: ?[]const u8,
+    xdg_config_home: ?[]const u8,
+) !ServicePaths {
+    const dbus_service_path = blk: {
+        if (xdg_data_home) |data_dir| {
+            if (data_dir.len > 0 and std.fs.path.isAbsolute(data_dir)) {
+                break :blk try std.fs.path.join(gpa, &.{ data_dir, "dbus-1", "services", "org.freedesktop.secrets.service" });
+            }
+        }
+        const home_dir = home orelse return error.HomeNotFound;
+        if (home_dir.len == 0) return error.HomeNotFound;
+        break :blk try std.fs.path.join(gpa, &.{ home_dir, ".local", "share", "dbus-1", "services", "org.freedesktop.secrets.service" });
+    };
+    errdefer gpa.free(dbus_service_path);
+
+    const systemd_unit_path = blk: {
+        if (xdg_config_home) |config_dir| {
+            if (config_dir.len > 0 and std.fs.path.isAbsolute(config_dir)) {
+                break :blk try std.fs.path.join(gpa, &.{ config_dir, "systemd", "user", "keyring.service" });
+            }
+        }
+        const home_dir = home orelse return error.HomeNotFound;
+        if (home_dir.len == 0) return error.HomeNotFound;
+        break :blk try std.fs.path.join(gpa, &.{ home_dir, ".config", "systemd", "user", "keyring.service" });
+    };
+
+    return .{
+        .dbus_service_path = dbus_service_path,
+        .systemd_unit_path = systemd_unit_path,
+    };
+}
+
+fn resolveServicePaths(gpa: Allocator) !ServicePaths {
+    if (test_env_override) |env| {
+        return resolveServicePathsFromDirs(gpa, env.home, env.xdg_data_home, env.xdg_config_home);
+    }
+    const home = getEnvVarOwned(gpa, "HOME");
+    defer if (home) |v| gpa.free(v);
+    const xdg_data_home = getEnvVarOwned(gpa, "XDG_DATA_HOME");
+    defer if (xdg_data_home) |v| gpa.free(v);
+    const xdg_config_home = getEnvVarOwned(gpa, "XDG_CONFIG_HOME");
+    defer if (xdg_config_home) |v| gpa.free(v);
+    return resolveServicePathsFromDirs(gpa, home, xdg_data_home, xdg_config_home);
+}
+
+fn validateExecutablePath(exe_path: []const u8) !void {
+    if (exe_path.len == 0 or std.mem.indexOfAny(u8, exe_path, "\r\n\x00") != null) {
+        return error.InvalidExecutablePath;
+    }
+}
+
+pub fn formatDbusServiceFile(gpa: Allocator, exe_path: []const u8) ![]u8 {
+    try validateExecutablePath(exe_path);
+    var out = std.Io.Writer.Allocating.init(gpa);
+    errdefer out.deinit();
+
+    try out.writer.writeAll(managed_marker ++ "\n[D-BUS Service]\nName=org.freedesktop.secrets\nExec=");
+    if (std.mem.indexOfAny(u8, exe_path, " \t\"'\\$`") != null) {
+        try out.writer.writeByte('"');
+        for (exe_path) |c| {
+            if (c == '\\' or c == '"' or c == '$' or c == '`') {
+                try out.writer.writeByte('\\');
+            }
+            try out.writer.writeByte(c);
+        }
+        try out.writer.writeByte('"');
+    } else {
+        try out.writer.writeAll(exe_path);
+    }
+    try out.writer.writeAll(" service\nSystemdService=keyring.service\n");
+    return out.toOwnedSlice();
+}
+
+pub fn formatSystemdUnitFile(gpa: Allocator, exe_path: []const u8) ![]u8 {
+    try validateExecutablePath(exe_path);
+    var out = std.Io.Writer.Allocating.init(gpa);
+    errdefer out.deinit();
+
+    try out.writer.writeAll(
+        managed_marker ++
+            "\n[Unit]\nDescription=Keyring Secret Service\n\n[Service]\nType=dbus\nBusName=org.freedesktop.secrets\nExecStart=",
+    );
+    if (std.mem.indexOfAny(u8, exe_path, " \t\"'\\;") != null) {
+        try out.writer.writeByte('"');
+        for (exe_path) |c| {
+            if (c == '\\' or c == '"') {
+                try out.writer.writeByte('\\');
+                try out.writer.writeByte(c);
+            } else if (c == '%') {
+                try out.writer.writeAll("%%");
+            } else if (c == '$') {
+                try out.writer.writeAll("$$");
+            } else {
+                try out.writer.writeByte(c);
+            }
+        }
+        try out.writer.writeByte('"');
+    } else {
+        for (exe_path) |c| {
+            if (c == '%') {
+                try out.writer.writeAll("%%");
+            } else if (c == '$') {
+                try out.writer.writeAll("$$");
+            } else {
+                try out.writer.writeByte(c);
+            }
+        }
+    }
+    try out.writer.writeAll(" service\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n");
+    return out.toOwnedSlice();
+}
+
+pub fn isManagedUnitContent(contents: []const u8) bool {
+    if (std.mem.indexOf(u8, contents, managed_marker) != null) return true;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+        const rhs = if (std.mem.startsWith(u8, line, "Exec="))
+            line["Exec=".len..]
+        else if (std.mem.startsWith(u8, line, "ExecStart="))
+            line["ExecStart=".len..]
+        else
+            continue;
+        if (execInvokesKeyringService(rhs)) return true;
+    }
+    return false;
+}
+
+fn execInvokesKeyringService(raw_rhs: []const u8) bool {
+    var rhs = std.mem.trimStart(u8, raw_rhs, " \t");
+    while (rhs.len > 0 and std.mem.indexOfScalar(u8, "-@:+!", rhs[0]) != null) {
+        rhs = rhs[1..];
+    }
+    rhs = std.mem.trimStart(u8, rhs, " \t");
+    if (rhs.len == 0) return false;
+
+    var exe_token: []const u8 = "";
+    var rest: []const u8 = "";
+    if (rhs[0] == '"') {
+        var idx: usize = 1;
+        while (idx < rhs.len) : (idx += 1) {
+            if (rhs[idx] == '\\' and idx + 1 < rhs.len) {
+                idx += 1;
+                continue;
+            }
+            if (rhs[idx] == '"') break;
+        }
+        if (idx >= rhs.len) return false;
+        exe_token = rhs[1..idx];
+        rest = std.mem.trimStart(u8, rhs[idx + 1 ..], " \t");
+    } else if (rhs[0] == '\'') {
+        const close_idx = std.mem.indexOfScalarPos(u8, rhs, 1, '\'') orelse return false;
+        exe_token = rhs[1..close_idx];
+        rest = std.mem.trimStart(u8, rhs[close_idx + 1 ..], " \t");
+    } else {
+        const split_idx = std.mem.indexOfAny(u8, rhs, " \t") orelse return false;
+        exe_token = rhs[0..split_idx];
+        rest = std.mem.trimStart(u8, rhs[split_idx..], " \t");
+    }
+
+    var base = exe_token;
+    if (std.mem.lastIndexOfAny(u8, base, "/\\")) |sep| {
+        base = base[sep + 1 ..];
+    }
+    if (!std.mem.eql(u8, base, "keyring") and !std.ascii.eqlIgnoreCase(base, "keyring.exe")) {
+        return false;
+    }
+
+    const arg_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+    return std.mem.eql(u8, rest[0..arg_end], "service");
+}
+
+pub fn resolveInstallExecutablePath(gpa: Allocator, io: std.Io, home: ?[]const u8) ![]u8 {
+    if (test_env_override) |env| {
+        if (env.exe_path) |override_exe| {
+            return gpa.dupe(u8, override_exe);
+        }
+    }
+    if (home) |home_dir| {
+        if (home_dir.len > 0) {
+            const local_bin_exe = try std.fs.path.join(gpa, &.{ home_dir, ".local", "bin", "keyring" });
+            if (regularFileExists(io, local_bin_exe)) return local_bin_exe;
+            gpa.free(local_bin_exe);
+        }
+    }
+    return std.process.executablePathAlloc(io, gpa);
+}
+
+fn regularFileExists(io: std.Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .file;
+}
+
+fn readUnitFileIfExists(gpa: Allocator, io: std.Io, path: []const u8) !?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => err,
+    };
+}
+
+fn writeUnitFileAtomic(gpa: Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        if (parent.len > 0) {
+            _ = try std.Io.Dir.cwd().createDirPathStatus(io, parent, .default_dir);
+        }
+    }
+    var random_suffix: [8]u8 = undefined;
+    secureRandom(&random_suffix);
+    const suffix_hex = std.fmt.bytesToHex(random_suffix, .lower);
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp.{s}", .{ path, suffix_hex });
+    defer gpa.free(tmp_path);
+
+    var renamed = false;
+    defer if (!renamed) std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{
+            .read = true,
+            .truncate = true,
+            .exclusive = true,
+            .permissions = .default_file,
+        });
+        defer file.close(io);
+        try file.writeStreamingAll(io, contents);
+        try file.sync(io);
+    }
+    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io);
+    renamed = true;
+}
+
+fn checkForeignConflict(gpa: Allocator, io: std.Io, path: []const u8) !bool {
+    const existing = (try readUnitFileIfExists(gpa, io, path)) orelse return false;
+    defer gpa.free(existing);
+    return !isManagedUnitContent(existing);
+}
+
+fn currentProcessEnviron() std.process.Environ {
+    if (builtin.os.tag == .windows) return .{ .block = .global };
+    if (builtin.os.tag == .wasi) return .empty;
+    var count: usize = 0;
+    while (std.c.environ[count] != null) : (count += 1) {}
+    return .{ .block = .{ .slice = @ptrCast(std.c.environ[0..count :null]) } };
+}
+
+fn getEnvVarOwned(gpa: Allocator, name: []const u8) ?[]u8 {
+    if (builtin.os.tag == .wasi) return null;
+    if (builtin.os.tag == .windows) {
+        var map = std.process.Environ.createMap(.{ .block = .global }, gpa) catch return null;
+        defer map.deinit();
+        if (map.get(name)) |value| return gpa.dupe(u8, value) catch null;
+        return null;
+    }
+    var index: usize = 0;
+    while (std.c.environ[index]) |entry| : (index += 1) {
+        const item = std.mem.span(entry);
+        if (item.len > name.len and item[name.len] == '=' and std.mem.eql(u8, item[0..name.len], name)) {
+            return gpa.dupe(u8, item[name.len + 1 ..]) catch null;
+        }
+    }
+    return null;
+}
+
+fn runSystemctlUser(gpa: Allocator, args: []const []const u8) bool {
+    if (test_env_override) |env| {
+        if (env.systemctl_fn) |hook| return hook(args);
+        return false;
+    }
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = currentProcessEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var argv_list: std.ArrayList([]const u8) = .empty;
+    defer argv_list.deinit(gpa);
+    argv_list.appendSlice(gpa, &.{ "systemctl", "--user" }) catch return false;
+    argv_list.appendSlice(gpa, args) catch return false;
+
+    const result = std.process.run(gpa, io, .{
+        .argv = argv_list.items,
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+    }) catch return false;
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn isVaultEnrolled(gpa: Allocator) bool {
+    if (vault.loadVaultEnvelope(gpa)) |document_value| {
+        var document = document_value;
+        document.deinit();
+        return true;
+    } else |_| {
+        return false;
+    }
+}
+
+pub fn runInstall(gpa: Allocator, opts: InstallOptions, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !u8 {
+    if (builtin.os.tag != .linux and test_env_override == null) {
+        try stderr.writeAll(unsupported_platform_message);
+        try stderr.flush();
+        return 1;
+    }
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var paths = resolveServicePaths(gpa) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try stderr.writeAll("keyring: service install: HOME is not set\n");
+            try stderr.flush();
+            return 1;
+        },
+    };
+    defer paths.deinit(gpa);
+
+    if (!opts.force) {
+        for ([_][]const u8{ paths.dbus_service_path, paths.systemd_unit_path }) |target_path| {
+            if (try checkForeignConflict(gpa, io, target_path)) {
+                try stderr.print(
+                    "keyring: service install: refusing to overwrite foreign service file {s} (re-run with --force to override)\n",
+                    .{target_path},
+                );
+                try stderr.flush();
+                return 1;
+            }
+        }
+    }
+
+    const home_owned = if (test_env_override) |env|
+        (if (env.home) |h| try gpa.dupe(u8, h) else null)
+    else
+        getEnvVarOwned(gpa, "HOME");
+    defer if (home_owned) |h| gpa.free(h);
+
+    const exe_path = try resolveInstallExecutablePath(gpa, io, home_owned);
+    defer gpa.free(exe_path);
+
+    const dbus_contents = try formatDbusServiceFile(gpa, exe_path);
+    defer gpa.free(dbus_contents);
+    const systemd_contents = try formatSystemdUnitFile(gpa, exe_path);
+    defer gpa.free(systemd_contents);
+
+    try writeUnitFileAtomic(gpa, io, paths.dbus_service_path, dbus_contents);
+    try writeUnitFileAtomic(gpa, io, paths.systemd_unit_path, systemd_contents);
+
+    const reloaded = runSystemctlUser(gpa, &.{"daemon-reload"});
+    const enabled = reloaded and runSystemctlUser(gpa, &.{ "enable", "--now", "keyring.service" });
+
+    try stdout.print("Installed D-Bus activation: {s}\n", .{paths.dbus_service_path});
+    try stdout.print("Installed systemd user unit: {s}\n", .{paths.systemd_unit_path});
+    if (enabled) {
+        try stdout.writeAll("Enabled and started keyring.service via systemctl --user.\n");
+    } else {
+        try stdout.writeAll("Note: systemctl --user unavailable; D-Bus activation will start keyring service on demand.\n");
+    }
+    if (isVaultEnrolled(gpa)) {
+        try stdout.writeAll("Next step: run 'keyring unlock' to unlock the Secret Service.\n");
+    } else {
+        try stdout.writeAll("Next steps: run 'keyring enroll' to initialize the vault, then 'keyring unlock' to unlock.\n");
+    }
+    try stdout.flush();
+    return 0;
+}
+
+pub fn runUninstall(gpa: Allocator, opts: UninstallOptions, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !u8 {
+    if (builtin.os.tag != .linux and test_env_override == null) {
+        try stderr.writeAll(unsupported_platform_message);
+        try stderr.flush();
+        return 1;
+    }
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var paths = resolveServicePaths(gpa) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try stderr.writeAll("keyring: service uninstall: HOME is not set\n");
+            try stderr.flush();
+            return 1;
+        },
+    };
+    defer paths.deinit(gpa);
+
+    if (!opts.force) {
+        for ([_][]const u8{ paths.dbus_service_path, paths.systemd_unit_path }) |target_path| {
+            if (try checkForeignConflict(gpa, io, target_path)) {
+                try stderr.print(
+                    "keyring: service uninstall: refusing to remove foreign service file {s} (re-run with --force to override)\n",
+                    .{target_path},
+                );
+                try stderr.flush();
+                return 1;
+            }
+        }
+    }
+
+    _ = runSystemctlUser(gpa, &.{ "disable", "--now", "keyring.service" });
+    _ = runSystemctlUser(gpa, &.{"daemon-reload"});
+
+    var removed_any = false;
+    for ([_][]const u8{ paths.dbus_service_path, paths.systemd_unit_path }) |target_path| {
+        var removed = true;
+        std.Io.Dir.cwd().deleteFile(io, target_path) catch |err| switch (err) {
+            error.FileNotFound => removed = false,
+            else => return err,
+        };
+        if (removed) {
+            removed_any = true;
+            try stdout.print("Removed {s}\n", .{target_path});
+        }
+    }
+    if (!removed_any) {
+        try stdout.writeAll("Keyring Secret Service units were not installed.\n");
+    }
+    try stdout.flush();
+    return 0;
+}
+
+pub fn runStatus(gpa: Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !u8 {
+    if (builtin.os.tag != .linux and test_env_override == null) {
+        try stderr.writeAll(unsupported_platform_message);
+        try stderr.flush();
+        return 1;
+    }
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const store_path = vault.vaultPath(gpa) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try stderr.writeAll("keyring: service status: HOME is not set\n");
+            try stderr.flush();
+            return 1;
+        },
+    };
+    defer gpa.free(store_path);
+
+    var paths = resolveServicePaths(gpa) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try stderr.writeAll("keyring: service status: HOME is not set\n");
+            try stderr.flush();
+            return 1;
+        },
+    };
+    defer paths.deinit(gpa);
+
+    if (vault.loadVaultEnvelope(gpa)) |document_value| {
+        var document = document_value;
+        defer document.deinit();
+        try stdout.print("vault: enrolled ({d} keys) ({s})\n", .{ document.value.prf_slots.len, store_path });
+    } else |err| switch (err) {
+        error.VaultNotFound => try stdout.print("vault: not enrolled ({s})\n", .{store_path}),
+        else => return err,
+    }
+
+    try writeUnitInstallStatus(gpa, io, stdout, "dbus activation", paths.dbus_service_path);
+    try writeUnitInstallStatus(gpa, io, stdout, "systemd user unit", paths.systemd_unit_path);
+
+    const daemon_state: DaemonRuntimeState = if (test_env_override) |env|
+        env.daemon_state
+    else if (builtin.os.tag == .linux) blk: {
+        if (Linux.queryRunningStatus(gpa)) |status_val| {
+            var st = status_val;
+            defer st.deinit(gpa);
+            break :blk if (st.locked) .locked else .{ .unlocked = st.item_count };
+        }
+        break :blk .not_running;
+    } else .not_running;
+
+    switch (daemon_state) {
+        .unlocked => |count| try stdout.print("daemon: running (unlocked, {d} items)\n", .{count}),
+        .locked => try stdout.writeAll("daemon: running (locked)\n"),
+        .not_running => try stdout.writeAll("daemon: not running\n"),
+    }
+
+    try stdout.flush();
+    return 0;
+}
+
+fn writeUnitInstallStatus(
+    gpa: Allocator,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    label: []const u8,
+    path: []const u8,
+) !void {
+    if (try readUnitFileIfExists(gpa, io, path)) |contents| {
+        defer gpa.free(contents);
+        if (isManagedUnitContent(contents)) {
+            try stdout.print("{s}: installed ({s})\n", .{ label, path });
+        } else {
+            try stdout.print("{s}: installed (foreign: {s})\n", .{ label, path });
+        }
+    } else {
+        try stdout.print("{s}: not installed\n", .{label});
+    }
+}
+
+pub fn runDaemon(gpa: Allocator, replace: bool, lock_timeout_seconds: ?u32) !void {
     if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
-    return Linux.runDaemon(gpa, replace);
+    return Linux.runDaemon(gpa, replace, lock_timeout_seconds);
 }
 
 pub fn clientUnlockWithMasterKey(gpa: Allocator, master_key_value: [vault.dek_len]u8) !bool {
@@ -1376,7 +2083,7 @@ const Linux = if (builtin.os.tag == .linux) struct {
     const linux = std.os.linux;
     const connection = dbus.connection;
 
-    fn runDaemon(gpa: Allocator, replace: bool) !void {
+    fn runDaemon(gpa: Allocator, replace: bool, lock_timeout_seconds: ?u32) !void {
         var conn = try connection.connectSession(gpa);
         defer conn.deinit();
 
@@ -1402,7 +2109,26 @@ const Linux = if (builtin.os.tag == .linux) struct {
         var state = try ServiceState.init(gpa);
         defer state.deinit();
         state.next_serial = conn.next_serial;
+        var last_activity_sec: u64 = unixNow();
         while (true) {
+            if (state.unlocked) {
+                if (lock_timeout_seconds) |timeout_s| {
+                    const now = unixNow();
+                    if (state.checkIdleTimeout(now, last_activity_sec, timeout_s)) {
+                        continue;
+                    }
+                    const deadline = last_activity_sec +| @as(u64, timeout_s);
+                    const rem_sec = deadline - now;
+                    const timeout_ms: i32 = @intCast(@min(rem_sec *| 1000, @as(u64, std.math.maxInt(i32))));
+                    var pfd = [1]std.posix.pollfd{.{
+                        .fd = conn.fd,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    }};
+                    const ready = std.posix.poll(&pfd, timeout_ms) catch return error.ReadFailed;
+                    if (ready == 0) continue;
+                }
+            }
             const frame = try readFrame(gpa, conn.fd);
             defer {
                 std.crypto.secureZero(u8, frame);
@@ -1415,9 +2141,11 @@ const Linux = if (builtin.os.tag == .linux) struct {
                 const for_unique = conn.unique_name != null and std.mem.eql(u8, destination, conn.unique_name.?);
                 if (!for_service and !for_unique) continue;
             }
+            _ = state.checkIdleTimeout(unixNow(), last_activity_sec, lock_timeout_seconds);
             var outbound = try state.handleMessage(parsed);
             defer outbound.deinit();
             for (outbound.frames.items) |response| try writeAll(conn.fd, response);
+            last_activity_sec = unixNow();
         }
     }
 
@@ -1485,6 +2213,52 @@ const Linux = if (builtin.os.tag == .linux) struct {
             .locked = locked,
             .item_count = item_count,
             .store_path = try gpa.dupe(u8, path),
+        };
+    }
+
+    fn queryRunningStatus(gpa: Allocator) ?Status {
+        var conn = connection.connectSession(gpa) catch return null;
+        defer conn.deinit();
+
+        var owner_body: std.ArrayList(u8) = .empty;
+        defer owner_body.deinit(gpa);
+        var writer = wire.Writer.init(gpa, &owner_body);
+        writer.writeString(service_destination) catch return null;
+        var owner_reply = connection.call(&conn, .{
+            .destination = "org.freedesktop.DBus",
+            .path = "/org/freedesktop/DBus",
+            .interface = "org.freedesktop.DBus",
+            .member = "GetNameOwner",
+            .signature = "s",
+            .body = owner_body.items,
+        }) catch return null;
+        defer owner_reply.deinit();
+        if (owner_reply.err != null) return null;
+        var owner_reader = wire.Reader.init(owner_reply.body);
+        const owner_unique_name = owner_reader.readString() catch return null;
+        if (owner_unique_name.len == 0) return null;
+
+        var reply = connection.call(&conn, .{
+            .destination = owner_unique_name,
+            .path = service_path,
+            .interface = control_interface,
+            .member = "GetStatus",
+            .signature = null,
+            .body = &.{},
+        }) catch return null;
+        defer reply.deinit();
+        if (reply.err != null) return null;
+        var reader = wire.Reader.init(reply.body);
+        const initialized = reader.readBool() catch return null;
+        const locked = reader.readBool() catch return null;
+        const item_count = reader.readU32() catch return null;
+        const path = reader.readString() catch return null;
+        const owned_path = gpa.dupe(u8, path) catch return null;
+        return .{
+            .initialized = initialized,
+            .locked = locked,
+            .item_count = item_count,
+            .store_path = owned_path,
         };
     }
 
@@ -2063,20 +2837,809 @@ test "standard D-Bus interfaces and prompt dismissal reply immediately" {
     }
 }
 
+fn testDispatchFull(
+    state: *ServiceState,
+    flags: message.Flags,
+    path: []const u8,
+    interface: ?[]const u8,
+    member: []const u8,
+    signature: ?[]const u8,
+    body: []const u8,
+) !OutboundMessages {
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(std.testing.allocator);
+    try message.serialize(std.testing.allocator, &frame, .{
+        .msg_type = .method_call,
+        .flags = flags,
+        .serial = 42,
+        .path = path,
+        .interface = interface,
+        .member = member,
+        .destination = service_destination,
+        .sender = ":1.99",
+        .signature = signature,
+    }, body);
+    return state.handleMessage(try message.parse(frame.items));
+}
+
+fn expectCollectionSignal(raw_frame: []const u8, expected_member: []const u8, expected_item_path: []const u8) !void {
+    const parsed = try message.parse(raw_frame);
+    try std.testing.expectEqual(message.MessageType.signal, parsed.header.msg_type);
+    try std.testing.expectEqualStrings(collection_path, parsed.header.path.?);
+    try std.testing.expectEqualStrings(collection_interface, parsed.header.interface.?);
+    try std.testing.expectEqualStrings(expected_member, parsed.header.member.?);
+    try std.testing.expectEqualStrings("o", parsed.header.signature.?);
+    var r = wire.Reader.init(parsed.body);
+    try std.testing.expectEqualStrings(expected_item_path, try r.readObjectPath());
+}
+
+fn writeCopilotCreateItemBody(
+    gpa: Allocator,
+    body: *std.ArrayList(u8),
+    label: []const u8,
+    service_name: []const u8,
+    username: []const u8,
+    session_path: []const u8,
+    iv: []const u8,
+    ciphertext: []const u8,
+    content_type: []const u8,
+    replace: bool,
+) !void {
+    var w = wire.Writer.init(gpa, body);
+    const properties = try w.beginArray(8);
+    try w.alignStruct();
+    try w.writeString("org.freedesktop.Secret.Item.Label");
+    try w.writeSignatureValue("s");
+    try w.writeString(label);
+    try w.alignStruct();
+    try w.writeString("org.freedesktop.Secret.Item.Attributes");
+    try w.writeSignatureValue("a{ss}");
+    try writeTestAttributes(&w, service_name, username, false);
+    w.endArray(properties);
+
+    try w.alignStruct();
+    try w.writeObjectPath(session_path);
+    try writeByteArray(&w, iv);
+    try writeByteArray(&w, ciphertext);
+    try w.writeString(content_type);
+    try w.writeBool(replace);
+}
+
+test "zbus secret-service Copilot CLI flow: empty-interface Properties, SetAlias, replace=false, signals, and no_reply_expected" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testVaultPath(&tmp, gpa);
+    defer gpa.free(path);
+    vault.vault_path_override = path;
+    defer vault.vault_path_override = null;
+
+    const prf_output: [vault.prf_salt_len]u8 = @splat(0x55);
+    var enrolled = try vault.enrollInitialVault(gpa, io, .{
+        .label = "copilot-test-key",
+        .credential_id = "copilot-credential-id",
+        .cose_alg = -8,
+        .public_key = &@as([32]u8, @splat(0x33)),
+        .prf_output = prf_output,
+        .created_at = 1_700_000_000,
+    }, .{
+        .payload_created = 1_700_000_000,
+        .argon2_t = 1,
+        .argon2_m = 1024,
+        .argon2_p = 1,
+    });
+    defer enrolled.deinit();
+    try vault.saveVaultEnvelope(gpa, &enrolled.document.value);
+
+    var state = try ServiceState.init(gpa);
+    defer state.deinit();
+
+    // Unlock via omitted INTERFACE header on control method.
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try writeByteArray(&w, &enrolled.dek);
+        var out = try testDispatchFull(&state, .{}, service_path, null, "UnlockWithMasterKey", "ay", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        try std.testing.expect(try r.readBool());
+    }
+
+    // 1. Properties.GetAll on service_path with empty interface "" (and omitted header interface).
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString("");
+        var out = try testDispatchFull(&state, .{}, service_path, null, "GetAll", "s", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        const props = try r.beginArray(8);
+        try std.testing.expect(r.arrayHasMore(props));
+        try r.alignStruct();
+        try std.testing.expectEqualStrings("Collections", try r.readString());
+        try std.testing.expectEqualStrings("ao", try r.readSignatureValue());
+        const cols = try r.beginArray(4);
+        try std.testing.expectEqualStrings(collection_path, try r.readObjectPath());
+        try std.testing.expect(!r.arrayHasMore(cols));
+    }
+
+    // 2. OpenSession with dh-ietf1024-sha256-aes128-cbc-pkcs7 (with omitted header interface).
+    var dh_session_path: []u8 = undefined;
+    defer gpa.free(dh_session_path);
+    var client_dh_key: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &client_dh_key);
+    {
+        var prng = std.Random.DefaultPrng.init(0xCAFEBABE);
+        var client_pair = try generateDhKeyPair(prng.random());
+        defer std.crypto.secureZero(u8, &client_pair.private);
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString(dh_algorithm);
+        try w.writeSignatureValue("ay");
+        try writeByteArray(&w, &client_pair.public);
+        var out = try testDispatchFull(&state, .{}, service_path, null, "OpenSession", "sv", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        try std.testing.expectEqualStrings("ay", try r.readSignatureValue());
+        const server_public = try readByteArray(&r);
+        client_dh_key = try deriveDhSharedKey(client_pair.private, server_public);
+        dh_session_path = try gpa.dupe(u8, try r.readObjectPath());
+    }
+
+    // 3. Service.SearchItems({"service": "copilot-cli", "username": "https://github.com:alice"}) -> empty.
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try writeTestAttributes(&w, "copilot-cli", "https://github.com:alice", false);
+        var out = try testDispatch(&state, service_path, service_interface, "SearchItems", "a{ss}", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        const unlocked = try r.beginArray(4);
+        try std.testing.expect(!r.arrayHasMore(unlocked));
+        r.pos = unlocked.end;
+        const locked = try r.beginArray(4);
+        try std.testing.expect(!r.arrayHasMore(locked));
+    }
+
+    // 4. Service.ReadAlias("default") and Service.SetAlias("default", ...).
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString("default");
+        var out = try testDispatch(&state, service_path, service_interface, "ReadAlias", "s", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        try std.testing.expectEqualStrings(collection_path, try r.readObjectPath());
+    }
+    for ([_][]const u8{ collection_path, collection_alias_path }) |target| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString("default");
+        try w.writeObjectPath(target);
+        var out = try testDispatch(&state, service_path, service_interface, "SetAlias", "so", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        try std.testing.expectEqual(@as(usize, 0), reply.body.len);
+    }
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString("default");
+        try w.writeObjectPath("/");
+        var out = try testDispatch(&state, service_path, service_interface, "SetAlias", "so", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .error_reply);
+        try std.testing.expectEqualStrings("org.freedesktop.DBus.Error.NotSupported", reply.header.error_name.?);
+    }
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString("default");
+        try w.writeObjectPath("/org/freedesktop/secrets/collection/missing");
+        var out = try testDispatch(&state, service_path, service_interface, "SetAlias", "so", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .error_reply);
+        try std.testing.expectEqualStrings("org.freedesktop.Secret.Error.NoSuchObject", reply.header.error_name.?);
+    }
+
+    // 5. Properties.Get with "" and "org.freedesktop.Secret.Collection" for "Locked" -> false.
+    for ([_][]const u8{ "", collection_interface }) |iface| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString(iface);
+        try w.writeString("Locked");
+        var out = try testDispatch(&state, collection_path, properties_interface, "Get", "ss", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        try std.testing.expectEqualStrings("b", try r.readSignatureValue());
+        try std.testing.expectEqual(false, try r.readBool());
+    }
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString("");
+        try w.writeString("Locked");
+        var out = try testDispatch(&state, "/org/freedesktop/secrets/unknown", properties_interface, "Get", "ss", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .error_reply);
+        try std.testing.expectEqualStrings("org.freedesktop.Secret.Error.NoSuchObject", reply.header.error_name.?);
+    }
+
+    // 6. Collection.CreateItem with application/octet-stream, replace=true -> ItemCreated signal.
+    const iv1: [16]u8 = @splat(0x11);
+    var item1_path: []u8 = undefined;
+    defer gpa.free(item1_path);
+    {
+        const ct1 = try aesCbcEncrypt(gpa, client_dh_key, iv1, "ghu_copilot_token_v1");
+        defer gpa.free(ct1);
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        try writeCopilotCreateItemBody(
+            gpa,
+            &body,
+            "keyring:https://github.com:alice@copilot-cli",
+            "copilot-cli",
+            "https://github.com:alice",
+            dh_session_path,
+            &iv1,
+            ct1,
+            "application/octet-stream",
+            true,
+        );
+        var out = try testDispatchFull(&state, .{}, collection_path, null, "CreateItem", "a{sv}(oayays)b", body.items);
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 2), out.frames.items.len);
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        item1_path = try gpa.dupe(u8, try r.readObjectPath());
+        try std.testing.expectEqualStrings("/", try r.readObjectPath());
+        try expectCollectionSignal(out.frames.items[1], "ItemCreated", item1_path);
+    }
+
+    // 7. CreateItem with replace=false creates a second item (ItemCreated); replace=true updates in-place (ItemChanged).
+    var item2_path: []u8 = undefined;
+    defer gpa.free(item2_path);
+    {
+        const ct2 = try aesCbcEncrypt(gpa, client_dh_key, iv1, "ghu_duplicate_token");
+        defer gpa.free(ct2);
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        try writeCopilotCreateItemBody(
+            gpa,
+            &body,
+            "keyring:https://github.com:alice@copilot-cli",
+            "copilot-cli",
+            "https://github.com:alice",
+            dh_session_path,
+            &iv1,
+            ct2,
+            "application/octet-stream",
+            false,
+        );
+        var out = try testDispatch(&state, collection_path, collection_interface, "CreateItem", "a{sv}(oayays)b", body.items);
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 2), out.frames.items.len);
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        item2_path = try gpa.dupe(u8, try r.readObjectPath());
+        try std.testing.expect(!std.mem.eql(u8, item1_path, item2_path));
+        try std.testing.expectEqual(@as(usize, 2), state.items.items.len);
+        try expectCollectionSignal(out.frames.items[1], "ItemCreated", item2_path);
+    }
+    {
+        const ct3 = try aesCbcEncrypt(gpa, client_dh_key, iv1, "ghu_copilot_token_v2");
+        defer gpa.free(ct3);
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        try writeCopilotCreateItemBody(
+            gpa,
+            &body,
+            "keyring:https://github.com:alice@copilot-cli",
+            "copilot-cli",
+            "https://github.com:alice",
+            dh_session_path,
+            &iv1,
+            ct3,
+            "application/octet-stream",
+            true,
+        );
+        var out = try testDispatch(&state, collection_path, collection_interface, "CreateItem", "a{sv}(oayays)b", body.items);
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 2), out.frames.items.len);
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        try std.testing.expectEqualStrings(item1_path, try r.readObjectPath());
+        try std.testing.expectEqual(@as(usize, 2), state.items.items.len);
+        try expectCollectionSignal(out.frames.items[1], "ItemChanged", item1_path);
+    }
+
+    // 8. Properties.Get / Set with empty interface "" on item1_path emits ItemChanged.
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString("");
+        try w.writeString("Label");
+        try w.writeSignatureValue("s");
+        try w.writeString("Updated Copilot Token");
+        var out = try testDispatch(&state, item1_path, properties_interface, "Set", "ssv", body.items);
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 2), out.frames.items.len);
+        _ = try expectReplyType(&out, .method_return);
+        try expectCollectionSignal(out.frames.items[1], "ItemChanged", item1_path);
+    }
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString("");
+        try w.writeString("Label");
+        var out = try testDispatch(&state, item1_path, properties_interface, "Get", "ss", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        try std.testing.expectEqualStrings("s", try r.readSignatureValue());
+        try std.testing.expectEqualStrings("Updated Copilot Token", try r.readString());
+    }
+
+    // 9. Item.GetSecret & Item.SetSecret (ItemChanged) & Item.Delete (ItemDeleted).
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeObjectPath(dh_session_path);
+        var out = try testDispatchFull(&state, .{}, item1_path, null, "GetSecret", "o", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        const secret = try readSecretTuple(&r);
+        try std.testing.expectEqualStrings("application/octet-stream", secret.content_type);
+        var reply_iv: [16]u8 = undefined;
+        @memcpy(&reply_iv, secret.parameters);
+        const decrypted = try aesCbcDecrypt(gpa, client_dh_key, reply_iv, secret.value);
+        defer gpa.free(decrypted);
+        try std.testing.expectEqualStrings("ghu_copilot_token_v2", decrypted);
+    }
+    {
+        const iv2: [16]u8 = @splat(0x29);
+        const ct4 = try aesCbcEncrypt(gpa, client_dh_key, iv2, "ghu_copilot_token_v3");
+        defer gpa.free(ct4);
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.alignStruct();
+        try w.writeObjectPath(dh_session_path);
+        try writeByteArray(&w, &iv2);
+        try writeByteArray(&w, ct4);
+        try w.writeString("application/octet-stream");
+        var out = try testDispatch(&state, item1_path, item_interface, "SetSecret", "(oayays)", body.items);
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 2), out.frames.items.len);
+        _ = try expectReplyType(&out, .method_return);
+        try expectCollectionSignal(out.frames.items[1], "ItemChanged", item1_path);
+    }
+    {
+        var out = try testDispatch(&state, item2_path, item_interface, "Delete", null, &.{});
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 2), out.frames.items.len);
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        try std.testing.expectEqualStrings("/", try r.readObjectPath());
+        try expectCollectionSignal(out.frames.items[1], "ItemDeleted", item2_path);
+        try std.testing.expectEqual(@as(usize, 1), state.items.items.len);
+    }
+
+    // 10. Flags.no_reply_expected = true suppresses method_return / error_reply while preserving signals.
+    {
+        var out = try testDispatchFull(
+            &state,
+            .{ .no_reply_expected = true },
+            item1_path,
+            item_interface,
+            "Delete",
+            null,
+            &.{},
+        );
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 1), out.frames.items.len);
+        try expectCollectionSignal(out.frames.items[0], "ItemDeleted", item1_path);
+        try std.testing.expectEqual(@as(usize, 0), state.items.items.len);
+    }
+    {
+        var out = try testDispatchFull(&state, .{ .no_reply_expected = true }, service_path, peer_interface, "Ping", null, &.{});
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 0), out.frames.items.len);
+    }
+    {
+        var out = try testDispatchFull(&state, .{ .no_reply_expected = true }, service_path, service_interface, "NoSuchMethod", null, &.{});
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 0), out.frames.items.len);
+    }
+}
+
+test "parseArgs handles run, install, uninstall, status, and rejects invalid arguments" {
+    const default_run = parseArgs(&.{}).?;
+    try std.testing.expectEqual(Action{ .run = .{} }, default_run);
+
+    const custom_run = parseArgs(&.{ "--replace", "--lock-timeout", "180" }).?;
+    try std.testing.expectEqual(Action{ .run = .{ .replace = true, .lock_timeout_seconds = 180 } }, custom_run);
+
+    try std.testing.expectEqual(Action{ .install = .{ .force = false } }, parseArgs(&.{"install"}).?);
+    try std.testing.expectEqual(Action{ .install = .{ .force = true } }, parseArgs(&.{ "install", "--force" }).?);
+    try std.testing.expectEqual(Action{ .uninstall = .{ .force = false } }, parseArgs(&.{"uninstall"}).?);
+    try std.testing.expectEqual(Action{ .uninstall = .{ .force = true } }, parseArgs(&.{ "uninstall", "--force" }).?);
+    try std.testing.expectEqual(Action.status, parseArgs(&.{"status"}).?);
+
+    try std.testing.expect(parseArgs(&.{ "--lock-timeout", "0" }) == null);
+    try std.testing.expect(parseArgs(&.{"--lock-timeout"}) == null);
+    try std.testing.expect(parseArgs(&.{ "--lock-timeout", "abc" }) == null);
+    try std.testing.expect(parseArgs(&.{"--force"}) == null);
+    try std.testing.expect(parseArgs(&.{ "install", "--replace" }) == null);
+    try std.testing.expect(parseArgs(&.{ "install", "extra" }) == null);
+    try std.testing.expect(parseArgs(&.{ "uninstall", "--unknown" }) == null);
+    try std.testing.expect(parseArgs(&.{ "status", "--force" }) == null);
+    try std.testing.expect(parseArgs(&.{ "--replace", "install" }) == null);
+    try std.testing.expect(parseArgs(&.{"bogus"}) == null);
+}
+
+test "service unit formatting escapes spaces and rejects control characters" {
+    const gpa = std.testing.allocator;
+
+    const plain_dbus = try formatDbusServiceFile(gpa, "/home/alice/.local/bin/keyring");
+    defer gpa.free(plain_dbus);
+    try std.testing.expectEqualStrings(
+        "# Managed by cataggar/keyring\n" ++
+            "[D-BUS Service]\n" ++
+            "Name=org.freedesktop.secrets\n" ++
+            "Exec=/home/alice/.local/bin/keyring service\n" ++
+            "SystemdService=keyring.service\n",
+        plain_dbus,
+    );
+
+    const plain_systemd = try formatSystemdUnitFile(gpa, "/home/alice/.local/bin/keyring");
+    defer gpa.free(plain_systemd);
+    try std.testing.expectEqualStrings(
+        "# Managed by cataggar/keyring\n" ++
+            "[Unit]\n" ++
+            "Description=Keyring Secret Service\n\n" ++
+            "[Service]\n" ++
+            "Type=dbus\n" ++
+            "BusName=org.freedesktop.secrets\n" ++
+            "ExecStart=/home/alice/.local/bin/keyring service\n" ++
+            "Restart=on-failure\n\n" ++
+            "[Install]\n" ++
+            "WantedBy=default.target\n",
+        plain_systemd,
+    );
+
+    const spaced_dbus = try formatDbusServiceFile(gpa, "/home/alice/My Apps/keyring");
+    defer gpa.free(spaced_dbus);
+    try std.testing.expect(std.mem.indexOf(u8, spaced_dbus, "Exec=\"/home/alice/My Apps/keyring\" service\n") != null);
+    try std.testing.expect(isManagedUnitContent(spaced_dbus));
+
+    const spaced_systemd = try formatSystemdUnitFile(gpa, "/home/alice/My Apps/keyring");
+    defer gpa.free(spaced_systemd);
+    try std.testing.expect(std.mem.indexOf(u8, spaced_systemd, "ExecStart=\"/home/alice/My Apps/keyring\" service\n") != null);
+    try std.testing.expect(isManagedUnitContent(spaced_systemd));
+
+    try std.testing.expectError(error.InvalidExecutablePath, formatDbusServiceFile(gpa, "/bad\npath/keyring"));
+    try std.testing.expectError(error.InvalidExecutablePath, formatSystemdUnitFile(gpa, "/bad\rpath/keyring"));
+    try std.testing.expectError(error.InvalidExecutablePath, formatDbusServiceFile(gpa, ""));
+
+    try std.testing.expect(isManagedUnitContent("[D-BUS Service]\nName=org.freedesktop.secrets\nExec=/usr/local/bin/keyring service\n"));
+    try std.testing.expect(!isManagedUnitContent("[D-BUS Service]\nName=org.freedesktop.secrets\nExec=/usr/bin/gnome-keyring-daemon --start --components=secrets\n"));
+    try std.testing.expect(!isManagedUnitContent("[D-BUS Service]\nName=org.freedesktop.secrets\nExec=/usr/bin/oo7-daemon\n"));
+}
+
+test "service install, status, foreign-unit protection, and uninstall lifecycle" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const home_dir = try std.fs.path.join(gpa, &.{ root, "home" });
+    defer gpa.free(home_dir);
+    const xdg_data = try std.fs.path.join(gpa, &.{ root, "xdg-data" });
+    defer gpa.free(xdg_data);
+    const xdg_config = try std.fs.path.join(gpa, &.{ root, "xdg-config" });
+    defer gpa.free(xdg_config);
+    const vpath = try std.fs.path.join(gpa, &.{ xdg_data, "keyring", "vault.json" });
+    defer gpa.free(vpath);
+
+    // Create ~/.local/bin/keyring shim to verify resolveInstallExecutablePath prefers it.
+    const local_bin_dir = try std.fs.path.join(gpa, &.{ home_dir, ".local", "bin" });
+    defer gpa.free(local_bin_dir);
+    try std.Io.Dir.cwd().createDirPath(io, local_bin_dir);
+    const local_bin_keyring = try std.fs.path.join(gpa, &.{ local_bin_dir, "keyring" });
+    defer gpa.free(local_bin_keyring);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = local_bin_keyring, .data = "shim" });
+
+    vault.vault_path_override = vpath;
+    defer vault.vault_path_override = null;
+
+    const SystemctlRecorder = struct {
+        var calls: usize = 0;
+        var succeed: bool = true;
+        fn run(_: []const []const u8) bool {
+            calls += 1;
+            return succeed;
+        }
+    };
+    SystemctlRecorder.calls = 0;
+    SystemctlRecorder.succeed = false;
+
+    test_env_override = .{
+        .home = home_dir,
+        .xdg_data_home = xdg_data,
+        .xdg_config_home = xdg_config,
+        .exe_path = null,
+        .systemctl_fn = SystemctlRecorder.run,
+        .daemon_state = .not_running,
+    };
+    defer test_env_override = null;
+
+    var paths = try resolveServicePathsFromDirs(gpa, home_dir, xdg_data, xdg_config);
+    defer paths.deinit(gpa);
+
+    // 1. Initial status before install or enrollment.
+    {
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 0), try runStatus(gpa, &stdout.writer, &stderr.writer));
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "vault: not enrolled") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "dbus activation: not installed\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "systemd user unit: not installed\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "daemon: not running\n") != null);
+    }
+
+    // 2. Install succeeds even when systemctl --user is unavailable, preferring ~/.local/bin/keyring.
+    {
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 0), try runInstall(gpa, .{}, &stdout.writer, &stderr.writer));
+        try std.testing.expectEqual(@as(usize, 0), stderr.written().len);
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "keyring enroll") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "keyring unlock") != null);
+
+        const dbus_file = (try readUnitFileIfExists(gpa, io, paths.dbus_service_path)).?;
+        defer gpa.free(dbus_file);
+        try std.testing.expect(std.mem.indexOf(u8, dbus_file, managed_marker) != null);
+        try std.testing.expect(std.mem.indexOf(u8, dbus_file, ".local") != null);
+
+        const unit_file = (try readUnitFileIfExists(gpa, io, paths.systemd_unit_path)).?;
+        defer gpa.free(unit_file);
+        try std.testing.expect(std.mem.indexOf(u8, unit_file, managed_marker) != null);
+    }
+
+    // 3. Idempotent re-install with systemctl succeeding.
+    SystemctlRecorder.calls = 0;
+    SystemctlRecorder.succeed = true;
+    test_env_override.?.exe_path = "/usr/local/bin/keyring";
+    {
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 0), try runInstall(gpa, .{}, &stdout.writer, &stderr.writer));
+        try std.testing.expectEqual(@as(usize, 2), SystemctlRecorder.calls);
+    }
+
+    // 4. Foreign D-Bus service file (gnome-keyring) refuses install & uninstall without --force, reported as foreign in status.
+    try writeUnitFileAtomic(
+        gpa,
+        io,
+        paths.dbus_service_path,
+        "[D-BUS Service]\nName=org.freedesktop.secrets\nExec=/usr/bin/gnome-keyring-daemon --start --components=secrets\n",
+    );
+    {
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 1), try runInstall(gpa, .{ .force = false }, &stdout.writer, &stderr.writer));
+        try std.testing.expect(std.mem.indexOf(u8, stderr.written(), "--force") != null);
+    }
+    {
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 1), try runUninstall(gpa, .{ .force = false }, &stdout.writer, &stderr.writer));
+        try std.testing.expect(std.mem.indexOf(u8, stderr.written(), "--force") != null);
+    }
+
+    // Enroll vault and check status with foreign dbus activation + unlocked daemon.
+    const prf_output: [vault.prf_salt_len]u8 = @splat(0x77);
+    var enrolled = try vault.enrollInitialVault(gpa, io, .{
+        .label = "yubikey",
+        .credential_id = "status-credential",
+        .cose_alg = -8,
+        .public_key = &@as([32]u8, @splat(0x44)),
+        .prf_output = prf_output,
+        .created_at = 1_700_000_000,
+    }, .{
+        .payload_created = 1_700_000_000,
+        .argon2_t = 1,
+        .argon2_m = 1024,
+        .argon2_p = 1,
+    });
+    defer enrolled.deinit();
+    try vault.saveVaultEnvelope(gpa, &enrolled.document.value);
+    test_env_override.?.daemon_state = .{ .unlocked = 3 };
+    {
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 0), try runStatus(gpa, &stdout.writer, &stderr.writer));
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "vault: enrolled (1 keys)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "dbus activation: installed (foreign: ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "systemd user unit: installed (") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "daemon: running (unlocked, 3 items)\n") != null);
+    }
+
+    // 5. --force install overwrites foreign file, and uninstall removes both files cleanly.
+    {
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 0), try runInstall(gpa, .{ .force = true }, &stdout.writer, &stderr.writer));
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "keyring enroll") == null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout.written(), "keyring unlock") != null);
+    }
+    {
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 0), try runUninstall(gpa, .{}, &stdout.writer, &stderr.writer));
+        try std.testing.expect((try readUnitFileIfExists(gpa, io, paths.dbus_service_path)) == null);
+        try std.testing.expect((try readUnitFileIfExists(gpa, io, paths.systemd_unit_path)) == null);
+    }
+}
+
+test "ServiceState.checkIdleTimeout locks at deadline and SetAlias rejects clearing default or custom aliases" {
+    const gpa = std.testing.allocator;
+    var state = try ServiceState.init(gpa);
+    defer state.deinit();
+
+    // Simulate unlocked state with a dummy DEK.
+    state.unlocked = true;
+    state.dek = @splat(0xAB);
+
+    // No timeout configured -> stays unlocked.
+    try std.testing.expect(!state.checkIdleTimeout(1_000, 100, null));
+    try std.testing.expect(state.unlocked);
+
+    // Before deadline (`100 + 60 = 160`) -> stays unlocked.
+    try std.testing.expect(!state.checkIdleTimeout(159, 100, 60));
+    try std.testing.expect(state.unlocked);
+
+    // At deadline (`160 >= 160`) -> locks and zeroes DEK.
+    try std.testing.expect(state.checkIdleTimeout(160, 100, 60));
+    try std.testing.expect(!state.unlocked);
+    try std.testing.expect(state.dek == null);
+
+    // Once locked, subsequent checks return false.
+    try std.testing.expect(!state.checkIdleTimeout(500, 100, 60));
+
+    // SetAlias("default", "/") -> NotSupported; SetAlias("login", collection_path) -> NotSupported.
+    for ([_]struct { name: []const u8, target: []const u8 }{
+        .{ .name = "default", .target = "/" },
+        .{ .name = "login", .target = collection_path },
+        .{ .name = "login", .target = "/" },
+    }) |tc| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString(tc.name);
+        try w.writeObjectPath(tc.target);
+        var out = try testDispatch(&state, service_path, service_interface, "SetAlias", "so", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .error_reply);
+        try std.testing.expectEqualStrings("org.freedesktop.DBus.Error.NotSupported", reply.header.error_name.?);
+    }
+}
+
+test "resolveServicePathsFromDirs ignores relative XDG_DATA_HOME and XDG_CONFIG_HOME" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const home_dir = try std.fs.path.join(gpa, &.{ root, "home" });
+    defer gpa.free(home_dir);
+    const expected_dbus = try std.fs.path.join(gpa, &.{ home_dir, ".local", "share", "dbus-1", "services", "org.freedesktop.secrets.service" });
+    defer gpa.free(expected_dbus);
+    const expected_systemd = try std.fs.path.join(gpa, &.{ home_dir, ".config", "systemd", "user", "keyring.service" });
+    defer gpa.free(expected_systemd);
+
+    var rel_paths = try resolveServicePathsFromDirs(gpa, home_dir, "relative/xdg-data", "./relative-config");
+    defer rel_paths.deinit(gpa);
+    try std.testing.expectEqualStrings(expected_dbus, rel_paths.dbus_service_path);
+    try std.testing.expectEqualStrings(expected_systemd, rel_paths.systemd_unit_path);
+}
+
 test "non-Linux daemon and client helpers report unsupported platform" {
     if (builtin.os.tag == .linux) return;
-    try std.testing.expectError(error.UnsupportedPlatform, runDaemon(std.testing.allocator, false));
-    try std.testing.expectError(error.UnsupportedPlatform, clientUnlockWithMasterKey(std.testing.allocator, @splat(0)));
-    try std.testing.expectError(error.UnsupportedPlatform, clientLockAll(std.testing.allocator));
-    try std.testing.expectError(error.UnsupportedPlatform, clientGetStatus(std.testing.allocator));
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedPlatform, runDaemon(gpa, false, null));
+    try std.testing.expectError(error.UnsupportedPlatform, clientUnlockWithMasterKey(gpa, @splat(0)));
+    try std.testing.expectError(error.UnsupportedPlatform, clientLockAll(gpa));
+    try std.testing.expectError(error.UnsupportedPlatform, clientGetStatus(gpa));
+
+    {
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 1), try runInstall(gpa, .{}, &stdout.writer, &stderr.writer));
+        try std.testing.expectEqualStrings(unsupported_platform_message, stderr.written());
+    }
+    {
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 1), try runUninstall(gpa, .{}, &stdout.writer, &stderr.writer));
+        try std.testing.expectEqualStrings(unsupported_platform_message, stderr.written());
+    }
+    {
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 1), try runStatus(gpa, &stdout.writer, &stderr.writer));
+        try std.testing.expectEqualStrings(unsupported_platform_message, stderr.written());
+    }
 }
 
 test "Linux daemon and client entry points compile" {
     if (builtin.os.tag != .linux) return;
+    const gpa = std.testing.allocator;
     const now = std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).toSeconds();
-    if (now == std.math.minInt(i64)) try runDaemon(std.testing.allocator, false);
-    if (clientGetStatus(std.testing.allocator)) |status_value| {
+    if (now == std.math.minInt(i64)) {
+        try runDaemon(gpa, false, null);
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        _ = try runInstall(gpa, .{}, &stdout.writer, &stderr.writer);
+        _ = try runUninstall(gpa, .{}, &stdout.writer, &stderr.writer);
+        _ = try runStatus(gpa, &stdout.writer, &stderr.writer);
+    }
+    if (clientGetStatus(gpa)) |status_value| {
         var status = status_value;
-        status.deinit(std.testing.allocator);
+        status.deinit(gpa);
     } else |_| {}
 }

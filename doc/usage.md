@@ -6,9 +6,12 @@ keyring version
 keyring --list-backends
 keyring diagnose
 
-# Linux: run the built-in Secret Service provider (starts locked).
+# Linux: run or manage the built-in Secret Service provider (starts locked).
 keyring service
-keyring service --replace
+keyring service --replace --lock-timeout 3600
+keyring service install
+keyring service status
+keyring service uninstall
 
 # Enroll and manage WebAuthn PRF security keys.
 keyring enroll --label primary-yubikey
@@ -81,6 +84,15 @@ keyring wslc login -f
 keyring wslc status
 keyring wslc logout myregistry.azurecr.io
 
+# Manage GitHub Copilot CLI credentials in the OS keyring.
+keyring copilot login
+keyring copilot status
+keyring copilot token
+eval "$(keyring copilot env)"
+keyring copilot import
+keyring copilot export /tmp/copilot-export
+keyring copilot logout
+
 # Disable storage for this process.
 keyring --disable
 keyring --disable get my-service alice
@@ -126,6 +138,20 @@ only the current repository; when multiple scope flags are given, the last wins.
 - `keyring podman credential <get|store|erase|list|version>` (or invoking `docker-credential-keyring`) speaks the noninteractive Docker credential-helper protocol over `stdin`/`stdout`.
 
 See [Podman Desktop and Podman](podman.md) for Windows WinGet + WSL 2 setup, platform `auth.json` paths, `ghr` helper provisioning, and Podman Desktop file-watcher notes.
+
+## GitHub Copilot CLI (`keyring copilot`)
+
+`keyring copilot` manages GitHub Copilot CLI (`copilot`) credentials across Windows Credential Manager, macOS Keychain, Linux Secret Service (`org.freedesktop.secrets`), and WSL (`ghr link cataggar/keyring`):
+
+- `keyring copilot login [-h|--hostname <host>] [-u|--user <login>] [--web|--device] [-f|--force]` resolves or acquires a GitHub token, writes it to the OS keyring in Copilot CLI's native format, updates `loggedInUsers` and `lastLoggedInUser` in `~/.copilot/config.json` (`$COPILOT_HOME/config.json`), and scrubs any matching plaintext `copilotTokens` entry.
+- `keyring copilot logout [-h|--hostname <host>] [-u|--user <login> | --all]` removes stored Copilot CLI credentials for the target account (or `--all` accounts) without revoking shared `gh` tokens.
+- `keyring copilot status` reports the resolved `config.json` path, configured accounts, and whether tokens are stored in the OS keyring or plaintext `copilotTokens` (`keyring diagnose` also reports Copilot CLI config and vault status when `~/.copilot/config.json` exists).
+- `keyring copilot token [-h|--hostname <host>] [-u|--user <login>]` prints the stored Copilot CLI token for the selected or active account.
+- `keyring copilot env [-h|--hostname <host>] [-u|--user <login>] [--shell <sh|pwsh|cmd|fish>]` prints shell exports setting `COPILOT_GITHUB_TOKEN` without writing secrets to disk.
+- `keyring copilot import [<dir-or-file>]` migrates plaintext `copilotTokens` from `config.json` into the OS keyring (scrubbing `config.json` in place) or imports an exported bundle.
+- `keyring copilot export <dir>` exports Copilot CLI credentials and account metadata to `<dir>` for transfer to another machine.
+
+See [GitHub Copilot CLI](copilot.md) for platform credential schemas, WSL setup with `ghr link`, headless Linux `keyring service` setup, and migrating plaintext `copilotTokens`.
 
 See also [Environment variables](environment-variables.md) and
 [Exit codes](exit-codes.md).

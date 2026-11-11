@@ -26,6 +26,95 @@ pub const Credential = struct {
     password: []u8,
 };
 
+pub const LoginOptions = struct {
+    hostname: []const u8,
+};
+
+pub fn parseLoginArgs(args: []const []const u8) ?LoginOptions {
+    if (args.len != 2) return null;
+    if (!std.mem.eql(u8, args[0], "--hostname") and !std.mem.eql(u8, args[0], "-h")) return null;
+    if (args[1].len == 0 or args[1][0] == '-') return null;
+    return .{ .hostname = args[1] };
+}
+
+/// Accept only Azure Repos organization addresses, never arbitrary hosts to
+/// which the login command could accidentally send an access token.
+pub fn loginOrgUrl(gpa: Allocator, hostname: []const u8) ![]u8 {
+    const input = try std.ascii.allocLowerString(gpa, hostname);
+    defer gpa.free(input);
+    const address = if (std.mem.startsWith(u8, input, "https://")) input[8..] else input;
+    const host_end = std.mem.indexOfScalar(u8, address, '/') orelse address.len;
+    const host = address[0..host_end];
+    const path = address[host_end..];
+    const legacy_suffix = ".visualstudio.com";
+    const org = if (std.mem.eql(u8, host, "dev.azure.com"))
+        std.mem.trim(u8, path, "/")
+    else if (std.mem.endsWith(u8, host, legacy_suffix) and
+        (path.len == 0 or std.mem.eql(u8, path, "/")))
+        host[0 .. host.len - legacy_suffix.len]
+    else
+        return error.InvalidHostname;
+    if (org.len == 0 or org.len > 50) return error.InvalidHostname;
+    for (org) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-') return error.InvalidHostname;
+    }
+    if (!std.ascii.isAlphanumeric(org[0]) or !std.ascii.isAlphanumeric(org[org.len - 1]))
+        return error.InvalidHostname;
+    return std.fmt.allocPrint(gpa, "https://dev.azure.com/{s}", .{org});
+}
+
+pub fn login(gpa: Allocator, stderr: *Io.Writer, org_url: []const u8) Error!void {
+    var credential = try getGitCredential(gpa, stderr, org_url);
+    defer gpa.free(credential.password);
+    verifyOrganization(gpa, org_url, credential.password) catch |err| {
+        if (err != error.AuthenticationFailed) return err;
+        log(stderr, "{s} Cached credentials rejected, re-authenticating...\n", .{log_prefix});
+        try eraseGitCredential(gpa, org_url);
+        const refreshed = try getGitCredentialWithRefresh(gpa, stderr, org_url, true);
+        gpa.free(credential.password);
+        credential = refreshed;
+        verifyOrganization(gpa, org_url, credential.password) catch |retry_err| {
+            if (retry_err == error.AuthenticationFailed) try eraseGitCredential(gpa, org_url);
+            return retry_err;
+        };
+    };
+}
+
+fn verifyOrganization(gpa: Allocator, org_url: []const u8, token: []const u8) Error!void {
+    const url = try std.fmt.allocPrint(gpa, "{s}/_apis/connectionData", .{org_url});
+    defer gpa.free(url);
+    const auth = try std.fmt.allocPrint(gpa, "Bearer {s}", .{token});
+    defer gpa.free(auth);
+    var response = Io.Writer.Allocating.init(gpa);
+    defer response.deinit();
+    var client: std.http.Client = .{ .allocator = gpa, .io = ioGlobal() };
+    defer client.deinit();
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .headers = .{ .authorization = .{ .override = auth } },
+        .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
+        .redirect_behavior = .not_allowed,
+        .response_writer = &response.writer,
+    }) catch return error.NetworkFailure;
+    try validateOrganizationResponse(gpa, result.status, response.written());
+}
+
+fn validateOrganizationResponse(gpa: Allocator, status: std.http.Status, body: []const u8) Error!void {
+    if (status != .ok) return error.AuthenticationFailed;
+    const ConnectionData = struct {
+        authenticatedUser: struct {
+            id: []const u8,
+            isActive: bool = false,
+        },
+    };
+    var parsed = std.json.parseFromSlice(ConnectionData, gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return error.AuthenticationFailed;
+    defer parsed.deinit();
+    const user = parsed.value.authenticatedUser;
+    if (!user.isActive or user.id.len == 0 or std.mem.eql(u8, user.id, "00000000-0000-0000-0000-000000000000"))
+        return error.AuthenticationFailed;
+}
+
 const client_id = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 const scope = "499b84ac-1321-427f-aa17-267ca6975798/.default offline_access";
 const auth_url = "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize";
@@ -318,6 +407,10 @@ const git_oauth_cache_key = "__entra_oauth__";
 /// under `__entra_oauth__` so it works across organizations even when Git sends
 /// only `host=dev.azure.com` without an organization path.
 pub fn getGitCredential(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8) Error!Credential {
+    return getGitCredentialWithRefresh(gpa, stderr, service_url, false);
+}
+
+fn getGitCredentialWithRefresh(gpa: Allocator, stderr: *Io.Writer, service_url: []const u8, force_refresh: bool) Error!Credential {
     if (!isDevOpsUrl(service_url)) return error.EntryNotFound;
 
     const now = unixNow();
@@ -326,13 +419,13 @@ pub fn getGitCredential(gpa: Allocator, stderr: *Io.Writer, service_url: []const
     var cache: Cache = loaded.cache;
 
     if (cache.access_token) |tok| {
-        if (cache.expires_at > now + 60 and tok.len > 0) {
+        if (!force_refresh and cache.expires_at > now + 60 and tok.len > 0) {
             return .{ .username = session_username, .password = try gpa.dupe(u8, tok) };
         }
     }
 
     if (cache.session_tokens.map.get(git_oauth_cache_key)) |cached| {
-        if (cached.expires_at > now + 60 and cached.token.len > 0) {
+        if (!force_refresh and cached.expires_at > now + 60 and cached.token.len > 0) {
             return .{ .username = session_username, .password = try gpa.dupe(u8, cached.token) };
         }
     }
@@ -530,6 +623,51 @@ pub fn extractOrg(service_url: []const u8) ?[]const u8 {
     }
 
     return null;
+}
+
+test "login normalizes equivalent Azure Repos organization addresses" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{
+        "example.visualstudio.com",
+        "https://EXAMPLE.visualstudio.com/",
+        "dev.azure.com/example",
+        "https://dev.azure.com/example/",
+    }) |input| {
+        const url = try loginOrgUrl(gpa, input);
+        defer gpa.free(url);
+        try std.testing.expectEqualStrings("https://dev.azure.com/example", url);
+        try std.testing.expectEqualStrings("example", extractOrg(url).?);
+    }
+}
+
+test "login rejects missing organizations and unsafe or unrelated addresses" {
+    for ([_][]const u8{
+        "",                                        "dev.azure.com",                      "https://dev.azure.com/",
+        "http://example.visualstudio.com",         "example.visualstudio.com.evil.test", "https://dev.azure.com.evil.test/example",
+        "https://evil.test/dev.azure.com/example", "https://user@dev.azure.com/example", "https://dev.azure.com:443/example",
+        "https://dev.azure.com/example/project",   "example.pkgs.visualstudio.com",      "https://dev.azure.com/example?query",
+        "https://dev.azure.com/example#fragment",  "https://dev.azure.com/%65xample",    "https://dev.azure.com/-example",
+    }) |input| {
+        try std.testing.expectError(error.InvalidHostname, loginOrgUrl(std.testing.allocator, input));
+    }
+}
+
+test "login verifies an active authenticated organization identity, not HTTP success alone" {
+    const gpa = std.testing.allocator;
+    const valid = "{\"authenticatedUser\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"isActive\":true}}";
+    try validateOrganizationResponse(gpa, .ok, valid);
+    try std.testing.expectError(error.AuthenticationFailed, validateOrganizationResponse(gpa, .unauthorized, valid));
+    try std.testing.expectError(error.AuthenticationFailed, validateOrganizationResponse(gpa, .forbidden, valid));
+    try std.testing.expectError(error.AuthenticationFailed, validateOrganizationResponse(gpa, .found, valid));
+    for ([_][]const u8{
+        "<html>Sign in</html>",
+        "{}",
+        "{\"authenticatedUser\":{\"id\":\"\",\"isActive\":true}}",
+        "{\"authenticatedUser\":{\"id\":\"00000000-0000-0000-0000-000000000000\",\"isActive\":true}}",
+        "{\"authenticatedUser\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"isActive\":false}}",
+    }) |body| {
+        try std.testing.expectError(error.AuthenticationFailed, validateOrganizationResponse(gpa, .ok, body));
+    }
 }
 
 pub fn generatePkce(verifier_out: *[43]u8, challenge_out: *[43]u8) void {

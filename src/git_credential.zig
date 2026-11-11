@@ -75,7 +75,7 @@ pub fn isGitCredentialArgv0(arg0: []const u8) bool {
     return std.ascii.eqlIgnoreCase(base, "git-credential-keyring");
 }
 
-/// Parse `keyring git config [-h|--hostname <host>] [--global|--local]`.
+/// Parse `keyring git config [-h|--hostname <host>] [-g|--global|--local]`.
 pub fn parseConfigArgs(args: []const []const u8) ?ConfigOptions {
     var opts: ConfigOptions = .{};
     var i: usize = 0;
@@ -85,7 +85,7 @@ pub fn parseConfigArgs(args: []const []const u8) ?ConfigOptions {
             if (i + 1 >= args.len or args[i + 1].len == 0) return null;
             opts.hostname = args[i + 1];
             i += 2;
-        } else if (std.mem.eql(u8, arg, "--global")) {
+        } else if (std.mem.eql(u8, arg, "--global") or std.mem.eql(u8, arg, "-g")) {
             opts.global = true;
             i += 1;
         } else if (std.mem.eql(u8, arg, "--local")) {
@@ -338,7 +338,7 @@ pub fn formatGitHelperValue(gpa: Allocator, exe_path: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// Run `keyring git config [-h|--hostname <host>] [--global|--local]`.
+/// Run `keyring git config [-h|--hostname <host>] [-g|--global|--local]`.
 pub fn runConfig(
     gpa: Allocator,
     opts: ConfigOptions,
@@ -801,4 +801,3 @@ test "runConfig preserves process environment ($HOME) and writes host-scoped and
     try std.testing.expect(std.mem.indexOf(u8, content, "git credential") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "useHttpPath = true") != null);
 }
-

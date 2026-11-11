@@ -6,6 +6,36 @@ the browser OAuth2 + PKCE flow from
 `VssSessionToken` password for Azure Artifacts feed URLs on `dev.azure.com`,
 `*.pkgs.visualstudio.com`, `pkgs.codedev.ms`, and `pkgs.vsts.me`.
 
+## Explicit Azure DevOps login
+
+Before running noninteractive Git operations, authenticate explicitly:
+
+```sh
+keyring ado login --hostname example.visualstudio.com
+# Equivalent canonical organization URL:
+keyring ado login --hostname https://dev.azure.com/example
+keyring git config --hostname example.visualstudio.com --global
+keyring git config --hostname dev.azure.com --global
+```
+
+`-h` is an alias for `--hostname`. The organization is required; bare
+`dev.azure.com` is not enough. Only HTTPS organization URLs or legacy organization
+hostnames are accepted, not project/repository URLs or unrelated hosts.
+Equivalent legacy and canonical addresses are normalized to the same organization.
+
+Login reuses the existing Azure DevOps token cache, MSAL SSO, and browser
+OAuth2 + PKCE fallback. It verifies an active authenticated identity through the
+organization's connection API before reporting success, and never prints tokens.
+Organization access does not guarantee permission to every repository.
+Git uses the cached OAuth credential; package feeds continue using their
+per-organization session tokens. Login does not change Git configuration.
+
+Interactive authentication honors `ADO_KEYRING_NONINTERACTIVE`,
+`KEYRING_NONINTERACTIVE`, `GIT_TERMINAL_PROMPT`, and `GCM_INTERACTIVE`; run login
+with browser access and without settings that disable interaction. An unavailable
+token store or a disabled browser flow fails explicitly instead of reporting success.
+Disabling disk caching also prevents login from preparing later Git processes.
+
 ## Token caching
 
 Tokens are cached per platform. The long-lived OAuth **refresh token** is stored

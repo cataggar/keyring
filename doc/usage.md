@@ -53,6 +53,10 @@ keyring gh login --hostname example.ghe.com --device
 keyring git config
 keyring git config -h example.ghe.com
 
+# Authenticate Azure DevOps before noninteractive Git operations.
+keyring ado login --hostname example.visualstudio.com
+keyring ado login --hostname https://dev.azure.com/example
+
 # Import GitHub CLI credentials into the OS keyring (from dir, file, stdin, or local hosts.yml).
 keyring gh import /tmp/gh-export
 keyring gh import

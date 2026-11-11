@@ -47,6 +47,7 @@ const usage =
     \\  get <service> <user>          Read a password to stdout.
     \\  del <service> <user>          Delete a password.
     \\  az export <dir>               Export Azure CLI token cache to a directory.
+    \\  ado login --hostname <host>    Authenticate and verify access to an Azure DevOps organization.
     \\  gh login [options]            Authenticate with a GitHub host (github.com, *.ghe.com, GHES).
     \\  gh export <dir>               Export GitHub CLI credentials to <dir>/hosts.yml.
     \\  gh import [<dir-or-file>]     Import GitHub CLI credentials into the keyring.
@@ -101,6 +102,7 @@ pub const Command = union(enum) {
     get: struct { service: []const u8, user: []const u8 },
     del: struct { service: []const u8, user: []const u8 },
     az_export: struct { dir: []const u8 },
+    ado_login: ado.LoginOptions,
     gh_login: gh.LoginOptions,
     gh_export: struct { dir: []const u8 },
     gh_import: struct { source: ?[]const u8 },
@@ -270,6 +272,28 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
         .gh_login => |opts| code: {
             break :code try gh.runLogin(arena, opts, stdout, stderr);
         },
+        .ado_login => |opts| code: {
+            const org_url = ado.loginOrgUrl(arena, opts.hostname) catch |err| {
+                if (err == error.InvalidHostname) {
+                    try stderr.writeAll("keyring: expected <org>.visualstudio.com or https://dev.azure.com/<org>\n");
+                    try stderr.flush();
+                    break :code 2;
+                }
+                return err;
+            };
+            defer arena.free(org_url);
+            ado.login(arena, stderr, org_url) catch |err| {
+                try stderr.print("keyring: Azure DevOps login failed ({s})\n", .{@errorName(err)});
+                if (err == error.NoStorageAccess) {
+                    try stderr.writeAll("Allow interactive authentication and browser access, and check the token store with 'keyring diagnose'.\n");
+                }
+                try stderr.flush();
+                break :code exitCodeFor(err);
+            };
+            try stdout.print("Authenticated to {s}; organization access verified.\n", .{org_url});
+            try stdout.flush();
+            break :code 0;
+        },
         .gh_export => |cmd| code: {
             break :code try gh.runExport(arena, cmd.dir, stdout, stderr);
         },
@@ -397,6 +421,17 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
             .{ .az_export = .{ .dir = rest[1] } }
         else
             .{ .usage_error = "usage: keyring az export <dir>" };
+        return parsed;
+    }
+
+    if (std.mem.eql(u8, command, "ado")) {
+        parsed.command = if (rest.len >= 1 and std.mem.eql(u8, rest[0], "login"))
+            if (ado.parseLoginArgs(rest[1..])) |opts|
+                .{ .ado_login = opts }
+            else
+                .{ .usage_error = "usage: keyring ado login -h|--hostname <org>.visualstudio.com|https://dev.azure.com/<org>" }
+        else
+            .{ .usage_error = "usage: keyring ado login --hostname <organization-host-or-url>" };
         return parsed;
     }
 
@@ -1348,6 +1383,22 @@ test "parseArgs recognizes az export" {
     try expectUsage(parseArgs(&.{ "keyring", "az", "export" }));
     try expectUsage(parseArgs(&.{ "keyring", "az", "bogus", "/tmp/out" }));
     try expectUsage(parseArgs(&.{ "keyring", "az" }));
+}
+
+test "parseArgs recognizes explicit ado login and rejects malformed options" {
+    const parsed = parseArgs(&.{ "keyring", "ado", "login", "--hostname", "example.visualstudio.com" });
+    try expectCommandTag(.ado_login, parsed);
+    try std.testing.expectEqualStrings("example.visualstudio.com", parsed.command.ado_login.hostname);
+    const short = parseArgs(&.{ "keyring", "ado", "login", "-h", "https://dev.azure.com/example" });
+    try expectCommandTag(.ado_login, short);
+    try std.testing.expectEqualStrings("https://dev.azure.com/example", short.command.ado_login.hostname);
+    try expectUsage(parseArgs(&.{ "keyring", "ado" }));
+    try expectUsage(parseArgs(&.{ "keyring", "ado", "login" }));
+    try expectUsage(parseArgs(&.{ "keyring", "ado", "login", "--hostname" }));
+    try expectUsage(parseArgs(&.{ "keyring", "ado", "login", "--hostname", "" }));
+    try expectUsage(parseArgs(&.{ "keyring", "ado", "login", "--hostname", "--device" }));
+    try expectUsage(parseArgs(&.{ "keyring", "ado", "login", "--hostname", "example.visualstudio.com", "--device" }));
+    try expectUsage(parseArgs(&.{ "keyring", "ado", "logout" }));
 }
 
 test "parseArgs recognizes gh login, export, and import" {

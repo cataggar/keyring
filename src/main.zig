@@ -16,6 +16,7 @@ const service = @import("service.zig");
 const registry_auth = @import("registry_auth.zig");
 const podman = @import("podman.zig");
 const wslc = @import("wslc.zig");
+const copilot = @import("copilot.zig");
 
 test {
     _ = gh;
@@ -27,6 +28,7 @@ test {
     _ = registry_auth;
     _ = podman;
     _ = wslc;
+    _ = copilot;
 }
 
 var runtime_env_map: ?*std.process.Environ.Map = null;
@@ -43,7 +45,7 @@ const usage =
     \\  version                       Show version.
     \\  --list-backends               List available backends.
     \\  diagnose                      Show backend diagnostics.
-    \\  service [options]             Run the built-in Secret Service daemon.
+    \\  service [options]             Run the built-in Secret Service daemon, or install|uninstall|status.
     \\  enroll [options]              Enroll, list, or revoke security keys.
     \\  unlock [options]              Unlock the built-in service.
     \\  lock                           Lock the built-in service immediately.
@@ -69,6 +71,13 @@ const usage =
     \\  wslc logout <server>...       Remove registry credentials from wslc storage.
     \\  wslc status                   Show wslc credential store status and configured registries.
     \\  wslc credential <op>          Credential helper protocol for wslc (get, store, erase).
+    \\  copilot login [options]       Authenticate GitHub Copilot CLI and store token in keyring.
+    \\  copilot logout [options]      Remove Copilot CLI credentials from keyring and config.json.
+    \\  copilot status                Show Copilot CLI config.json and keyring vault status.
+    \\  copilot token [options]       Read the stored Copilot CLI token to stdout.
+    \\  copilot env [options]         Print shell export for COPILOT_GITHUB_TOKEN.
+    \\  copilot import [<src>]        Migrate plaintext copilotTokens or import into keyring.
+    \\  copilot export <dir>          Export Copilot CLI credentials to <dir>/config.json.
     \\
     \\Backends: secret_service, keychain, win_credential, file, ado, null_backend (or null)
     \\
@@ -78,13 +87,9 @@ const usage =
     \\  NO_COLOR                      Disable ANSI colors in diagnostic output
     \\  CLICOLOR_FORCE                Force ANSI colors even when stdout is not a TTY
     \\  KEYRING_VAULT_PATH            Override the WebAuthn vault.json path
+    \\  COPILOT_HOME                  Override the Copilot CLI config directory (~/.copilot)
     \\
 ;
-
-pub const ServiceArgs = struct {
-    replace: bool = false,
-    lock_timeout_seconds: ?u32 = null,
-};
 
 pub const EnrollArgs = struct {
     add_key: bool = false,
@@ -108,7 +113,7 @@ pub const Command = union(enum) {
     version,
     list_backends,
     diagnose,
-    service: ServiceArgs,
+    service: service.Action,
     enroll: EnrollArgs,
     unlock: UnlockArgs,
     lock,
@@ -126,6 +131,7 @@ pub const Command = union(enum) {
     devops_npm: devops_npm.Options,
     podman: podman.Subcommand,
     wslc: wslc.Subcommand,
+    copilot: copilot.Subcommand,
     usage_error: []const u8,
 };
 
@@ -217,13 +223,20 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
             try diagnose(arena, stdout);
             break :code 0;
         },
-        .service => |args| code: {
-            _ = args.lock_timeout_seconds;
-            service.runDaemon(arena, args.replace) catch |err| {
-                try printAppError(stderr, normalizeServiceError(err), null, null);
-                break :code 1;
-            };
-            break :code 0;
+        .service => |action| code: {
+            switch (action) {
+                .run => |args| {
+                    _ = args.lock_timeout_seconds;
+                    service.runDaemon(arena, args.replace) catch |err| {
+                        try printAppError(stderr, normalizeServiceError(err), null, null);
+                        break :code 1;
+                    };
+                    break :code 0;
+                },
+                .install => |opts| break :code try service.runInstall(arena, opts, stdout, stderr),
+                .uninstall => |opts| break :code try service.runUninstall(arena, opts, stdout, stderr),
+                .status => break :code try service.runStatus(arena, stdout, stderr),
+            }
         },
         .enroll => |args| code: {
             runEnroll(arena, io, args, stdout, stderr) catch |err| {
@@ -342,6 +355,12 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
             var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
             break :code try wslc.run(arena, subcmd, &stdin_reader.interface, stdout, stderr);
         },
+        .copilot => |subcmd| code: {
+            var stdin_buffer: [4096]u8 = undefined;
+            defer std.crypto.secureZero(u8, &stdin_buffer);
+            var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+            break :code try copilot.run(arena, subcmd, &stdin_reader.interface, stdout, stderr);
+        },
         .usage_error => |message| code: {
             try stderr.print("keyring: {s}\n{s}", .{ message, usage });
             try stderr.flush();
@@ -421,7 +440,10 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
     }
 
     if (std.mem.eql(u8, command, "service")) {
-        parsed.command = parseServiceArgs(rest) orelse .{ .usage_error = "usage: keyring service [--replace] [--lock-timeout <seconds>]" };
+        parsed.command = if (service.parseArgs(rest)) |act|
+            .{ .service = act }
+        else
+            .{ .usage_error = "usage: keyring service [--replace] [--lock-timeout <seconds>] | install [--force] | uninstall [--force] | status" };
         return parsed;
     }
 
@@ -536,24 +558,16 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
         return parsed;
     }
 
+    if (std.mem.eql(u8, command, "copilot")) {
+        parsed.command = if (copilot.parseArgs(rest)) |subcmd|
+            .{ .copilot = subcmd }
+        else
+            .{ .usage_error = "usage: keyring copilot <login [-h <host>] [-u <user>] [--web|--device] [-f|--force] | logout [-h <host>] [-u <user>|--all] | status | token [-h <host>] [-u <user>] | env [-h <host>] [-u <user>] [--shell <sh|pwsh|cmd|fish>] | import [<dir-or-file>] | export <dir>>" };
+        return parsed;
+    }
+
     parsed.command = if (std.mem.startsWith(u8, command, "-")) .{ .usage_error = "unknown flag" } else .{ .usage_error = "unknown command" };
     return parsed;
-}
-
-fn parseServiceArgs(args: []const []const u8) ?Command {
-    var result: ServiceArgs = .{};
-    var index: usize = 0;
-    while (index < args.len) {
-        if (std.mem.eql(u8, args[index], "--replace")) {
-            result.replace = true;
-            index += 1;
-        } else if (std.mem.eql(u8, args[index], "--lock-timeout")) {
-            if (index + 1 >= args.len) return null;
-            result.lock_timeout_seconds = parsePositiveU32(args[index + 1]) orelse return null;
-            index += 2;
-        } else return null;
-    }
-    return .{ .service = result };
 }
 
 fn parseEnrollArgs(args: []const []const u8) ?Command {
@@ -1109,6 +1123,7 @@ fn diagnose(arena: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     gh.diagnoseHosts(arena, stdout) catch {};
     podman.diagnose(arena, stdout) catch {};
     wslc.diagnose(arena, stdout) catch {};
+    copilot.diagnose(arena, stdout) catch {};
     try stdout.flush();
 }
 
@@ -1386,10 +1401,27 @@ test "parseArgs recognizes set get del" {
 }
 
 test "parseArgs recognizes service enroll unlock and lock" {
+    const bare_service = parseArgs(&.{ "keyring", "service" });
+    try expectCommandTag(.service, bare_service);
+    try std.testing.expect(!bare_service.command.service.run.replace);
+    try std.testing.expectEqual(@as(?u32, null), bare_service.command.service.run.lock_timeout_seconds);
+
     const service_command = parseArgs(&.{ "keyring", "service", "--replace", "--lock-timeout", "600" });
     try expectCommandTag(.service, service_command);
-    try std.testing.expect(service_command.command.service.replace);
-    try std.testing.expectEqual(@as(?u32, 600), service_command.command.service.lock_timeout_seconds);
+    try std.testing.expect(service_command.command.service.run.replace);
+    try std.testing.expectEqual(@as(?u32, 600), service_command.command.service.run.lock_timeout_seconds);
+
+    const service_install = parseArgs(&.{ "keyring", "service", "install" });
+    try expectCommandTag(.service, service_install);
+    try std.testing.expect(!service_install.command.service.install.force);
+
+    const service_uninstall = parseArgs(&.{ "keyring", "service", "uninstall", "--force" });
+    try expectCommandTag(.service, service_uninstall);
+    try std.testing.expect(service_uninstall.command.service.uninstall.force);
+
+    const service_status = parseArgs(&.{ "keyring", "service", "status" });
+    try expectCommandTag(.service, service_status);
+    try std.testing.expectEqual(std.meta.Tag(service.Action).status, std.meta.activeTag(service_status.command.service));
 
     const enroll = parseArgs(&.{
         "keyring", "enroll", "--add-key", "--recover", "--label", "backup",
@@ -1426,6 +1458,8 @@ test "parseArgs recognizes service enroll unlock and lock" {
 
 test "parseArgs rejects invalid service enroll and unlock options" {
     try expectUsage(parseArgs(&.{ "keyring", "service", "--lock-timeout", "0" }));
+    try expectUsage(parseArgs(&.{ "keyring", "service", "install", "--bogus" }));
+    try expectUsage(parseArgs(&.{ "keyring", "service", "status", "extra" }));
     try expectUsage(parseArgs(&.{ "keyring", "enroll", "--add-key", "--list" }));
     try expectUsage(parseArgs(&.{ "keyring", "enroll", "--force" }));
     try expectUsage(parseArgs(&.{ "keyring", "unlock", "--port", "70000" }));
@@ -1583,6 +1617,52 @@ test "parseArgs recognizes wslc subcommands" {
     try expectUsage(parseArgs(&.{ "keyring", "wslc", "logout" }));
     try expectUsage(parseArgs(&.{ "keyring", "wslc", "login", "--password-stdin", "ghcr.io" }));
     try expectUsage(parseArgs(&.{ "keyring", "wslc", "credential", "bogus" }));
+}
+
+test "parseArgs recognizes copilot subcommands" {
+    const login_cmd = parseArgs(&.{ "keyring", "copilot", "login", "-h", "example.ghe.com", "-u", "alice", "--device", "-f" });
+    try expectCommandTag(.copilot, login_cmd);
+    try std.testing.expectEqualStrings("example.ghe.com", login_cmd.command.copilot.login.hostname);
+    try std.testing.expectEqualStrings("alice", login_cmd.command.copilot.login.username.?);
+    try std.testing.expectEqual(gh.LoginMode.device, login_cmd.command.copilot.login.mode);
+    try std.testing.expect(login_cmd.command.copilot.login.force);
+
+    const logout_all = parseArgs(&.{ "keyring", "copilot", "logout", "--all" });
+    try expectCommandTag(.copilot, logout_all);
+    try std.testing.expect(logout_all.command.copilot.logout.all);
+
+    const status_cmd = parseArgs(&.{ "keyring", "copilot", "status" });
+    try expectCommandTag(.copilot, status_cmd);
+    try std.testing.expectEqual(std.meta.Tag(copilot.Subcommand).status, std.meta.activeTag(status_cmd.command.copilot));
+
+    const token_cmd = parseArgs(&.{ "keyring", "copilot", "token", "-h", "github.com", "-u", "alice" });
+    try expectCommandTag(.copilot, token_cmd);
+    try std.testing.expectEqualStrings("github.com", token_cmd.command.copilot.token.hostname.?);
+    try std.testing.expectEqualStrings("alice", token_cmd.command.copilot.token.username.?);
+
+    const env_cmd = parseArgs(&.{ "keyring", "copilot", "env", "--shell", "sh" });
+    try expectCommandTag(.copilot, env_cmd);
+    try std.testing.expectEqual(copilot.ShellKind.sh, env_cmd.command.copilot.env.shell.?);
+
+    const imp_local = parseArgs(&.{ "keyring", "copilot", "import" });
+    try expectCommandTag(.copilot, imp_local);
+    try std.testing.expect(imp_local.command.copilot.import_cmd.source == null);
+
+    const imp_src = parseArgs(&.{ "keyring", "copilot", "import", "./copilot-bundle" });
+    try expectCommandTag(.copilot, imp_src);
+    try std.testing.expectEqualStrings("./copilot-bundle", imp_src.command.copilot.import_cmd.source.?);
+
+    const exp_cmd = parseArgs(&.{ "keyring", "copilot", "export", "./copilot-bundle" });
+    try expectCommandTag(.copilot, exp_cmd);
+    try std.testing.expectEqualStrings("./copilot-bundle", exp_cmd.command.copilot.export_cmd.dir);
+
+    try expectUsage(parseArgs(&.{ "keyring", "copilot" }));
+    try expectUsage(parseArgs(&.{ "keyring", "copilot", "bogus" }));
+    try expectUsage(parseArgs(&.{ "keyring", "copilot", "login", "--web", "--device" }));
+    try expectUsage(parseArgs(&.{ "keyring", "copilot", "logout", "--all", "-u", "alice" }));
+    try expectUsage(parseArgs(&.{ "keyring", "copilot", "status", "extra" }));
+    try expectUsage(parseArgs(&.{ "keyring", "copilot", "env", "--shell", "bogus" }));
+    try expectUsage(parseArgs(&.{ "keyring", "copilot", "export" }));
 }
 
 test "parseArgs recognizes backend flag" {

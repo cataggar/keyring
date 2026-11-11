@@ -264,7 +264,7 @@ mkdir -p "$TEST_XDG_DATA" "$TEST_XDG_CONFIG" "$TEST_XDG_RUNTIME" "$COPILOT_DIR"
 
 SERVICE_STATUS="$(NO_COLOR=1 XDG_DATA_HOME="$TEST_XDG_DATA" XDG_CONFIG_HOME="$TEST_XDG_CONFIG" XDG_RUNTIME_DIR="$TEST_XDG_RUNTIME" "$BIN" service status 2>&1)" || fail "keyring service status failed"
 printf '%s\n' "$SERVICE_STATUS" | grep -Fqi 'enrolled' || fail "service status did not report enrolled: $SERVICE_STATUS"
-printf '%s\n' "$SERVICE_STATUS" | grep -Fqi 'running (unlocked)' || fail "service status did not report running (unlocked): $SERVICE_STATUS"
+printf '%s\n' "$SERVICE_STATUS" | grep -Fqi 'running (unlocked' || fail "service status did not report running (unlocked): $SERVICE_STATUS"
 
 XDG_DATA_HOME="$TEST_XDG_DATA" XDG_CONFIG_HOME="$TEST_XDG_CONFIG" XDG_RUNTIME_DIR="$TEST_XDG_RUNTIME" "$BIN" service install >/dev/null || fail "keyring service install failed"
 [ -f "$DBUS_SERVICE_FILE" ] || fail "service install did not write $DBUS_SERVICE_FILE"

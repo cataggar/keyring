@@ -702,6 +702,22 @@ pub fn storeGenericCredential(
     username: []const u8,
     secret: []const u8,
 ) Error!void {
+    return storeGenericCredentialWithInteraction(
+        gpa,
+        raw_or_norm_server,
+        username,
+        secret,
+        .if_available,
+    );
+}
+
+pub fn storeGenericCredentialWithInteraction(
+    gpa: Allocator,
+    raw_or_norm_server: []const u8,
+    username: []const u8,
+    secret: []const u8,
+    interaction: credential_provider.InteractionPolicy,
+) Error!void {
     if (username.len == 0 or secret.len == 0) return error.InvalidInput;
     for (username) |c| {
         if (c == 0 or std.ascii.isControl(c)) return error.InvalidInput;
@@ -757,7 +773,7 @@ pub fn storeGenericCredential(
             .target = target,
             .operation = .login,
             .account = if (is_identity_token) null else username,
-            .interaction = .never,
+            .interaction = interaction,
             .deadline = deadline,
         },
         .credential = &cred_in,
@@ -765,6 +781,36 @@ pub fn storeGenericCredential(
     saved.deinit(gpa);
 
     try upsertRegistryIndex(gpa, bare_host, username);
+    if (try legacyLoweredAuthorityIfDistinctAlloc(gpa, raw_or_norm_server, bare_host)) |legacy_host| {
+        defer gpa.free(legacy_host);
+        const legacy_svc = try genericRegistryServiceAlloc(gpa, legacy_host);
+        defer gpa.free(legacy_svc);
+        activeGenericStoreOps().delete(gpa, legacy_svc, generic_default_account) catch {};
+        _ = removeRegistryIndex(gpa, legacy_host) catch false;
+    }
+}
+
+fn legacyLoweredAuthorityIfDistinctAlloc(
+    gpa: Allocator,
+    raw_server: []const u8,
+    canonical_bare_host: []const u8,
+) Error!?[]u8 {
+    var s = std.mem.trim(u8, raw_server, " \t\r\n");
+    if (std.mem.indexOf(u8, s, "://")) |scheme_idx| {
+        s = s[scheme_idx + 3 ..];
+    }
+    if (std.mem.indexOfScalar(u8, s, '/')) |slash_idx| {
+        s = s[0..slash_idx];
+    }
+    if (s.len == 0 or s[0] != '[') return null;
+
+    const lowered = try gpa.dupe(u8, s);
+    _ = std.ascii.lowerString(lowered, lowered);
+    if (std.mem.eql(u8, lowered, canonical_bare_host)) {
+        gpa.free(lowered);
+        return null;
+    }
+    return lowered;
 }
 
 pub const GenericLookupSource = enum {
@@ -882,6 +928,53 @@ pub fn getGenericCredentialDetailedAt(
     }
 
     const ops = activeGenericStoreOps();
+    if (primary_miss_err == error.EntryNotFound) {
+        if (try legacyLoweredAuthorityIfDistinctAlloc(gpa, raw_or_norm_server, bare_host)) |legacy_host| {
+            defer gpa.free(legacy_host);
+            const legacy_svc = try genericRegistryServiceAlloc(gpa, legacy_host);
+            defer gpa.free(legacy_svc);
+            if (ops.get(gpa, legacy_svc, generic_default_account)) |raw_legacy| {
+                defer {
+                    std.crypto.secureZero(u8, raw_legacy);
+                    gpa.free(raw_legacy);
+                }
+                const LegacyV0 = struct {
+                    username: ?[]const u8 = null,
+                    secret: ?[]const u8 = null,
+                };
+                const parsed = std.json.parseFromSlice(LegacyV0, gpa, raw_legacy, .{
+                    .ignore_unknown_fields = true,
+                }) catch return error.StorageFailure;
+                defer parsed.deinit();
+
+                const u = parsed.value.username orelse return error.StorageFailure;
+                const sec = parsed.value.secret orelse return error.StorageFailure;
+                if (u.len == 0 or sec.len == 0) return error.StorageFailure;
+
+                if (requested_username == null or std.mem.eql(u8, u, requested_username.?)) {
+                    const server_copy = try gpa.dupe(u8, bare_host);
+                    errdefer gpa.free(server_copy);
+                    const user_copy = try gpa.dupe(u8, u);
+                    errdefer gpa.free(user_copy);
+                    const secret_copy = try gpa.dupe(u8, sec);
+                    return .{
+                        .credential = .{
+                            .kind = if (std.mem.eql(u8, u, identity_token_username)) .identity_token else .basic,
+                            .server = server_copy,
+                            .username = user_copy,
+                            .secret = secret_copy,
+                            .expires_at = extractJwtExpiration(gpa, secret_copy),
+                        },
+                        .source = .primary_container_registry,
+                    };
+                }
+            } else |err| switch (err) {
+                error.EntryNotFound => {},
+                else => return mapKeyringError(err),
+            }
+        }
+    }
+
     if (requested_username) |user| {
         if (user.len > 0) {
             const https_svc = try std.fmt.allocPrint(gpa, "https://{s}", .{bare_host});
@@ -970,6 +1063,14 @@ pub fn getGenericCredential(
 /// Delete any generic credential stored for `raw_or_norm_server` and remove it
 /// from `registries.json`. Returns `error.EntryNotFound` only if absent in both.
 pub fn deleteGenericCredential(gpa: Allocator, raw_or_norm_server: []const u8) Error!void {
+    return deleteGenericCredentialWithInteraction(gpa, raw_or_norm_server, .if_available);
+}
+
+pub fn deleteGenericCredentialWithInteraction(
+    gpa: Allocator,
+    raw_or_norm_server: []const u8,
+    interaction: credential_provider.InteractionPolicy,
+) Error!void {
     const bare_host = try normalizeServerAlloc(gpa, raw_or_norm_server, .bare_docker_io);
     defer gpa.free(bare_host);
 
@@ -983,13 +1084,28 @@ pub fn deleteGenericCredential(gpa: Allocator, raw_or_norm_server: []const u8) E
     stored.logout(gpa, .{
         .target = target,
         .operation = .logout,
-        .interaction = .never,
+        .interaction = interaction,
     }) catch |err| switch (err) {
         error.CredentialNotFound => found_keyring = false,
         else => return mapProviderError(err),
     };
 
-    const removed_index = try removeRegistryIndex(gpa, bare_host);
+    var removed_index = try removeRegistryIndex(gpa, bare_host);
+    if (try legacyLoweredAuthorityIfDistinctAlloc(gpa, raw_or_norm_server, bare_host)) |legacy_host| {
+        defer gpa.free(legacy_host);
+        const legacy_svc = try genericRegistryServiceAlloc(gpa, legacy_host);
+        defer gpa.free(legacy_svc);
+        if (activeGenericStoreOps().delete(gpa, legacy_svc, generic_default_account)) |_| {
+            found_keyring = true;
+        } else |err| switch (err) {
+            error.EntryNotFound => {},
+            else => return mapKeyringError(err),
+        }
+        if (try removeRegistryIndex(gpa, legacy_host)) {
+            removed_index = true;
+        }
+    }
+
     if (!found_keyring and !removed_index) {
         return error.EntryNotFound;
     }
@@ -1960,6 +2076,21 @@ test "normalizeServerAlloc canonicalizes bracketed IPv6 across keyring and regis
     const listed_after = try listGenericIndexAlloc(gpa);
     defer gpa.free(listed_after);
     try std.testing.expectEqual(@as(usize, 0), listed_after.len);
+
+    // Pre-canonical legacy IPv6 key stored by an older binary still resolves and cleans up on delete!
+    try FakeGenericStore.set(
+        gpa,
+        "container-registry://[2001:0db8:0:0:0:0:0:1]:5000",
+        "default",
+        "{\"username\":\"legacy-v6\",\"secret\":\"legacy-v6-secret\"}",
+    );
+    const got_legacy_v6 = try getGenericCredential(gpa, "[2001:0DB8:0:0:0:0:0:1]:5000", null);
+    defer got_legacy_v6.deinit(gpa);
+    try std.testing.expectEqualStrings("legacy-v6", got_legacy_v6.username);
+    try std.testing.expectEqualStrings("legacy-v6-secret", got_legacy_v6.secret);
+
+    try deleteGenericCredential(gpa, "[2001:0DB8:0:0:0:0:0:1]:5000");
+    try std.testing.expectError(error.EntryNotFound, getGenericCredential(gpa, "[2001:0DB8:0:0:0:0:0:1]:5000", null));
 }
 
 test "live null_backend fails closed with NoStorageAccess without touching registries.json" {

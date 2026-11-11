@@ -98,15 +98,14 @@ pub fn mapKeyringError(err: keyring_zig.Error) cp.ProviderError {
 pub fn checkSecureBackendAvailable(gpa: Allocator) cp.ProviderError!void {
     if (is_app_backend_disallowed_fn) |disallowed_fn| {
         if (disallowed_fn()) return error.StorageUnavailable;
-    } else {
-        if (try getEnvOwned(gpa, "KEYRING_BACKEND")) |backend_env| {
-            defer gpa.free(backend_env);
-            const trimmed = std.mem.trim(u8, backend_env, " \t\r\n");
-            if (std.ascii.eqlIgnoreCase(trimmed, "ado") or
-                std.ascii.eqlIgnoreCase(trimmed, "azure_devops"))
-            {
-                return error.StorageUnavailable;
-            }
+    }
+    if (try getEnvOwned(gpa, "KEYRING_BACKEND")) |backend_env| {
+        defer gpa.free(backend_env);
+        const trimmed = std.mem.trim(u8, backend_env, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(trimmed, "ado") or
+            std.ascii.eqlIgnoreCase(trimmed, "azure_devops"))
+        {
+            return error.StorageUnavailable;
         }
     }
 

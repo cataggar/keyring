@@ -43,11 +43,22 @@ jobs:
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev libglib2.0-dev dbus gnome-keyring libsecret-tools python3-cryptography python3-pip
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::Retries=5 update &&
+               sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+                 dbus gnome-keyring libsecret-tools python3-cryptography python3-pip; then
+              exit 0
+            fi
+            echo "apt-get attempt ${attempt} failed; retrying..." >&2
+            sleep 5
+          done
+          exit 1
 
       - name: Install Python keyring
         if: runner.os == 'Linux'
-        run: pip install keyring
+        run: pip install --retries 5 keyring
 
       - name: Build static Linux binary
         if: runner.os == 'Linux'

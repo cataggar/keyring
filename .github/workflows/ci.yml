@@ -42,7 +42,18 @@ jobs:
           test "$version" = "0.17.0"
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y dbus libsecret-1-dev python3-cryptography
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::Retries=5 update &&
+               sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+                 dbus libsecret-tools python3-cryptography; then
+              exit 0
+            fi
+            echo "apt-get attempt ${attempt} failed; retrying..." >&2
+            sleep 5
+          done
+          exit 1
       - name: Build
         run: zig build
       - name: Test

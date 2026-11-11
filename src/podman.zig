@@ -2815,6 +2815,15 @@ test "--auths-only removes owned keyring helper and refuses external helper with
     registry_auth.state_dir_override = state_dir;
     defer registry_auth.state_dir_override = null;
 
+    TestGenericBackend.reset(gpa);
+    defer TestGenericBackend.deinit(gpa);
+    registry_auth.generic_store_override = .{
+        .get = TestGenericBackend.get,
+        .set = TestGenericBackend.set,
+        .delete = TestGenericBackend.delete,
+    };
+    defer registry_auth.generic_store_override = null;
+
     FakeProviders.reset();
     provider_hooks_override = FakeProviders.hooks;
     defer provider_hooks_override = null;

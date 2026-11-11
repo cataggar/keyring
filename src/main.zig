@@ -466,9 +466,9 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
             parsed.command = if (git_credential.parseConfigArgs(rest[1..])) |opts|
                 .{ .git_config = opts }
             else
-                .{ .usage_error = "usage: keyring git config [-h|--hostname <host>] [--global|--local]" };
+                .{ .usage_error = "usage: keyring git config [-h|--hostname <host>] [-g|--global|--local]" };
         } else {
-            parsed.command = .{ .usage_error = "usage: keyring git <credential <get|store|erase> | config [-h|--hostname <host>] [--global|--local]>" };
+            parsed.command = .{ .usage_error = "usage: keyring git <credential <get|store|erase> | config [-h|--hostname <host>] [-g|--global|--local]>" };
         }
         return parsed;
     }
@@ -1459,6 +1459,18 @@ test "parseArgs recognizes git credential, git-credential-keyring argv0, and git
     try expectCommandTag(.git_config, cfg_short_h);
     try std.testing.expectEqualStrings("microsoft.ghe.com", cfg_short_h.command.git_config.hostname.?);
     try std.testing.expect(cfg_short_h.command.git_config.global);
+
+    const cfg_short_g = parseArgs(&.{ "keyring", "git", "config", "-h", "example.ghe.com", "-g" });
+    try expectCommandTag(.git_config, cfg_short_g);
+    try std.testing.expect(cfg_short_g.command.git_config.global);
+
+    const cfg_global_last = parseArgs(&.{ "keyring", "git", "config", "--local", "-g" });
+    try expectCommandTag(.git_config, cfg_global_last);
+    try std.testing.expect(cfg_global_last.command.git_config.global);
+
+    const cfg_local_last = parseArgs(&.{ "keyring", "git", "config", "-g", "--local" });
+    try expectCommandTag(.git_config, cfg_local_last);
+    try std.testing.expect(!cfg_local_last.command.git_config.global);
 
     try expectUsage(parseArgs(&.{ "keyring", "git", "credential", "bogus" }));
     try expectUsage(parseArgs(&.{ "git-credential-keyring", "bogus" }));

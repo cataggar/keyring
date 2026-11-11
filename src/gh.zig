@@ -1493,6 +1493,9 @@ pub fn lookupStoredKeyringCredential(
         }
     }
 
+    var saw_locked = false;
+    var saw_no_access = false;
+
     if (specific_user) |wanted_user| {
         var canonical_user: []const u8 = wanted_user;
         var is_active = false;
@@ -1524,6 +1527,8 @@ pub fn lookupStoredKeyringCredential(
             };
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.Locked => saw_locked = true,
+            error.NoStorageAccess => saw_no_access = true,
             else => {},
         }
 
@@ -1544,9 +1549,13 @@ pub fn lookupStoredKeyringCredential(
                 gpa.free(tok);
             } else |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.Locked => saw_locked = true,
+                error.NoStorageAccess => saw_no_access = true,
                 else => {},
             }
         }
+        if (saw_locked) return error.Locked;
+        if (saw_no_access) return error.NoStorageAccess;
         return null;
     }
 
@@ -1567,6 +1576,8 @@ pub fn lookupStoredKeyringCredential(
                     };
                 } else |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
+                    error.Locked => saw_locked = true,
+                    error.NoStorageAccess => saw_no_access = true,
                     else => {},
                 }
             }
@@ -1594,11 +1605,15 @@ pub fn lookupStoredKeyringCredential(
                 gpa.free(tok);
             } else |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.Locked => saw_locked = true,
+                error.NoStorageAccess => saw_no_access = true,
                 else => {},
             }
         }
     }
 
+    if (saw_locked) return error.Locked;
+    if (saw_no_access) return error.NoStorageAccess;
     return null;
 }
 

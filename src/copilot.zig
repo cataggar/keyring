@@ -745,19 +745,6 @@ pub fn decodeWindowsCredentialBlobAlloc(gpa: Allocator, blob: []const u8) Error!
     return decodeWindowsUtf8BlobAlloc(gpa, blob);
 }
 
-fn decodeWindowsNativeTargetBlobAlloc(gpa: Allocator, blob: []const u8) SecretError![]u8 {
-    if (decodeWindowsUtf16LeBlobAlloc(gpa, blob)) |decoded| {
-        return decoded;
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.StorageFailure => return decodeWindowsUtf8BlobAlloc(gpa, blob) catch |uerr| switch (uerr) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.StorageFailure,
-        },
-        else => return error.StorageFailure,
-    }
-}
-
 fn looksLikeUtf16LePassword(blob: []const u8) bool {
     if (blob.len < 2 or blob.len % 2 != 0) return false;
     if (std.mem.startsWith(u8, blob, "\xFF\xFE")) return true;
@@ -792,7 +779,10 @@ fn liveSecretGet(gpa: Allocator, service: []const u8, account: []const u8) Secre
                 std.crypto.secureZero(u8, raw);
                 gpa.free(raw);
             }
-            return decodeWindowsNativeTargetBlobAlloc(gpa, raw);
+            return decodeWindowsUtf16LeBlobAlloc(gpa, raw) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.StorageFailure,
+            };
         } else |err| switch (err) {
             error.EntryNotFound => {},
             error.OutOfMemory => return error.OutOfMemory,
@@ -823,7 +813,10 @@ fn liveSecretGet(gpa: Allocator, service: []const u8, account: []const u8) Secre
                 std.crypto.secureZero(u8, raw);
                 gpa.free(raw);
             }
-            return decodeWindowsNativeTargetBlobAlloc(gpa, raw);
+            return decodeWindowsUtf8BlobAlloc(gpa, raw) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.StorageFailure,
+            };
         } else |err| return switch (err) {
             error.EntryNotFound => error.EntryNotFound,
             error.OutOfMemory => error.OutOfMemory,
@@ -1577,21 +1570,42 @@ fn resolveStoredCredential(
             resolveCanonicalLogin(snap, target_https_host, wanted)
         else
             null;
-        if (gh.lookupStoredKeyringCredential(gpa, bare_host, lookup_user) catch null) |gh_cred| {
-            defer gh_cred.deinit(gpa);
-            if (!gh_cred.from_env and
-                gh_cred.stored_in_keyring and
-                !std.mem.eql(u8, gh_cred.username, gh.token_username) and
-                !std.ascii.eqlIgnoreCase(gh_cred.username, gh.token_username) and
-                !isClassicPat(gh_cred.token))
-            {
-                return .{
-                    .https_host = try gpa.dupe(u8, target_https_host),
-                    .login = try gpa.dupe(u8, gh_cred.username),
-                    .token = try gpa.dupe(u8, gh_cred.token),
-                    .from_gh_fallback = true,
-                };
+        if (gh.lookupStoredKeyringCredential(gpa, bare_host, lookup_user)) |maybe_gh_cred| {
+            if (maybe_gh_cred) |gh_cred| {
+                defer gh_cred.deinit(gpa);
+                if (!gh_cred.from_env and
+                    gh_cred.stored_in_keyring and
+                    !std.mem.eql(u8, gh_cred.username, gh.token_username) and
+                    !std.ascii.eqlIgnoreCase(gh_cred.username, gh.token_username) and
+                    !isClassicPat(gh_cred.token))
+                {
+                    return .{
+                        .https_host = try gpa.dupe(u8, target_https_host),
+                        .login = try gpa.dupe(u8, gh_cred.username),
+                        .token = try gpa.dupe(u8, gh_cred.token),
+                        .from_gh_fallback = true,
+                    };
+                }
             }
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Locked => saw_locked = true,
+            error.NoStorageAccess => saw_no_access = true,
+            else => {},
+        }
+    }
+
+    // When no candidate account was probed yet (e.g. missing/empty config.json),
+    // probe the keyring once so Locked / NoStorageAccess are surfaced accurately.
+    if (opts.username == null and snap.users.items.len == 0 and !saw_locked and !saw_no_access and !saw_storage_failure) {
+        if (store.get(a, service_name, "__keyring_copilot_probe__")) |probe_tok| {
+            std.crypto.secureZero(u8, probe_tok);
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Locked => saw_locked = true,
+            error.NoStorageAccess => saw_no_access = true,
+            error.StorageFailure => saw_storage_failure = true,
+            error.EntryNotFound => {},
         }
     }
 
@@ -1671,6 +1685,32 @@ fn runLogin(
     }
 
     if (resolved_token == null) {
+        // Verify keyring accessibility before starting interactive OAuth so we
+        // never mint a token or fall back to plaintext `hosts.yml` when the
+        // keyring is locked or unavailable (including when `--force` is set).
+        if (activeSecretStore().get(gpa, service_name, "__keyring_copilot_probe__")) |probe_tok| {
+            std.crypto.secureZero(u8, probe_tok);
+            gpa.free(probe_tok);
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Locked => {
+                try stderr.writeAll("keyring: copilot login: OS keyring is locked (run 'keyring unlock' first)\n");
+                try stderr.flush();
+                return 1;
+            },
+            error.NoStorageAccess => {
+                try stderr.writeAll("keyring: copilot login: no access to OS keyring (run 'keyring diagnose' for guidance)\n");
+                try stderr.flush();
+                return 4;
+            },
+            error.StorageFailure => {
+                try stderr.writeAll("keyring: copilot login: failed to read from OS keyring\n");
+                try stderr.flush();
+                return 1;
+            },
+            error.EntryNotFound => {},
+        }
+
         const cred = gh.loginOAuth(gpa, .{
             .hostname = canonical_host,
             .mode = opts.mode,
@@ -2050,7 +2090,10 @@ fn detectDefaultShell(gpa: Allocator) ShellKind {
 }
 
 pub fn formatShellExportAlloc(gpa: Allocator, shell: ShellKind, token: []const u8) Error![]u8 {
-    if (std.mem.indexOfAny(u8, token, "\r\n\x00") != null) return error.InvalidInput;
+    if (token.len == 0) return error.InvalidInput;
+    for (token) |c| {
+        if (c <= 0x20 or c >= 0x7f) return error.InvalidInput;
+    }
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -3009,11 +3052,18 @@ test "Windows target-specific UTF-16LE and UTF-8 decoders validate lengths and e
     defer gpa.free(dec_bom);
     try std.testing.expectEqualStrings("gho_WinCred123", dec_bom);
 
-    // Odd-length blob fails strict UTF-16LE decoding, then succeeds via UTF-8 fallback.
+    // Odd-length blob fails strict UTF-16LE decoding (`target_dot`), while
+    // 40-byte ASCII UTF-8 tokens (`target_at` / `target_slash`) decode cleanly via `decodeWindowsUtf8BlobAlloc`.
     try std.testing.expectError(error.StorageFailure, decodeWindowsUtf16LeBlobAlloc(gpa, "gho_odd"));
-    const fallback = try decodeWindowsNativeTargetBlobAlloc(gpa, "gho_odd");
-    defer gpa.free(fallback);
-    try std.testing.expectEqualStrings("gho_odd", fallback);
+    const forty_char_tok = "gho_0123456789abcdefghijklmnopqrstuvwxyz";
+    try std.testing.expectEqual(@as(usize, 40), forty_char_tok.len);
+    const dec_at = try decodeWindowsUtf8BlobAlloc(gpa, forty_char_tok);
+    defer gpa.free(dec_at);
+    try std.testing.expectEqualStrings(forty_char_tok, dec_at);
+
+    // Unicode curly single quote U+2019 (\xe2\x80\x99) must be rejected by formatShellExportAlloc (PowerShell quote breakout).
+    try std.testing.expectError(error.InvalidInput, formatShellExportAlloc(gpa, .pwsh, "gho_bad\xe2\x80\x99;calc"));
+    try std.testing.expectError(error.InvalidInput, formatShellExportAlloc(gpa, .sh, "gho_bad\xe2\x80\x99"));
 
     // Legacy keytar UTF-8 decoder trims trailing NULs and rejects invalid UTF-8 / interior NULs.
     const dec8 = try decodeWindowsUtf8BlobAlloc(gpa, "gho_keytar\x00\x00");
@@ -3238,4 +3288,50 @@ test "null_backend (--disable) returns exit 4 across token, import, logout, and 
     const after = (try registry_auth.readFileIfExists(gpa, config_path)).?;
     defer gpa.free(after);
     try std.testing.expectEqualStrings(initial_config, after);
+}
+
+test "first-time login, login -f, token, and env without config.json surface Locked and NoStorageAccess before OAuth" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try testTmpDirPath(&tmp, gpa);
+    defer gpa.free(root_path);
+    const copilot_dir = try std.fs.path.join(gpa, &.{ root_path, "empty-copilot-home" });
+    defer gpa.free(copilot_dir);
+
+    MockStoreState.reset(gpa);
+    defer MockStoreState.deinit();
+    setTestOverrides(MockStoreState.store, copilot_dir, testNoColorEnv);
+    defer setTestOverrides(null, null, null);
+
+    var empty_in = Io.Reader.fixed("");
+    var out = Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    var err_out = Io.Writer.Allocating.init(gpa);
+    defer err_out.deinit();
+
+    MockStoreState.mode = .locked;
+    for ([_]Subcommand{
+        .{ .login = .{} },
+        .{ .login = .{ .force = true } },
+        .{ .token = .{} },
+        .{ .env = .{ .shell = .sh } },
+    }) |subcmd| {
+        out.clearRetainingCapacity();
+        err_out.clearRetainingCapacity();
+        try std.testing.expectEqual(@as(u8, 1), try run(gpa, subcmd, &empty_in, &out.writer, &err_out.writer));
+    }
+
+    MockStoreState.mode = .no_access;
+    for ([_]Subcommand{
+        .{ .login = .{} },
+        .{ .login = .{ .force = true } },
+        .{ .token = .{} },
+        .{ .env = .{ .shell = .sh } },
+    }) |subcmd| {
+        out.clearRetainingCapacity();
+        err_out.clearRetainingCapacity();
+        try std.testing.expectEqual(@as(u8, 4), try run(gpa, subcmd, &empty_in, &out.writer, &err_out.writer));
+    }
 }

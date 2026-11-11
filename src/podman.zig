@@ -1183,15 +1183,37 @@ pub const ResolvedPodmanCredential = struct {
     origin: CredentialOrigin,
 };
 
+fn isKeyringHelperConfiguredInAuthFile(
+    gpa: Allocator,
+    auth_path: ?[]const u8,
+    bare_host: []const u8,
+) bool {
+    const path = auth_path orelse return false;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const bytes = (registry_auth.readFileIfExists(a, path) catch return false) orelse return false;
+    defer std.crypto.secureZero(u8, bytes);
+    if (bytes.len == 0) return false;
+
+    const root = parseAuthJsonRootLeaky(a, bytes) catch return false;
+    const ch_val = root.get("credHelpers") orelse return false;
+    if (ch_val != .object) return false;
+    const hv = ch_val.object.get(bare_host) orelse return false;
+    return hv == .string and std.mem.eql(u8, hv.string, helper_value);
+}
+
 fn lookupStoredOrAuthsFallback(
     gpa: Allocator,
     bare_host: []const u8,
     auth_path: ?[]const u8,
     requested_username: ?[]const u8,
+    enforce_owned_helper_storage: bool,
 ) Error!?ResolvedPodmanCredential {
     const now = activeProviderHooks().nowSeconds();
 
-    if (registry_auth.getGenericCredentialDetailed(gpa, bare_host, requested_username)) |res| {
+    if (registry_auth.getGenericCredentialDetailedAt(gpa, bare_host, requested_username, now)) |res| {
         if (res.credential.expires_at) |exp| {
             if (exp <= now) {
                 res.credential.deinit(gpa);
@@ -1207,6 +1229,12 @@ fn lookupStoredOrAuthsFallback(
         };
     } else |err| switch (err) {
         error.EntryNotFound => {},
+        error.NoStorageAccess => {
+            if (enforce_owned_helper_storage and isKeyringHelperConfiguredInAuthFile(gpa, auth_path, bare_host)) {
+                return error.NoStorageAccess;
+            }
+        },
+        error.AuthenticationFailed => return null,
         else => return mapRegistryAuthError(err),
     }
 
@@ -1266,7 +1294,7 @@ pub fn resolvePodmanCredentialDetailed(
         defer gpa.free(gh_host);
 
         if (!force) {
-            if (registry_auth.getGenericCredentialDetailed(gpa, bare_host, requested_username)) |res| {
+            if (registry_auth.getGenericCredentialDetailedAt(gpa, bare_host, requested_username, hooks.nowSeconds())) |res| {
                 if (res.credential.expires_at == null or res.credential.expires_at.? > hooks.nowSeconds()) {
                     return .{
                         .credential = res.credential,
@@ -1278,12 +1306,12 @@ pub fn resolvePodmanCredentialDetailed(
                 }
                 res.credential.deinit(gpa);
             } else |err| switch (err) {
-                error.EntryNotFound => {},
+                error.EntryNotFound, error.NoStorageAccess, error.AuthenticationFailed => {},
                 else => return mapRegistryAuthError(err),
             }
 
             if (can_interact) {
-                if (try lookupStoredOrAuthsFallback(gpa, bare_host, auth_path, requested_username)) |existing| {
+                if (try lookupStoredOrAuthsFallback(gpa, bare_host, auth_path, requested_username, false)) |existing| {
                     var keep = false;
                     defer if (!keep) existing.credential.deinit(gpa);
                     const probe = hooks.acquireGhCredential(gpa, gh_host, requested_username, false, false, stderr) catch |err| switch (err) {
@@ -1306,7 +1334,7 @@ pub fn resolvePodmanCredentialDetailed(
                 error.NoStorageAccess => return error.NoStorageAccess,
                 error.NetworkFailure => return error.NetworkFailure,
                 else => {
-                    if (try lookupStoredOrAuthsFallback(gpa, bare_host, auth_path, requested_username)) |fb| return fb;
+                    if (try lookupStoredOrAuthsFallback(gpa, bare_host, auth_path, requested_username, false)) |fb| return fb;
                     return error.AuthenticationFailed;
                 },
             };
@@ -1330,14 +1358,14 @@ pub fn resolvePodmanCredentialDetailed(
                 };
             }
 
-            if (try lookupStoredOrAuthsFallback(gpa, bare_host, auth_path, requested_username)) |fb| return fb;
+            if (try lookupStoredOrAuthsFallback(gpa, bare_host, auth_path, requested_username, false)) |fb| return fb;
             return error.EntryNotFound;
         }
 
         // Under `-f`, only keep a generic credential if `requested_username` explicitly targets a legacy `https://` entry;
         // otherwise `login -f ghcr.io` reauthenticates via `gh` and retires any stale `container-registry://ghcr.io` override.
         if (requested_username) |user| {
-            if (registry_auth.getGenericCredentialDetailed(gpa, bare_host, user)) |res| {
+            if (registry_auth.getGenericCredentialDetailedAt(gpa, bare_host, user, hooks.nowSeconds())) |res| {
                 if (res.source == .legacy_https_service and
                     (res.credential.expires_at == null or res.credential.expires_at.? > hooks.nowSeconds()))
                 {
@@ -1345,7 +1373,7 @@ pub fn resolvePodmanCredentialDetailed(
                 }
                 res.credential.deinit(gpa);
             } else |err| switch (err) {
-                error.EntryNotFound => {},
+                error.EntryNotFound, error.NoStorageAccess, error.AuthenticationFailed => {},
                 else => return mapRegistryAuthError(err),
             }
         }
@@ -1379,7 +1407,7 @@ pub fn resolvePodmanCredentialDetailed(
 
     // 2. Azure Container Registry (`*.azurecr.*`).
     if (registry_auth.isAcrServer(bare_host)) {
-        if (registry_auth.getGenericCredentialDetailed(gpa, bare_host, requested_username)) |res| {
+        if (registry_auth.getGenericCredentialDetailedAt(gpa, bare_host, requested_username, hooks.nowSeconds())) |res| {
             const origin: CredentialOrigin = switch (res.source) {
                 .primary_container_registry => .generic_keyring_primary,
                 .legacy_https_service => .migrated_fallback,
@@ -1396,7 +1424,7 @@ pub fn resolvePodmanCredentialDetailed(
                 res.credential.deinit(gpa);
             }
         } else |err| switch (err) {
-            error.EntryNotFound => {},
+            error.EntryNotFound, error.NoStorageAccess, error.AuthenticationFailed => {},
             else => return mapRegistryAuthError(err),
         }
 
@@ -1494,7 +1522,7 @@ pub fn resolvePodmanCredentialDetailed(
     }
 
     // 3. Generic OCI registry (`docker.io`, `quay.io`, custom registries).
-    if (try lookupStoredOrAuthsFallback(gpa, bare_host, auth_path, requested_username)) |res| {
+    if (try lookupStoredOrAuthsFallback(gpa, bare_host, auth_path, requested_username, true)) |res| {
         return res;
     }
     return error.EntryNotFound;
@@ -2238,7 +2266,7 @@ fn runCredentialHelper(
             };
             defer payload.deinit(a);
 
-            registry_auth.storeGenericCredential(a, payload.server_url, payload.username, payload.secret) catch |err| {
+            registry_auth.storeGenericCredentialWithInteraction(a, payload.server_url, payload.username, payload.secret, .never) catch |err| {
                 try stderr.print("keyring: docker-credential-keyring store: {s}\n", .{@errorName(err)});
                 try stderr.flush();
                 return 1;
@@ -2247,7 +2275,7 @@ fn runCredentialHelper(
         },
         .erase => {
             const raw_server = registry_auth.readBoundedStdinLine(a, stdin, 4096) catch return 1;
-            registry_auth.deleteGenericCredential(a, raw_server) catch |err| switch (err) {
+            registry_auth.deleteGenericCredentialWithInteraction(a, raw_server, .never) catch |err| switch (err) {
                 error.EntryNotFound => return 0,
                 else => return 1,
             };
@@ -2406,13 +2434,16 @@ fn reportError(stderr: *Io.Writer, cmd_label: []const u8, maybe_server: ?[]const
 
 const TestGenericBackend = struct {
     var map: ?std.StringHashMap([]u8) = null;
+    var fail_access: bool = false;
 
     fn reset(gpa: Allocator) void {
         deinit(gpa);
         map = std.StringHashMap([]u8).init(gpa);
+        fail_access = false;
     }
 
     fn deinit(gpa: Allocator) void {
+        fail_access = false;
         if (map) |*m| {
             var it = m.iterator();
             while (it.next()) |kv| {
@@ -2426,6 +2457,7 @@ const TestGenericBackend = struct {
     }
 
     fn get(gpa: Allocator, service: []const u8, account: []const u8) @import("keyring_zig").Error![]u8 {
+        if (fail_access) return error.NoStorageAccess;
         const m = &(map orelse return error.EntryNotFound);
         const key = std.fmt.allocPrint(gpa, "{s}|{s}", .{ service, account }) catch return error.OutOfMemory;
         defer gpa.free(key);
@@ -2434,6 +2466,7 @@ const TestGenericBackend = struct {
     }
 
     fn set(_: Allocator, service: []const u8, account: []const u8, password: []const u8) @import("keyring_zig").Error!void {
+        if (fail_access) return error.NoStorageAccess;
         var m = &(map orelse return error.PlatformFailure);
         const key = std.fmt.allocPrint(m.allocator, "{s}|{s}", .{ service, account }) catch return error.OutOfMemory;
         errdefer m.allocator.free(key);
@@ -2447,6 +2480,7 @@ const TestGenericBackend = struct {
     }
 
     fn delete(gpa: Allocator, service: []const u8, account: []const u8) @import("keyring_zig").Error!void {
+        if (fail_access) return error.NoStorageAccess;
         var m = &(map orelse return error.EntryNotFound);
         const key = std.fmt.allocPrint(gpa, "{s}|{s}", .{ service, account }) catch return error.OutOfMemory;
         defer gpa.free(key);
@@ -2815,14 +2849,11 @@ test "--auths-only removes owned keyring helper and refuses external helper with
     registry_auth.state_dir_override = state_dir;
     defer registry_auth.state_dir_override = null;
 
-    TestGenericBackend.reset(gpa);
-    defer TestGenericBackend.deinit(gpa);
-    registry_auth.generic_store_override = .{
-        .get = TestGenericBackend.get,
-        .set = TestGenericBackend.set,
-        .delete = TestGenericBackend.delete,
-    };
-    defer registry_auth.generic_store_override = null;
+    const keyring_zig = @import("keyring_zig");
+    const prev_backend = keyring_zig.currentBackend();
+    defer keyring_zig.setDefaultBackend(prev_backend) catch {};
+    try keyring_zig.setDefaultBackend(.null_backend);
+    registry_auth.generic_store_override = null;
 
     FakeProviders.reset();
     provider_hooks_override = FakeProviders.hooks;
@@ -2981,4 +3012,118 @@ test "explicit stored GHCR and ACR credentials take precedence in helper get, sa
     out_w.clearRetainingCapacity();
     try std.testing.expectEqual(@as(u8, 0), try run(gpa, .{ .credential = .get }, &get_quay, &out_w.writer, &err_w.writer));
     try std.testing.expect(std.mem.indexOf(u8, out_w.written(), "\"Secret\":\"quay_static_secret\"") != null);
+}
+
+test "expired stored JWT in container-registry is skipped for GHCR and ACR dynamic refresh, fails on generic registries, and rejects bearer_token" {
+    const gpa = std.testing.allocator;
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root_dir);
+
+    const bin_dir = try std.fs.path.join(gpa, &.{ root_dir, ".local", "bin" });
+    defer gpa.free(bin_dir);
+    const state_dir = try std.fs.path.join(gpa, &.{ root_dir, "state" });
+    defer gpa.free(state_dir);
+    _ = try Io.Dir.cwd().createDirPathStatus(io, bin_dir, .default_dir);
+
+    const fake_self = try std.fs.path.join(gpa, &.{ bin_dir, keyringBinaryName() });
+    defer gpa.free(fake_self);
+    try registry_auth.writeProtectedFileAtomic(gpa, fake_self, "keyring-bin");
+    self_exe_override = fake_self;
+    defer self_exe_override = null;
+
+    TestGenericBackend.reset(gpa);
+    defer TestGenericBackend.deinit(gpa);
+    registry_auth.generic_store_override = .{
+        .get = TestGenericBackend.get,
+        .set = TestGenericBackend.set,
+        .delete = TestGenericBackend.delete,
+    };
+    defer registry_auth.generic_store_override = null;
+
+    registry_auth.state_dir_override = state_dir;
+    defer registry_auth.state_dir_override = null;
+
+    FakeProviders.reset();
+    FakeProviders.now_ts = 1_700_000_000;
+    provider_hooks_override = FakeProviders.hooks;
+    defer provider_hooks_override = null;
+
+    FakeEnv.reset();
+    FakeEnv.home = root_dir;
+    FakeEnv.path_val = bin_dir;
+    env_override_fn = FakeEnv.get;
+    defer env_override_fn = null;
+
+    // Payload {"exp":1600000000} (expired relative to FakeProviders.now_ts = 1_700_000_000).
+    const expired_jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjE2MDAwMDAwMDB9.sig";
+    try registry_auth.storeGenericCredential(gpa, "ghcr.io", "stale-gh-user", expired_jwt);
+    try registry_auth.storeGenericCredential(gpa, "myacr.azurecr.io", registry_auth.identity_token_username, expired_jwt);
+    try registry_auth.storeGenericCredential(gpa, "quay.io", "quay-user", expired_jwt);
+
+    var empty_in = Io.Reader.fixed("");
+    var out_w = Io.Writer.Allocating.init(gpa);
+    defer out_w.deinit();
+    var err_w = Io.Writer.Allocating.init(gpa);
+    defer err_w.deinit();
+
+    // 1. GHCR skips expired stored JWT on both `podman login` and `podman login -f` and refreshes via dynamic provider.
+    const ghcr_login = parseArgs(&.{ "login", "ghcr.io" }).?;
+    try std.testing.expectEqual(@as(u8, 0), try run(gpa, ghcr_login, &empty_in, &out_w.writer, &err_w.writer));
+
+    var get_ghcr = Io.Reader.fixed("ghcr.io");
+    out_w.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try run(gpa, .{ .credential = .get }, &get_ghcr, &out_w.writer, &err_w.writer));
+    try std.testing.expect(std.mem.indexOf(u8, out_w.written(), "\"Username\":\"octocat\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_w.written(), "\"Secret\":\"gho_test_podman_token\"") != null);
+
+    // Re-seed expired JWT and verify `podman login -f -u octocat ghcr.io` also skips it cleanly.
+    try registry_auth.storeGenericCredential(gpa, "ghcr.io", "octocat", expired_jwt);
+    const ghcr_force = parseArgs(&.{ "login", "-f", "-u", "octocat", "ghcr.io" }).?;
+    try std.testing.expectEqual(@as(u8, 0), try run(gpa, ghcr_force, &empty_in, &out_w.writer, &err_w.writer));
+
+    // 2. ACR skips expired stored JWT and exchanges a fresh ACR refresh token dynamically.
+    const acr_login = parseArgs(&.{ "login", "myacr.azurecr.io" }).?;
+    try std.testing.expectEqual(@as(u8, 0), try run(gpa, acr_login, &empty_in, &out_w.writer, &err_w.writer));
+    try std.testing.expectEqual(@as(usize, 1), FakeProviders.acr_exchange_calls);
+
+    // 3. Generic registry (`quay.io`) with an expired stored JWT fails to resolve rather than returning
+    // the expired token OR resurrecting an older static `auth.json` `"auths"` entry!
+    var seed_in = Io.Reader.fixed("old-static-secret\n");
+    const seed_auths = parseArgs(&.{ "login", "--auths-only", "-u", "old-user", "--password-stdin", "quay.io" }).?;
+    try std.testing.expectEqual(@as(u8, 0), try run(gpa, seed_auths, &seed_in, &out_w.writer, &err_w.writer));
+    try registry_auth.storeGenericCredential(gpa, "quay.io", "quay-user", expired_jwt);
+
+    const quay_login = parseArgs(&.{ "login", "quay.io" }).?;
+    try std.testing.expectEqual(@as(u8, 3), try run(gpa, quay_login, &empty_in, &out_w.writer, &err_w.writer));
+
+    var get_quay = Io.Reader.fixed("quay.io");
+    out_w.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 1), try run(gpa, .{ .credential = .get }, &get_quay, &out_w.writer, &err_w.writer));
+    try std.testing.expect(std.mem.indexOf(u8, out_w.written(), expired_jwt) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_w.written(), "old-static-secret") == null);
+
+    // 4. Dual-mode generic registry (`"credHelpers": { "quay.io": "keyring" }`) fails closed on NoStorageAccess
+    // instead of silently falling back to a stale `"auths"` entry!
+    var dual_in = Io.Reader.fixed("dual-secret\n");
+    const dual_quay = parseArgs(&.{ "login", "-u", "dual-user", "--password-stdin", "quay.io" }).?;
+    try std.testing.expectEqual(@as(u8, 0), try run(gpa, dual_quay, &dual_in, &out_w.writer, &err_w.writer));
+    TestGenericBackend.fail_access = true;
+    var get_quay_unavail = Io.Reader.fixed("quay.io");
+    out_w.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 1), try run(gpa, .{ .credential = .get }, &get_quay_unavail, &out_w.writer, &err_w.writer));
+    try std.testing.expect(std.mem.indexOf(u8, out_w.written(), "dual-secret") == null);
+    TestGenericBackend.fail_access = false;
+
+    // 5. Corrupt / forbidden `.bearer_token` in `container-registry://ghcr.io` still propagates StorageFailure (exit 4 on login)!
+    try TestGenericBackend.set(
+        gpa,
+        "container-registry://ghcr.io",
+        "default",
+        "{\"v\":1,\"kind\":\"bearer_token\",\"secret\":\"bad-bearer\",\"cache_policy\":\"eternal\"}",
+    );
+    try std.testing.expectEqual(@as(u8, 4), try run(gpa, ghcr_login, &empty_in, &out_w.writer, &err_w.writer));
 }

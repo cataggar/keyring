@@ -17,8 +17,14 @@ const registry_auth = @import("registry_auth.zig");
 const podman = @import("podman.zig");
 const wslc = @import("wslc.zig");
 const copilot = @import("copilot.zig");
+const credential_provider = @import("credential_provider.zig");
+const stored_provider = @import("stored_provider.zig");
+const credential_provider_test = @import("credential_provider_test.zig");
 
 test {
+    _ = credential_provider;
+    _ = stored_provider;
+    _ = credential_provider_test;
     _ = gh;
     _ = git_credential;
     _ = vault;
@@ -198,9 +204,20 @@ pub fn main(init: std.process.Init) !void {
         };
         app_backend_override = .{ .keyring = .null_backend };
     }
+    stored_provider.is_app_backend_disallowed_fn = isDisallowedProviderAppBackend;
 
     const exit_code = try runCommand(parsed.command, arena, init.io, stdout, stderr);
     std.process.exit(exit_code);
+}
+
+fn isDisallowedProviderAppBackend() bool {
+    if (app_backend_override) |b| return b == .ado;
+    if (!app_env_backend_checked) {
+        app_env_backend = readAppEnvBackend();
+        app_env_backend_checked = true;
+    }
+    if (app_env_backend) |b| return b == .ado;
+    return false;
 }
 
 fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !u8 {
@@ -1792,6 +1809,50 @@ test "disabled Color methods are empty" {
     try std.testing.expectEqualStrings("", disabled.red());
     try std.testing.expectEqualStrings("", disabled.bold());
     try std.testing.expectEqualStrings("", disabled.reset());
+}
+
+test "isDisallowedProviderAppBackend fails closed when app backend is ado" {
+    const prev_keyring_backend = keyring_zig.currentBackend();
+    const prev_override = app_backend_override;
+    const prev_env_checked = app_env_backend_checked;
+    const prev_env_backend = app_env_backend;
+    const prev_hook = stored_provider.is_app_backend_disallowed_fn;
+    defer {
+        keyring_zig.setDefaultBackend(prev_keyring_backend) catch {};
+        app_backend_override = prev_override;
+        app_env_backend_checked = prev_env_checked;
+        app_env_backend = prev_env_backend;
+        stored_provider.is_app_backend_disallowed_fn = prev_hook;
+    }
+
+    var avail_buf: [5]keyring_zig.Backend = undefined;
+    for (keyring_zig.availableBackends(&avail_buf)) |candidate| {
+        if (candidate != .null_backend and (!@hasField(keyring_zig.Backend, "file") or candidate != .file)) {
+            try keyring_zig.setDefaultBackend(candidate);
+            break;
+        }
+    }
+
+    stored_provider.is_app_backend_disallowed_fn = isDisallowedProviderAppBackend;
+    app_backend_override = .ado;
+    try std.testing.expect(isDisallowedProviderAppBackend());
+    try std.testing.expectError(
+        error.StorageUnavailable,
+        stored_provider.checkSecureBackendAvailable(std.testing.allocator),
+    );
+
+    app_backend_override = null;
+    app_env_backend_checked = true;
+    app_env_backend = .ado;
+    try std.testing.expect(isDisallowedProviderAppBackend());
+    try std.testing.expectError(
+        error.StorageUnavailable,
+        stored_provider.checkSecureBackendAvailable(std.testing.allocator),
+    );
+
+    app_env_backend = null;
+    try std.testing.expect(!isDisallowedProviderAppBackend());
+    try stored_provider.checkSecureBackendAvailable(std.testing.allocator);
 }
 
 test {

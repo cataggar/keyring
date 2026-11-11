@@ -49,6 +49,7 @@ Use `keyring enroll --add-key`, `--list`, and `--revoke <id>` for multiple authe
 ## Documentation
 
 - [Usage](doc/usage.md) — commands, options, and backends
+- [Credential provider contract](doc/credential-provider.md) — provider lifecycle, interaction policy, and secure-storage guarantees
 - [GitHub Copilot CLI](doc/copilot.md)
 - [Podman Desktop and Podman](doc/podman.md)
 - [Environment variables](doc/environment-variables.md)

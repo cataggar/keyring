@@ -109,6 +109,8 @@ available. See [Headless Linux](headless-linux.md).
 
 The Linux-only built-in service stores encrypted items in `vault.json` and is unlocked through WebAuthn PRF or the one-time Recovery Key. See [Hardware-backed unlocking over SSH](headless-linux.md#hardware-backed-unlocking-over-ssh).
 
+Typed credential providers layer target normalization, `get`/`login`/`logout` lifecycle, interaction policy, and expiry semantics over encrypted persistence backends; see [Credential provider contract](credential-provider.md).
+
 ## Git credential helper (`keyring git credential`)
 
 `keyring git credential <get|store|erase>` (or invoking the binary via a `git-credential-keyring` symlink) implements the Git credential helper protocol over HTTPS for `github.com`, GitHub Enterprise Cloud with data residency (`*.ghe.com`, resolving REST calls to `https://api.<tenant>.ghe.com/user`), GitHub Enterprise Server, Azure DevOps (`dev.azure.com` and `*.visualstudio.com`), and generic HTTPS hosts stored in the active `keyring` backend.
@@ -153,5 +155,6 @@ See [Podman Desktop and Podman](podman.md) for Windows WinGet + WSL 2 setup, pla
 
 See [GitHub Copilot CLI](copilot.md) for platform credential schemas, WSL setup with `ghr link`, headless Linux `keyring service` setup, and migrating plaintext `copilotTokens`.
 
-See also [Environment variables](environment-variables.md) and
+See also [Credential provider contract](credential-provider.md),
+[Environment variables](environment-variables.md), and
 [Exit codes](exit-codes.md).

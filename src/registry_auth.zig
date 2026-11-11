@@ -21,8 +21,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const keyring_zig = @import("keyring_zig");
 const ado = @import("ado.zig");
+const credential_provider = @import("credential_provider.zig");
 const gh = @import("gh.zig");
 const msal_cache = @import("msal_cache.zig");
+const stored_provider = @import("stored_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -135,6 +137,23 @@ const live_generic_store_ops: GenericStoreOps = .{
 pub var generic_store_override: ?GenericStoreOps = null;
 pub var state_dir_override: ?[]const u8 = null;
 pub var env_override_fn: ?*const fn (name: []const u8) ?[]const u8 = null;
+pub var now_seconds_override_fn: ?*const fn () i64 = null;
+
+threadlocal var scoped_now_ms_override: ?i64 = null;
+
+fn secondsToClampedMs(sec: i64) i64 {
+    const max_sec = @divFloor(std.math.maxInt(i64), std.time.ms_per_s);
+    const min_sec = @divFloor(std.math.minInt(i64), std.time.ms_per_s);
+    if (sec >= max_sec) return std.math.maxInt(i64);
+    if (sec <= min_sec) return std.math.minInt(i64);
+    return sec * std.time.ms_per_s;
+}
+
+fn genericLookupNowMs() i64 {
+    if (scoped_now_ms_override) |ms| return ms;
+    if (now_seconds_override_fn) |f| return secondsToClampedMs(f());
+    return credential_provider.defaultNowMs();
+}
 
 pub fn activeGenericStoreOps() GenericStoreOps {
     return generic_store_override orelse live_generic_store_ops;
@@ -178,6 +197,20 @@ pub fn normalizeServerAlloc(gpa: Allocator, raw_server: []const u8, style: Docke
 
     const host_only = try extractHostWithoutPort(s);
     if (host_only.len == 0) return error.InvalidServer;
+
+    if (host_only[0] == '[') {
+        const inner = host_only[1 .. host_only.len - 1];
+        const groups = credential_provider.parseIpv6(inner) orelse return error.InvalidServer;
+        const canon_host = credential_provider.formatCanonicalIpv6Alloc(gpa, groups) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidServer,
+        };
+        if (s.len > host_only.len) {
+            defer gpa.free(canon_host);
+            return std.fmt.allocPrint(gpa, "{s}{s}", .{ canon_host, s[host_only.len..] });
+        }
+        return canon_host;
+    }
 
     const lowered = try gpa.dupe(u8, s);
     errdefer gpa.free(lowered);
@@ -599,11 +632,6 @@ fn writePercentEncodedForm(writer: *Io.Writer, value: []const u8) Error!void {
 // Deterministic Generic Keyring Store + Non-Secret Registry Index
 // ---------------------------------------------------------------------------
 
-const StoredGenericRecord = struct {
-    username: []const u8,
-    secret: []const u8,
-};
-
 const RegistryIndexDocument = struct {
     registries: std.json.ArrayHashMap([]const u8) = .{},
 };
@@ -622,6 +650,49 @@ fn mapKeyringError(err: keyring_zig.Error) Error {
     };
 }
 
+fn mapProviderError(err: credential_provider.ProviderError) Error {
+    return switch (err) {
+        error.CredentialNotFound => error.EntryNotFound,
+        error.ReauthenticationRequired => error.AuthenticationFailed,
+        error.StorageUnavailable, error.AccessDenied => error.NoStorageAccess,
+        error.StorageLocked => error.Locked,
+        error.InvalidInput => error.InvalidInput,
+        error.OutOfMemory => error.OutOfMemory,
+        error.StorageFailure,
+        error.UnsupportedTarget,
+        error.UnsupportedOperation,
+        error.Cancelled,
+        error.DeadlineExceeded,
+        => error.StorageFailure,
+    };
+}
+
+fn activeGenericKeyringAdapter() stored_provider.KeyringOpsAdapter {
+    if (generic_store_override) |override| {
+        return .{
+            .ops = .{
+                .get = override.get,
+                .set = override.set,
+                .delete = override.delete,
+            },
+            .enforce_secure_backend = false,
+        };
+    }
+    return .{
+        .ops = stored_provider.live_keyring_ops,
+        .enforce_secure_backend = true,
+    };
+}
+
+fn parseRegistryTargetAlloc(gpa: Allocator, bare_host: []const u8) Error!credential_provider.Target {
+    return credential_provider.Target.parseAlloc(gpa, bare_host, .{
+        .default_scheme = "https",
+    }) catch |err| switch (err) {
+        error.InvalidInput => error.InvalidServer,
+        else => mapProviderError(err),
+    };
+}
+
 /// Store `(username, secret)` deterministically in `keyring_zig` under
 /// `service = "container-registry://<bare_host>"`, `account = "default"` and
 /// record `<bare_host> -> <username>` in `<state_dir>/registries.json` (zero secrets).
@@ -632,24 +703,66 @@ pub fn storeGenericCredential(
     secret: []const u8,
 ) Error!void {
     if (username.len == 0 or secret.len == 0) return error.InvalidInput;
+    for (username) |c| {
+        if (c == 0 or std.ascii.isControl(c)) return error.InvalidInput;
+    }
+    if (std.mem.indexOfScalar(u8, secret, 0) != null) return error.InvalidInput;
+
     const bare_host = try normalizeServerAlloc(gpa, raw_or_norm_server, .bare_docker_io);
     defer gpa.free(bare_host);
 
-    const service = try genericRegistryServiceAlloc(gpa, bare_host);
-    defer gpa.free(service);
+    var target = try parseRegistryTargetAlloc(gpa, bare_host);
+    defer target.deinit(gpa);
 
-    const record_json = std.json.Stringify.valueAlloc(gpa, StoredGenericRecord{
-        .username = username,
-        .secret = secret,
-    }, .{}) catch return error.OutOfMemory;
-    defer {
-        std.crypto.secureZero(u8, record_json);
-        gpa.free(record_json);
-    }
+    const known_exp = extractJwtExpiration(gpa, secret);
+    const is_identity_token = std.mem.eql(u8, username, identity_token_username);
+    var cred_in: credential_provider.CredentialResult = blk_cred: {
+        var cred_secret: credential_provider.CredentialSecret = if (is_identity_token) .{
+            .identity_token = try gpa.dupe(u8, secret),
+        } else .{
+            .basic = blk_basic: {
+                const user_copy = try gpa.dupe(u8, username);
+                errdefer gpa.free(user_copy);
+                const sec_copy = try gpa.dupe(u8, secret);
+                break :blk_basic .{
+                    .username = user_copy,
+                    .secret = sec_copy,
+                };
+            },
+        };
+        errdefer cred_secret.deinit(gpa);
 
-    activeGenericStoreOps().set(gpa, service, generic_default_account, record_json) catch |err| {
-        return mapKeyringError(err);
+        const account_copy: ?[]u8 = if (is_identity_token) null else try gpa.dupe(u8, username);
+        break :blk_cred .{
+            .secret = cred_secret,
+            .account = account_copy,
+            .expires_at = known_exp,
+            .cache_policy = if (known_exp != null) .until_expiration else .eternal,
+            .audience = null,
+            .scopes = null,
+            .supports_noninteractive_renewal = false,
+        };
     };
+    defer cred_in.deinit(gpa);
+
+    const adapter = activeGenericKeyringAdapter();
+    const stored = stored_provider.StoredCredentialProvider.initContainerRegistry(adapter.backend());
+    const deadline: credential_provider.Deadline = if (now_seconds_override_fn != null)
+        .{ .now_ms_fn = genericLookupNowMs }
+    else
+        .{};
+
+    var saved = stored.login(gpa, .{
+        .request = .{
+            .target = target,
+            .operation = .login,
+            .account = if (is_identity_token) null else username,
+            .interaction = .never,
+            .deadline = deadline,
+        },
+        .credential = &cred_in,
+    }) catch |err| return mapProviderError(err);
+    saved.deinit(gpa);
 
     try upsertRegistryIndex(gpa, bare_host, username);
 }
@@ -664,58 +777,111 @@ pub const GenericLookupResult = struct {
     source: GenericLookupSource,
 };
 
-/// Retrieve a stored generic registry credential along with whether it came from
+fn hasAsciiControl(s: []const u8) bool {
+    for (s) |c| {
+        if (c == 0 or std.ascii.isControl(c)) return true;
+    }
+    return false;
+}
+
+/// Retrieve a stored generic registry credential evaluated against an optional
+/// caller-supplied `now_seconds` clock, along with whether it came from
 /// `container-registry://<bare_host>` (`primary_container_registry`) or a legacy
 /// `https://<host>` fallback (`legacy_https_service`).
-pub fn getGenericCredentialDetailed(
+pub fn getGenericCredentialDetailedAt(
     gpa: Allocator,
     raw_or_norm_server: []const u8,
     requested_username: ?[]const u8,
+    now_seconds: ?i64,
 ) Error!GenericLookupResult {
     const bare_host = try normalizeServerAlloc(gpa, raw_or_norm_server, .bare_docker_io);
     defer gpa.free(bare_host);
 
-    const service = try genericRegistryServiceAlloc(gpa, bare_host);
-    defer gpa.free(service);
+    var target = try parseRegistryTargetAlloc(gpa, bare_host);
+    defer target.deinit(gpa);
 
-    const ops = activeGenericStoreOps();
-    if (ops.get(gpa, service, generic_default_account)) |raw_json| {
-        defer {
-            std.crypto.secureZero(u8, raw_json);
-            gpa.free(raw_json);
-        }
-        const parsed = std.json.parseFromSlice(StoredGenericRecord, gpa, raw_json, .{
-            .ignore_unknown_fields = true,
-        }) catch return error.StorageFailure;
-        defer parsed.deinit();
+    const effective_now: ?i64 = now_seconds orelse if (now_seconds_override_fn) |f| f() else null;
+    const prev_scoped_ms = scoped_now_ms_override;
+    scoped_now_ms_override = if (effective_now) |sec| secondsToClampedMs(sec) else null;
+    defer scoped_now_ms_override = prev_scoped_ms;
 
-        if (parsed.value.username.len == 0 or parsed.value.secret.len == 0) {
-            return error.StorageFailure;
-        }
+    const deadline: credential_provider.Deadline = if (effective_now != null)
+        .{ .now_ms_fn = genericLookupNowMs }
+    else
+        .{};
 
-        if (requested_username == null or std.mem.eql(u8, parsed.value.username, requested_username.?)) {
+    const adapter = activeGenericKeyringAdapter();
+    const stored = stored_provider.StoredCredentialProvider.initContainerRegistry(adapter.backend());
+
+    var primary_miss_err: Error = error.EntryNotFound;
+
+    const req_account: ?[]const u8 = if (requested_username) |u|
+        (if (u.len > 0 and !hasAsciiControl(u)) u else null)
+    else
+        null;
+
+    if (stored.get(gpa, .{
+        .target = target,
+        .operation = .get,
+        .account = req_account,
+        .interaction = .never,
+        .deadline = deadline,
+    })) |res_val| {
+        var res = res_val;
+        defer res.deinit(gpa);
+
+        const MappedSecret = struct {
+            kind: CredentialKind,
+            username: []const u8,
+            secret: []const u8,
+        };
+        const mapped: MappedSecret = switch (res.secret) {
+            .basic => |b| blk: {
+                if (std.mem.eql(u8, b.username, identity_token_username)) {
+                    return error.StorageFailure;
+                }
+                break :blk .{
+                    .kind = .basic,
+                    .username = b.username,
+                    .secret = b.secret,
+                };
+            },
+            .identity_token => |tok| .{
+                .kind = .identity_token,
+                .username = identity_token_username,
+                .secret = tok,
+            },
+            .bearer_token => return error.StorageFailure,
+        };
+
+        if (requested_username == null or std.mem.eql(u8, mapped.username, requested_username.?)) {
             const server_copy = try gpa.dupe(u8, bare_host);
             errdefer gpa.free(server_copy);
-            const user_copy = try gpa.dupe(u8, parsed.value.username);
+            const user_copy = try gpa.dupe(u8, mapped.username);
             errdefer gpa.free(user_copy);
-            const secret_copy = try gpa.dupe(u8, parsed.value.secret);
-            const kind: CredentialKind = if (std.mem.eql(u8, user_copy, identity_token_username)) .identity_token else .basic;
+            const secret_copy = try gpa.dupe(u8, mapped.secret);
+            errdefer {
+                std.crypto.secureZero(u8, secret_copy);
+                gpa.free(secret_copy);
+            }
             return .{
                 .credential = .{
-                    .kind = kind,
+                    .kind = mapped.kind,
                     .server = server_copy,
                     .username = user_copy,
                     .secret = secret_copy,
-                    .expires_at = extractJwtExpiration(gpa, secret_copy),
+                    .expires_at = res.expires_at orelse extractJwtExpiration(gpa, secret_copy),
                 },
                 .source = .primary_container_registry,
             };
         }
     } else |err| switch (err) {
-        error.EntryNotFound => {},
-        else => return mapKeyringError(err),
+        error.CredentialNotFound => primary_miss_err = error.EntryNotFound,
+        error.ReauthenticationRequired => primary_miss_err = error.AuthenticationFailed,
+        else => return mapProviderError(err),
     }
 
+    const ops = activeGenericStoreOps();
     if (requested_username) |user| {
         if (user.len > 0) {
             const https_svc = try std.fmt.allocPrint(gpa, "https://{s}", .{bare_host});
@@ -770,7 +936,23 @@ pub fn getGenericCredentialDetailed(
         }
     }
 
-    return error.EntryNotFound;
+    return primary_miss_err;
+}
+
+/// Retrieve a stored generic registry credential along with whether it came from
+/// `container-registry://<bare_host>` (`primary_container_registry`) or a legacy
+/// `https://<host>` fallback (`legacy_https_service`).
+pub fn getGenericCredentialDetailed(
+    gpa: Allocator,
+    raw_or_norm_server: []const u8,
+    requested_username: ?[]const u8,
+) Error!GenericLookupResult {
+    return getGenericCredentialDetailedAt(
+        gpa,
+        raw_or_norm_server,
+        requested_username,
+        if (now_seconds_override_fn) |f| f() else null,
+    );
 }
 
 /// Retrieve a stored generic registry credential for `raw_or_norm_server`,
@@ -791,13 +973,20 @@ pub fn deleteGenericCredential(gpa: Allocator, raw_or_norm_server: []const u8) E
     const bare_host = try normalizeServerAlloc(gpa, raw_or_norm_server, .bare_docker_io);
     defer gpa.free(bare_host);
 
-    const service = try genericRegistryServiceAlloc(gpa, bare_host);
-    defer gpa.free(service);
+    var target = try parseRegistryTargetAlloc(gpa, bare_host);
+    defer target.deinit(gpa);
+
+    const adapter = activeGenericKeyringAdapter();
+    const stored = stored_provider.StoredCredentialProvider.initContainerRegistry(adapter.backend());
 
     var found_keyring = true;
-    activeGenericStoreOps().delete(gpa, service, generic_default_account) catch |err| switch (err) {
-        error.EntryNotFound => found_keyring = false,
-        else => return mapKeyringError(err),
+    stored.logout(gpa, .{
+        .target = target,
+        .operation = .logout,
+        .interaction = .never,
+    }) catch |err| switch (err) {
+        error.CredentialNotFound => found_keyring = false,
+        else => return mapProviderError(err),
     };
 
     const removed_index = try removeRegistryIndex(gpa, bare_host);
@@ -1588,4 +1777,222 @@ test "helper wire protocol handles non-newline server input and list output" {
     };
     try writeHelperListResponse(gpa, &out.writer, &entries);
     try std.testing.expectEqualStrings("{\"ghcr.io\":\"octocat\"}\n", out.written());
+}
+
+test "identity-token <token> credentials round-trip losslessly via StoredCredentialProvider" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = Io.Threaded.global_single_threaded.io();
+    const tmp_abs = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(tmp_abs);
+
+    FakeGenericStore.reset(gpa);
+    defer FakeGenericStore.deinit(gpa);
+
+    generic_store_override = .{
+        .get = FakeGenericStore.get,
+        .set = FakeGenericStore.set,
+        .delete = FakeGenericStore.delete,
+    };
+    defer generic_store_override = null;
+
+    state_dir_override = tmp_abs;
+    defer state_dir_override = null;
+
+    const jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjIwMDAwMDAwMDB9.sig";
+    try storeGenericCredential(gpa, "https://myacr.azurecr.io/v2/", identity_token_username, jwt);
+
+    // JWT with a real `exp` claim persists `expires_at` + `until_expiration` without inventing `scopes`.
+    const raw_envelope = try FakeGenericStore.get(gpa, "container-registry://myacr.azurecr.io", "default");
+    defer {
+        std.crypto.secureZero(u8, raw_envelope);
+        gpa.free(raw_envelope);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, raw_envelope, "\"kind\":\"identity_token\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw_envelope, "\"expires_at\":2000000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw_envelope, "\"cache_policy\":\"until_expiration\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw_envelope, "\"scopes\"") == null);
+
+    // Non-JWT opaque `<token>` keeps `expires_at == null` and `cache_policy == eternal`.
+    try storeGenericCredential(gpa, "https://opaque.example.io", identity_token_username, "opaque-identity-secret");
+    const raw_opaque = try FakeGenericStore.get(gpa, "container-registry://opaque.example.io", "default");
+    defer {
+        std.crypto.secureZero(u8, raw_opaque);
+        gpa.free(raw_opaque);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, raw_opaque, "\"kind\":\"identity_token\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw_opaque, "\"expires_at\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw_opaque, "\"cache_policy\":\"eternal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw_opaque, "\"scopes\"") == null);
+
+    const got_any = try getGenericCredentialDetailedAt(gpa, "myacr.azurecr.io", null, 1_900_000_000);
+    defer got_any.credential.deinit(gpa);
+    try std.testing.expectEqual(CredentialKind.identity_token, got_any.credential.kind);
+    try std.testing.expectEqualStrings("myacr.azurecr.io", got_any.credential.server);
+    try std.testing.expectEqualStrings(identity_token_username, got_any.credential.username);
+    try std.testing.expectEqualStrings(jwt, got_any.credential.secret);
+    try std.testing.expectEqual(@as(?i64, 2_000_000_000), got_any.credential.expires_at);
+
+    const got_tok = try getGenericCredentialDetailedAt(gpa, "myacr.azurecr.io", identity_token_username, 1_900_000_000);
+    defer got_tok.credential.deinit(gpa);
+    try std.testing.expectEqual(CredentialKind.identity_token, got_tok.credential.kind);
+    try std.testing.expectEqualStrings(jwt, got_tok.credential.secret);
+
+    // Once `now_seconds >= exp`, lookup fails with AuthenticationFailed instead of returning the expired JWT.
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        getGenericCredentialDetailedAt(gpa, "myacr.azurecr.io", null, 2_000_000_000),
+    );
+
+    // Control characters in username are rejected on store.
+    try std.testing.expectError(
+        error.InvalidInput,
+        storeGenericCredential(gpa, "quay.io", "bad\nuser", "secret"),
+    );
+
+    // `.bearer_token` and `.basic` with `<token>` username in `container-registry://` are rejected
+    // with `error.StorageFailure` rather than coerced to `<token>`!
+    try FakeGenericStore.set(
+        gpa,
+        "container-registry://quay.io",
+        "default",
+        "{\"v\":1,\"kind\":\"bearer_token\",\"secret\":\"raw-bearer\",\"cache_policy\":\"eternal\"}",
+    );
+    try std.testing.expectError(error.StorageFailure, getGenericCredentialDetailedAt(gpa, "quay.io", null, 1_900_000_000));
+
+    try FakeGenericStore.set(
+        gpa,
+        "container-registry://quay.io",
+        "default",
+        "{\"v\":1,\"kind\":\"basic\",\"username\":\"<token>\",\"secret\":\"spoof\",\"cache_policy\":\"eternal\"}",
+    );
+    try std.testing.expectError(error.StorageFailure, getGenericCredentialDetailedAt(gpa, "quay.io", null, 1_900_000_000));
+}
+
+test "legacy v0 container-registry record loads cleanly and mismatched username falls back to legacy https" {
+    const gpa = std.testing.allocator;
+
+    FakeGenericStore.reset(gpa);
+    defer FakeGenericStore.deinit(gpa);
+
+    generic_store_override = .{
+        .get = FakeGenericStore.get,
+        .set = FakeGenericStore.set,
+        .delete = FakeGenericStore.delete,
+    };
+    defer generic_store_override = null;
+
+    try FakeGenericStore.set(
+        gpa,
+        "container-registry://quay.io",
+        "default",
+        "{\"username\":\"legacy-user\",\"secret\":\"legacy-secret\"}",
+    );
+    try FakeGenericStore.set(gpa, "https://quay.io", "alt-user", "https-fallback-secret");
+
+    const got_v0 = try getGenericCredential(gpa, "quay.io", null);
+    defer got_v0.deinit(gpa);
+    try std.testing.expectEqual(CredentialKind.basic, got_v0.kind);
+    try std.testing.expectEqualStrings("quay.io", got_v0.server);
+    try std.testing.expectEqualStrings("legacy-user", got_v0.username);
+    try std.testing.expectEqualStrings("legacy-secret", got_v0.secret);
+
+    const got_fb = try getGenericCredentialDetailed(gpa, "quay.io", "alt-user");
+    defer got_fb.credential.deinit(gpa);
+    try std.testing.expectEqual(GenericLookupSource.legacy_https_service, got_fb.source);
+    try std.testing.expectEqualStrings("alt-user", got_fb.credential.username);
+    try std.testing.expectEqualStrings("https-fallback-secret", got_fb.credential.secret);
+
+    // An expired primary entry for "alice" does NOT return AuthenticationFailed when querying
+    // "alt-user" or "<token>"; it reports EntryNotFound / falls back to https://quay.io!
+    const expired_jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjE2MDAwMDAwMDB9.sig";
+    try storeGenericCredential(gpa, "quay.io", "alice", expired_jwt);
+    const got_fb_after_exp = try getGenericCredentialDetailedAt(gpa, "quay.io", "alt-user", 1_700_000_000);
+    defer got_fb_after_exp.credential.deinit(gpa);
+    try std.testing.expectEqual(GenericLookupSource.legacy_https_service, got_fb_after_exp.source);
+    try std.testing.expectError(
+        error.EntryNotFound,
+        getGenericCredentialDetailedAt(gpa, "quay.io", identity_token_username, 1_700_000_000),
+    );
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        getGenericCredentialDetailedAt(gpa, "quay.io", "alice", 1_700_000_000),
+    );
+}
+
+test "normalizeServerAlloc canonicalizes bracketed IPv6 across keyring and registries.json" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = Io.Threaded.global_single_threaded.io();
+    const tmp_abs = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(tmp_abs);
+
+    FakeGenericStore.reset(gpa);
+    defer FakeGenericStore.deinit(gpa);
+
+    generic_store_override = .{
+        .get = FakeGenericStore.get,
+        .set = FakeGenericStore.set,
+        .delete = FakeGenericStore.delete,
+    };
+    defer generic_store_override = null;
+
+    state_dir_override = tmp_abs;
+    defer state_dir_override = null;
+
+    try storeGenericCredential(gpa, "https://[2001:0DB8:0:0:0:0:0:1]:5000/v2/", "ipv6-user", "ipv6-secret");
+
+    const listed = try listGenericIndexAlloc(gpa);
+    defer {
+        for (listed) |*e| e.deinit(gpa);
+        gpa.free(listed);
+    }
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("[2001:db8::1]:5000", listed[0].server);
+
+    try deleteGenericCredential(gpa, "[2001:db8::1]:5000");
+    try std.testing.expectError(error.EntryNotFound, getGenericCredential(gpa, "[2001:0db8:0:0:0:0:0:1]:5000", null));
+
+    const listed_after = try listGenericIndexAlloc(gpa);
+    defer gpa.free(listed_after);
+    try std.testing.expectEqual(@as(usize, 0), listed_after.len);
+}
+
+test "live null_backend fails closed with NoStorageAccess without touching registries.json" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = Io.Threaded.global_single_threaded.io();
+    const tmp_abs = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(tmp_abs);
+
+    const prev_backend = keyring_zig.currentBackend();
+    defer keyring_zig.setDefaultBackend(prev_backend) catch {};
+    const prev_hook = stored_provider.is_app_backend_disallowed_fn;
+    defer stored_provider.is_app_backend_disallowed_fn = prev_hook;
+
+    stored_provider.is_app_backend_disallowed_fn = null;
+    generic_store_override = null;
+    state_dir_override = tmp_abs;
+    defer state_dir_override = null;
+
+    try keyring_zig.setDefaultBackend(.null_backend);
+
+    try std.testing.expectError(
+        error.NoStorageAccess,
+        storeGenericCredential(gpa, "ghcr.io", "octocat", "ghp_secret"),
+    );
+
+    const index_path = try std.fs.path.join(gpa, &.{ tmp_abs, registries_index_filename });
+    defer gpa.free(index_path);
+    try std.testing.expect((try readFileIfExists(gpa, index_path)) == null);
+
+    const listed = try listGenericIndexAlloc(gpa);
+    defer gpa.free(listed);
+    try std.testing.expectEqual(@as(usize, 0), listed.len);
 }

@@ -1077,6 +1077,9 @@ fn getEnvVarOwned(gpa: Allocator, name: []const u8) ?[]u8 {
         if (override_fn(name)) |val| return gpa.dupe(u8, val) catch null;
         return null;
     }
+    if (secret_store_override != null or gh_config_dir_override != null) {
+        return null;
+    }
     if (builtin.os.tag == .wasi) return null;
     if (builtin.os.tag == .windows) {
         var map = std.process.Environ.createMap(.{ .block = .global }, gpa) catch return null;

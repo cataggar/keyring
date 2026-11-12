@@ -1,12 +1,12 @@
 .{
     .name = .keyring,
-    .version = "0.1.0",
+    .version = "0.0.0-dev",
     .fingerprint = 0x16bef15c85a03555, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .keyring_zig = .{
-            .url = "https://github.com/cataggar/keyring-zig/archive/44eefba.tar.gz",
-            .hash = "keyring_zig-0.1.1-Lil_CPwEAwCgi4F0ciY01dqNozd7Gpqiy2nkQ3bbqerd",
+            .url = "https://github.com/cataggar/keyring-zig/archive/3e52b35.tar.gz",
+            .hash = "keyring_zig-0.1.2-Lil_CPwEAwA407CEByO3kaMiA7If81UGyvpbOTL9QdJ_",
         },
     },
     .paths = .{

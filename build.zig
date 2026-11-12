@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
         "Include the encrypted file backend (enabled by default)",
     ) orelse true;
 
-    const version = b.option([]const u8, "version", "Version string baked into the binary (no 'v' prefix)") orelse "0.0.0-dev";
+    const version = b.option([]const u8, "version", "Version string baked into the binary (no 'v' prefix)") orelse @import("build.zig.zon").version;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);

@@ -70,6 +70,7 @@ pub const VerifiedAssertion = struct {
 
 const CborHead = struct {
     major: u3,
+    additional: u5,
     value: u64,
 };
 
@@ -101,7 +102,7 @@ const CborReader = struct {
 
     fn head(self: *CborReader) Error!CborHead {
         const first = try self.byte();
-        const additional = first & 0x1f;
+        const additional: u5 = @intCast(first & 0x1f);
         const value: u64 = switch (additional) {
             0...23 => additional,
             24 => try self.uintBytes(1),
@@ -110,7 +111,7 @@ const CborReader = struct {
             27 => try self.uintBytes(8),
             else => return error.InvalidCbor,
         };
-        return .{ .major = @intCast(first >> 5), .value = value };
+        return .{ .major = @intCast(first >> 5), .additional = additional, .value = value };
     }
 
     fn length(value: u64) Error!usize {
@@ -156,16 +157,24 @@ const CborReader = struct {
     fn skip(self: *CborReader, depth: usize) Error!void {
         if (depth > 16) return error.InvalidCbor;
         const item = try self.head();
-        const len = try length(item.value);
         switch (item.major) {
             0, 1 => {},
-            2, 3 => _ = try self.take(len),
-            4 => for (0..len) |_| try self.skip(depth + 1),
-            5 => for (0..len) |_| {
-                try self.skip(depth + 1);
-                try self.skip(depth + 1);
+            2, 3 => _ = try self.take(try length(item.value)),
+            4 => {
+                const len = try length(item.value);
+                for (0..len) |_| try self.skip(depth + 1);
             },
-            else => return error.InvalidCbor,
+            5 => {
+                const len = try length(item.value);
+                for (0..len) |_| {
+                    try self.skip(depth + 1);
+                    try self.skip(depth + 1);
+                }
+            },
+            6 => try self.skip(depth + 1),
+            7 => {
+                if (item.additional == 24 and item.value < 32) return error.InvalidCbor;
+            },
         }
     }
 };
@@ -175,9 +184,7 @@ pub fn parseAttestationObject(gpa: Allocator, cbor_bytes: []const u8) (Error || 
 
     const first_major: u3 = @intCast(cbor_bytes[0] >> 5);
     if (first_major == 5) {
-        if (extractAttestationAuthData(gpa, cbor_bytes)) |auth_data| {
-            return auth_data;
-        } else |_| {}
+        return extractAttestationAuthData(gpa, cbor_bytes);
     }
 
     if (cbor_bytes.len < 37) return error.InvalidAuthenticatorData;
@@ -187,16 +194,20 @@ pub fn parseAttestationObject(gpa: Allocator, cbor_bytes: []const u8) (Error || 
 fn extractAttestationAuthData(gpa: Allocator, cbor_bytes: []const u8) (Error || Allocator.Error)![]u8 {
     var reader: CborReader = .{ .bytes = cbor_bytes };
     const map_len = reader.containerLength(5) catch return error.InvalidAttestationObject;
+    var found_auth_data: ?[]const u8 = null;
     for (0..map_len) |_| {
         const key = reader.text() catch return error.InvalidAttestationObject;
         if (std.mem.eql(u8, key, "authData")) {
-            const auth_data = reader.bytestring() catch return error.InvalidAttestationObject;
-            if (auth_data.len < 37) return error.InvalidAuthenticatorData;
-            return gpa.dupe(u8, auth_data);
+            if (found_auth_data != null) return error.InvalidAttestationObject;
+            found_auth_data = reader.bytestring() catch return error.InvalidAttestationObject;
+        } else {
+            reader.skip(0) catch return error.InvalidAttestationObject;
         }
-        reader.skip(0) catch return error.InvalidAttestationObject;
     }
-    return error.InvalidAttestationObject;
+    if (reader.pos != cbor_bytes.len) return error.InvalidAttestationObject;
+    const auth_data = found_auth_data orelse return error.InvalidAttestationObject;
+    if (auth_data.len < 37) return error.InvalidAuthenticatorData;
+    return gpa.dupe(u8, auth_data);
 }
 
 const ParsedCoseKey = struct {
@@ -282,6 +293,7 @@ const ClientData = struct {
     type: ?[]const u8 = null,
     challenge: ?[]const u8 = null,
     origin: ?[]const u8 = null,
+    crossOrigin: ?bool = null,
 };
 
 fn timingSafeEql(a: []const u8, b: []const u8) bool {
@@ -311,6 +323,7 @@ pub fn verifyClientDataJson(
     if (!std.mem.eql(u8, actual_type, expected_type)) return error.InvalidClientData;
     if (!timingSafeEql(challenge, expected_challenge_b64)) return error.ChallengeMismatch;
     if (!std.mem.eql(u8, origin, expected_origin)) return error.OriginMismatch;
+    if (parsed.value.crossOrigin == true) return error.OriginMismatch;
 }
 
 fn verifyRpId(auth_data: ParsedAuthenticatorData, expected_rp_id: []const u8) Error!void {
@@ -324,6 +337,7 @@ fn decodePrfOutput(encoded: ?[]const u8) Error![32]u8 {
     const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(source) catch return error.PrfUnsupported;
     if (decoded_len != 32) return error.PrfUnsupported;
     var result: [32]u8 = undefined;
+    errdefer std.crypto.secureZero(u8, &result);
     std.base64.url_safe_no_pad.Decoder.decode(&result, source) catch return error.PrfUnsupported;
     var any_nonzero: u8 = 0;
     for (result) |b| any_nonzero |= b;
@@ -352,7 +366,8 @@ pub fn verifyRegistration(
     const credential_id = auth_data.credential_id orelse return error.InvalidAuthenticatorData;
     const public_key = auth_data.public_key orelse return error.InvalidCoseKey;
     const cose_alg = auth_data.cose_alg orelse return error.InvalidCoseKey;
-    const prf_output = try decodePrfOutput(prf_output_b64);
+    var prf_output = try decodePrfOutput(prf_output_b64);
+    errdefer std.crypto.secureZero(u8, &prf_output);
 
     const owned_credential_id = try gpa.dupe(u8, credential_id);
     errdefer gpa.free(owned_credential_id);
@@ -396,11 +411,17 @@ pub fn verifyAssertion(
     switch (cose_alg) {
         -7 => {
             const key = EcdsaP256Sha256.PublicKey.fromSec1(public_key) catch return error.SignatureInvalid;
-            const sig = if (signature.len == EcdsaP256Sha256.Signature.encoded_length)
-                EcdsaP256Sha256.Signature.fromBytes(signature[0..EcdsaP256Sha256.Signature.encoded_length].*)
-            else
-                EcdsaP256Sha256.Signature.fromDer(signature) catch return error.SignatureInvalid;
-            sig.verify(signed_data, key) catch return error.SignatureInvalid;
+            var verified = false;
+            if (EcdsaP256Sha256.Signature.fromDer(signature)) |der_sig| {
+                if (der_sig.verify(signed_data, key)) |_| {
+                    verified = true;
+                } else |_| {}
+            } else |_| {}
+            if (!verified) {
+                if (signature.len != EcdsaP256Sha256.Signature.encoded_length) return error.SignatureInvalid;
+                const raw_sig = EcdsaP256Sha256.Signature.fromBytes(signature[0..EcdsaP256Sha256.Signature.encoded_length].*);
+                raw_sig.verify(signed_data, key) catch return error.SignatureInvalid;
+            }
         },
         -8 => {
             if (public_key.len != Ed25519.PublicKey.encoded_length or signature.len != Ed25519.Signature.encoded_length) return error.SignatureInvalid;
@@ -414,7 +435,8 @@ pub fn verifyAssertion(
     if ((stored_sign_count > 0 or auth_data.sign_count > 0) and auth_data.sign_count <= stored_sign_count) {
         return error.ClonedAuthenticator;
     }
-    const prf_output = try decodePrfOutput(prf_output_b64);
+    var prf_output = try decodePrfOutput(prf_output_b64);
+    errdefer std.crypto.secureZero(u8, &prf_output);
     return .{
         .credential_id = try gpa.dupe(u8, credential_id),
         .new_sign_count = auth_data.sign_count,
@@ -746,4 +768,147 @@ test "verification rejects bad origin RP ID flags counter and PRF" {
         3,
         &zeros_encoded,
     ));
+}
+
+test "clientDataJSON rejects crossOrigin true and accepts crossOrigin false" {
+    const gpa = std.testing.allocator;
+    const challenge = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+    const origin = "http://localhost:45678";
+
+    const cross_true = "{\"type\":\"webauthn.get\",\"challenge\":\"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\",\"origin\":\"http://localhost:45678\",\"crossOrigin\":true}";
+    try std.testing.expectError(
+        error.OriginMismatch,
+        verifyClientDataJson(gpa, cross_true, "webauthn.get", challenge, origin),
+    );
+
+    const cross_false = "{\"type\":\"webauthn.get\",\"challenge\":\"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\",\"origin\":\"http://localhost:45678\",\"crossOrigin\":false}";
+    try verifyClientDataJson(gpa, cross_false, "webauthn.get", challenge, origin);
+}
+
+test "CBOR skip handles major types 6 and 7 and parseAttestationObject rejects bad maps and propagates OOM" {
+    const gpa = std.testing.allocator;
+    const raw = try buildAuthData(gpa, "localhost", 0x01, 0, null, null);
+    defer gpa.free(raw);
+
+    // Build canonical CTAP2 attestationObject with "fmt", "attStmt" (containing tags + booleans + null + floats), then "authData".
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(gpa);
+    try appendCborHead(&encoded, gpa, 5, 3);
+    try appendCborText(&encoded, gpa, "fmt");
+    try appendCborText(&encoded, gpa, "packed");
+    try appendCborText(&encoded, gpa, "attStmt");
+    try appendCborHead(&encoded, gpa, 5, 6);
+    // 1: semantic tag (major 6) wrapping a byte string
+    try appendCborText(&encoded, gpa, "tag");
+    try appendCborHead(&encoded, gpa, 6, 24);
+    try appendCborBytes(&encoded, gpa, "tagged");
+    // 2: booleans (0xf4, 0xf5) in an array
+    try appendCborText(&encoded, gpa, "bools");
+    try appendCborHead(&encoded, gpa, 4, 2);
+    try encoded.appendSlice(gpa, &.{ 0xf4, 0xf5 });
+    // 3: null and undefined (0xf6, 0xf7)
+    try appendCborText(&encoded, gpa, "nulls");
+    try appendCborHead(&encoded, gpa, 4, 2);
+    try encoded.appendSlice(gpa, &.{ 0xf6, 0xf7 });
+    // 4: 1-byte simple value >= 32 (0xf8, 32)
+    try appendCborText(&encoded, gpa, "simple");
+    try encoded.appendSlice(gpa, &.{ 0xf8, 32 });
+    // 5: float16 (0xf9) and float32 (0xfa)
+    try appendCborText(&encoded, gpa, "f16f32");
+    try appendCborHead(&encoded, gpa, 4, 2);
+    try encoded.appendSlice(gpa, &.{ 0xf9, 0x3c, 0x00, 0xfa, 0x3f, 0x80, 0x00, 0x00 });
+    // 6: float64 (0xfb + 8 bytes)
+    try appendCborText(&encoded, gpa, "f64");
+    try encoded.appendSlice(gpa, &.{ 0xfb, 0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+    try appendCborText(&encoded, gpa, "authData");
+    try appendCborBytes(&encoded, gpa, raw);
+
+    const parsed = try parseAttestationObject(gpa, encoded.items);
+    defer gpa.free(parsed);
+    try std.testing.expectEqualSlices(u8, raw, parsed);
+
+    // Propagate OutOfMemory instead of falling back to raw CBOR bytes.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, parseAttestationObject(failing.allocator(), encoded.items));
+
+    // Malformed CBOR map (>= 37 bytes, missing authData) must NOT fall back to raw CBOR bytes.
+    var bad_map: std.ArrayList(u8) = .empty;
+    defer bad_map.deinit(gpa);
+    try appendCborHead(&bad_map, gpa, 5, 1);
+    try appendCborText(&bad_map, gpa, "padding");
+    try appendCborBytes(&bad_map, gpa, &@as([48]u8, @splat(0x55)));
+    try std.testing.expectError(error.InvalidAttestationObject, parseAttestationObject(gpa, bad_map.items));
+}
+
+test "ES256 verifyAssertion accepts 64-byte ASN.1 DER signatures and 64-byte P1363 fallback" {
+    const gpa = std.testing.allocator;
+    const P256 = std.crypto.ecc.P256;
+    const challenge = "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
+    const origin = "http://localhost:56789";
+    const get_json = try clientJson(gpa, "webauthn.get", challenge, origin);
+    defer gpa.free(get_json);
+    const assertion_auth = try buildAuthData(gpa, "localhost", 0x01, 2, null, null);
+    defer gpa.free(assertion_auth);
+
+    var client_hash: [32]u8 = undefined;
+    Sha256.hash(get_json, &client_hash, .{});
+    const signed = try std.mem.concat(gpa, u8, &.{ assertion_auth, &client_hash });
+    defer gpa.free(signed);
+    var msg_hash: [32]u8 = undefined;
+    Sha256.hash(signed, &msg_hash, .{});
+
+    // Construct a mathematically valid P-256 ECDSA signature whose ASN.1 DER encoding is exactly 64 bytes:
+    // k = 1 => R = G (32-byte r with MSB 0x6b < 0x80 => 34-byte DER INTEGER),
+    // s = 2^200 (26-byte s with MSB 0x01 < 0x80 => 28-byte DER INTEGER) => 2 + 34 + 28 = 64 bytes total.
+    const r_bytes = P256.basePoint.affineCoordinates().x.toBytes(.big);
+    const r = try P256.scalar.Scalar.fromBytes(r_bytes, .big);
+    var s_bytes: [32]u8 = @splat(0);
+    s_bytes[6] = 0x01;
+    const s = try P256.scalar.Scalar.fromBytes(s_bytes, .big);
+    const z = try P256.scalar.Scalar.fromBytes(msg_hash, .big);
+    const d = s.sub(z).mul(r.invert());
+    const pub_point = try P256.basePoint.mulPublic(d.toBytes(.big), .big);
+    const public_key = pub_point.toUncompressedSec1();
+
+    const sig = EcdsaP256Sha256.Signature{ .r = r_bytes, .s = s_bytes };
+    var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const der_64 = sig.toDer(&der_buf);
+    try std.testing.expectEqual(@as(usize, 64), der_64.len);
+
+    var prf_encoded: [43]u8 = undefined;
+    var der_assertion = try verifyAssertion(
+        gpa,
+        "p256-der64",
+        assertion_auth,
+        get_json,
+        der_64,
+        challenge,
+        origin,
+        "localhost",
+        -7,
+        &public_key,
+        1,
+        prfB64(&prf_encoded),
+    );
+    defer der_assertion.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 2), der_assertion.new_sign_count);
+
+    // Also verify 64-byte raw P1363 fallback continues to work.
+    const raw_64 = sig.toBytes();
+    var raw_assertion = try verifyAssertion(
+        gpa,
+        "p256-raw64",
+        assertion_auth,
+        get_json,
+        &raw_64,
+        challenge,
+        origin,
+        "localhost",
+        -7,
+        &public_key,
+        1,
+        prfB64(&prf_encoded),
+    );
+    defer raw_assertion.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 2), raw_assertion.new_sign_count);
 }

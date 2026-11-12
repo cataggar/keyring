@@ -39,9 +39,13 @@ const kCFStringEncodingUTF8: CFStringEncoding = 0x08000100;
 
 const OSStatus = i32;
 const errSecSuccess: OSStatus = 0;
-const errSecItemNotFound: OSStatus = -25300;
+const errSecUserCanceled: OSStatus = -128;
+const errSecNotAvailable: OSStatus = -25291;
 const errSecAuthFailed: OSStatus = -25293;
+const errSecDuplicateItem: OSStatus = -25299;
+const errSecItemNotFound: OSStatus = -25300;
 const errSecInteractionNotAllowed: OSStatus = -25308;
+const errSecInteractionRequired: OSStatus = -25315;
 const errSecNoAccessForItem: OSStatus = -25243;
 const errSecInvalidOwnerEdit: OSStatus = -25244;
 
@@ -99,12 +103,14 @@ extern "c" fn SecItemUpdate(query: CFDictionaryRef, attributesToUpdate: CFDictio
 extern "c" fn SecItemDelete(query: CFDictionaryRef) OSStatus;
 
 fn makeCfString(bytes: []const u8) Error!CFStringRef {
-    return CFStringCreateWithBytes(null, bytes.ptr, @intCast(bytes.len), kCFStringEncodingUTF8, 0) orelse
+    const len = std.math.cast(CFIndex, bytes.len) orelse return error.StorageFailure;
+    return CFStringCreateWithBytes(null, bytes.ptr, len, kCFStringEncodingUTF8, 0) orelse
         error.StorageFailure;
 }
 
 fn makeCfData(bytes: []const u8) Error!CFDataRef {
-    return CFDataCreate(null, bytes.ptr, @intCast(bytes.len)) orelse error.StorageFailure;
+    const len = std.math.cast(CFIndex, bytes.len) orelse return error.StorageFailure;
+    return CFDataCreate(null, bytes.ptr, len) orelse error.StorageFailure;
 }
 
 /// Build a generic-password query matching `service`/`account`. When `with_data`
@@ -140,9 +146,13 @@ fn makeQueryDict(service: CFStringRef, account: CFStringRef, comptime with_data:
 fn mapStatus(status: OSStatus) Error {
     return switch (status) {
         errSecItemNotFound => error.EntryNotFound,
-        // A locked keychain, a cancelled unlock prompt, or an item owned by a
-        // different application's ACL all surface as a lack of storage access.
+        // A locked keychain, a cancelled unlock prompt, unavailable keychain,
+        // interaction required, or an item owned by a different application's
+        // ACL all surface as a lack of storage access.
+        errSecUserCanceled,
+        errSecNotAvailable,
         errSecInteractionNotAllowed,
+        errSecInteractionRequired,
         errSecAuthFailed,
         errSecNoAccessForItem,
         errSecInvalidOwnerEdit,
@@ -169,6 +179,7 @@ pub fn get(gpa: Allocator, service: []const u8, account: []const u8) Error![]u8 
 
     const data: CFDataRef = @ptrCast(out orelse return error.StorageFailure);
     const len: usize = @intCast(CFDataGetLength(data));
+    if (len == 0) return gpa.dupe(u8, "");
     const ptr = CFDataGetBytePtr(data);
     return gpa.dupe(u8, ptr[0..len]);
 }
@@ -236,7 +247,9 @@ fn add(service: CFStringRef, account: CFStringRef, value: CFDataRef) Error!void 
     defer CFRelease(attrs);
 
     const status = SecItemAdd(attrs, null);
-    if (status != errSecSuccess) return mapStatus(status);
+    if (status == errSecSuccess) return;
+    if (status == errSecDuplicateItem) return update(service, account, value);
+    return mapStatus(status);
 }
 
 /// Remove the generic-password item under `service`/`account`. Returns
@@ -252,4 +265,17 @@ pub fn delete(service: []const u8, account: []const u8) Error!void {
 
     const status = SecItemDelete(query);
     if (status != errSecSuccess) return mapStatus(status);
+}
+
+test "mapStatus maps Keychain access-denied and missing-item OSStatus codes" {
+    try std.testing.expectEqual(error.EntryNotFound, mapStatus(-25300));
+    try std.testing.expectEqual(error.NoStorageAccess, mapStatus(-128));
+    try std.testing.expectEqual(error.NoStorageAccess, mapStatus(-25291));
+    try std.testing.expectEqual(error.NoStorageAccess, mapStatus(-25315));
+    try std.testing.expectEqual(error.NoStorageAccess, mapStatus(-25293));
+    try std.testing.expectEqual(error.NoStorageAccess, mapStatus(-25308));
+    try std.testing.expectEqual(error.NoStorageAccess, mapStatus(-25243));
+    try std.testing.expectEqual(error.NoStorageAccess, mapStatus(-25244));
+    try std.testing.expectEqual(error.StorageFailure, mapStatus(-25299));
+    try std.testing.expectEqual(error.StorageFailure, mapStatus(-50));
 }

@@ -28,6 +28,7 @@ const BOOL = i32;
 const CRED_TYPE_GENERIC: u32 = 1;
 const CRED_PERSIST_LOCAL_MACHINE: u32 = 2;
 const ERROR_NOT_FOUND: u32 = 1168;
+const CRED_MAX_CREDENTIAL_BLOB_SIZE: usize = 2560;
 
 const FILETIME = extern struct {
     dwLowDateTime: u32,
@@ -67,10 +68,18 @@ extern "advapi32" fn CredEnumerateW(
 extern "advapi32" fn CredFree(Buffer: ?*anyopaque) callconv(.winapi) void;
 
 fn toUtf16Z(gpa: Allocator, value: []const u8) Error![:0]u16 {
+    if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidUtf8;
     return std.unicode.utf8ToUtf16LeAllocZ(gpa, value) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidUtf8,
     };
+}
+
+fn wipeCredBlob(c: *CREDENTIALW) void {
+    if (c.CredentialBlob) |blob| {
+        const len: usize = @intCast(c.CredentialBlobSize);
+        if (len > 0) std.crypto.secureZero(u8, blob[0..len]);
+    }
 }
 
 fn fromUtf16Z(gpa: Allocator, ptr: ?[*:0]const u16) Error![]u8 {
@@ -95,7 +104,10 @@ pub fn getEntry(gpa: Allocator, target: []const u8) Error!Entry {
             else => error.StorageFailure,
         };
     }
-    defer if (cred) |ptr| CredFree(ptr);
+    defer if (cred) |ptr| {
+        wipeCredBlob(ptr);
+        CredFree(ptr);
+    };
 
     const c = cred orelse return error.StorageFailure;
     return entryFromCred(gpa, c);
@@ -115,7 +127,11 @@ pub fn listEntries(gpa: Allocator, filter: []const u8) Error![]Entry {
             else => error.StorageFailure,
         };
     }
-    defer CredFree(@ptrCast(creds));
+    defer {
+        const total_creds: usize = @intCast(count);
+        for (creds[0..total_creds]) |c| wipeCredBlob(c);
+        CredFree(@ptrCast(creds));
+    }
 
     var list = try std.ArrayList(Entry).initCapacity(gpa, @intCast(count));
     errdefer {
@@ -166,7 +182,10 @@ pub fn get(gpa: Allocator, target: []const u8) Error![]u8 {
             else => error.StorageFailure,
         };
     }
-    defer if (cred) |ptr| CredFree(ptr);
+    defer if (cred) |ptr| {
+        wipeCredBlob(ptr);
+        CredFree(ptr);
+    };
 
     const c = cred orelse return error.StorageFailure;
     const len: usize = @intCast(c.CredentialBlobSize);
@@ -176,6 +195,9 @@ pub fn get(gpa: Allocator, target: []const u8) Error![]u8 {
 
 /// Store `value` under `target` (current-user, local-machine persisted).
 pub fn set(gpa: Allocator, target: []const u8, user: []const u8, value: []const u8) Error!void {
+    if (value.len > CRED_MAX_CREDENTIAL_BLOB_SIZE) return error.StorageFailure;
+    const blob_size = std.math.cast(u32, value.len) orelse return error.StorageFailure;
+
     const target_w = try toUtf16Z(gpa, target);
     defer gpa.free(target_w);
     const user_w = try toUtf16Z(gpa, user);
@@ -187,8 +209,8 @@ pub fn set(gpa: Allocator, target: []const u8, user: []const u8, value: []const 
         .TargetName = target_w.ptr,
         .Comment = null,
         .LastWritten = std.mem.zeroes(FILETIME),
-        .CredentialBlobSize = @intCast(value.len),
-        .CredentialBlob = @constCast(value.ptr),
+        .CredentialBlobSize = blob_size,
+        .CredentialBlob = if (value.len == 0) null else @constCast(value.ptr),
         .Persist = CRED_PERSIST_LOCAL_MACHINE,
         .AttributeCount = 0,
         .Attributes = null,
@@ -208,4 +230,23 @@ pub fn delete(gpa: Allocator, target: []const u8) Error!void {
             else => error.StorageFailure,
         };
     }
+}
+
+test "toUtf16Z rejects embedded NUL bytes and round-trips valid UTF-8" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidUtf8, toUtf16Z(gpa, "target\x00injected"));
+    try std.testing.expectError(error.InvalidUtf8, toUtf16Z(gpa, "\x00"));
+
+    const encoded = try toUtf16Z(gpa, "ado-keyring/alice");
+    defer gpa.free(encoded);
+    const decoded = try fromUtf16Z(gpa, encoded.ptr);
+    defer gpa.free(decoded);
+    try std.testing.expectEqualStrings("ado-keyring/alice", decoded);
+
+    var secret_buf = [_]u8{ 's', 'e', 'c', 'r', 'e', 't' };
+    var cred: CREDENTIALW = std.mem.zeroes(CREDENTIALW);
+    cred.CredentialBlob = &secret_buf;
+    cred.CredentialBlobSize = secret_buf.len;
+    wipeCredBlob(&cred);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0 }, &secret_buf);
 }

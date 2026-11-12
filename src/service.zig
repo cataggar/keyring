@@ -123,16 +123,30 @@ pub const ItemRecord = struct {
     modified: u64,
 };
 
-pub const Session = union(enum) {
+pub const SessionAlgorithm = union(enum) {
     plain,
     dh_ietf: [16]u8,
+};
 
-    fn deinit(self: *Session) void {
-        switch (self.*) {
+pub const Session = struct {
+    owner: ?[]u8 = null,
+    algorithm: SessionAlgorithm,
+
+    fn deinit(self: *Session, gpa: Allocator) void {
+        if (self.owner) |owner| gpa.free(owner);
+        switch (self.algorithm) {
             .plain => {},
             .dh_ietf => |*key| std.crypto.secureZero(u8, key),
         }
-        self.* = .plain;
+        self.* = .{ .owner = null, .algorithm = .plain };
+    }
+
+    fn matchesSender(self: *const Session, sender: ?[]const u8) bool {
+        if (self.owner) |owner| {
+            const actual = sender orelse return false;
+            return std.mem.eql(u8, owner, actual);
+        }
+        return sender == null;
     }
 };
 
@@ -141,7 +155,10 @@ pub const OutboundMessages = struct {
     frames: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn deinit(self: *OutboundMessages) void {
-        for (self.frames.items) |frame| self.gpa.free(frame);
+        for (self.frames.items) |frame| {
+            std.crypto.secureZero(u8, frame);
+            self.gpa.free(frame);
+        }
         self.frames.deinit(self.gpa);
         self.* = undefined;
     }
@@ -187,7 +204,7 @@ pub const ServiceState = struct {
         self.lockAll();
         self.items.deinit(self.gpa);
         var sessions = self.sessions.valueIterator();
-        while (sessions.next()) |session| session.deinit();
+        while (sessions.next()) |session| session.deinit(self.gpa);
         self.sessions.deinit(self.gpa);
         self.gpa.free(self.label);
         self.* = undefined;
@@ -201,10 +218,11 @@ pub const ServiceState = struct {
         self.unlocked = false;
     }
 
-    pub fn checkIdleTimeout(self: *ServiceState, now_sec: u64, last_activity_sec: u64, timeout_seconds: ?u32) bool {
+    pub fn checkIdleTimeout(self: *ServiceState, now_ms: i64, last_activity_ms: i64, timeout_seconds: ?u32) bool {
         if (!self.unlocked) return false;
         const t = timeout_seconds orelse return false;
-        if (now_sec >= last_activity_sec +| @as(u64, t)) {
+        const timeout_ms = @as(i64, t) * 1000;
+        if (now_ms >= last_activity_ms +| timeout_ms) {
             self.lockAll();
             return true;
         }
@@ -481,9 +499,12 @@ pub const ServiceState = struct {
             var requested = try readObjectPaths(self.gpa, &r);
             defer requested.deinit(self.gpa);
             const session_path = r.readObjectPath() catch return DispatchError.InvalidArgs;
-            const session = self.sessionForPath(session_path) orelse return DispatchError.NoSuchObject;
+            const session = try self.sessionForPath(session_path, call.header.sender);
             var body: std.ArrayList(u8) = .empty;
-            defer body.deinit(self.gpa);
+            defer {
+                std.crypto.secureZero(u8, body.items);
+                body.deinit(self.gpa);
+            }
             var w = wire.Writer.init(self.gpa, &body);
             const array = try w.beginArray(8);
             for (requested.items) |item_path| {
@@ -491,7 +512,7 @@ pub const ServiceState = struct {
                 const item = self.findItem(id) orelse continue;
                 try w.alignStruct();
                 try w.writeObjectPath(item_path);
-                try writeSecret(self.gpa, &w, item.secret, item.content_type, session_path, session.*);
+                try writeSecret(self.gpa, &w, item.secret, item.content_type, session_path, session.algorithm);
             }
             w.endArray(array);
             return self.reply(call, "a{o(oayays)}", body.items);
@@ -510,31 +531,51 @@ pub const ServiceState = struct {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.gpa);
         var w = wire.Writer.init(self.gpa, &body);
+
+        const owner = if (call.header.sender) |s| try self.gpa.dupe(u8, s) else null;
+        var session_stored = false;
+        errdefer if (!session_stored) {
+            if (owner) |o| self.gpa.free(o);
+        };
+
         if (std.mem.eql(u8, algorithm, "plain")) {
             if (!std.mem.eql(u8, variant_signature, "s")) return DispatchError.InvalidArgs;
             _ = r.readString() catch return DispatchError.InvalidArgs;
-            try self.sessions.put(self.gpa, id, .plain);
             try w.writeSignatureValue("s");
             try w.writeString("");
+            const path = try std.fmt.allocPrint(self.gpa, "/org/freedesktop/secrets/session/s{d}", .{id});
+            defer self.gpa.free(path);
+            try w.writeObjectPath(path);
+            if (try self.sessions.fetchPut(self.gpa, id, .{ .owner = owner, .algorithm = .plain })) |prev| {
+                var old = prev.value;
+                old.deinit(self.gpa);
+            }
+            session_stored = true;
         } else if (std.mem.eql(u8, algorithm, dh_algorithm)) {
             if (!std.mem.eql(u8, variant_signature, "ay")) return DispatchError.InvalidArgs;
             const client_key = try readByteArray(&r);
             var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+            defer std.crypto.secureZero(u8, &seed);
             secureRandom(&seed);
             var rng = std.Random.DefaultCsprng.init(seed);
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&rng));
             var key_pair = try generateDhKeyPair(rng.random());
             defer std.crypto.secureZero(u8, &key_pair.private);
             var key = try deriveDhSharedKey(key_pair.private, client_key);
-            errdefer std.crypto.secureZero(u8, &key);
-            try self.sessions.put(self.gpa, id, .{ .dh_ietf = key });
+            errdefer if (!session_stored) std.crypto.secureZero(u8, &key);
             try w.writeSignatureValue("ay");
             try writeByteArray(&w, &key_pair.public);
+            const path = try std.fmt.allocPrint(self.gpa, "/org/freedesktop/secrets/session/s{d}", .{id});
+            defer self.gpa.free(path);
+            try w.writeObjectPath(path);
+            if (try self.sessions.fetchPut(self.gpa, id, .{ .owner = owner, .algorithm = .{ .dh_ietf = key } })) |prev| {
+                var old = prev.value;
+                old.deinit(self.gpa);
+            }
+            session_stored = true;
         } else {
             return DispatchError.NotSupported;
         }
-        const path = try std.fmt.allocPrint(self.gpa, "/org/freedesktop/secrets/session/s{d}", .{id});
-        defer self.gpa.free(path);
-        try w.writeObjectPath(path);
         return self.reply(call, "vo", body.items);
     }
 
@@ -575,8 +616,8 @@ pub const ServiceState = struct {
         defer properties.deinit(self.gpa);
         const encoded_secret = try readSecretTuple(&r);
         const replace = r.readBool() catch return DispatchError.InvalidArgs;
-        const session = self.sessionForPath(encoded_secret.session) orelse return DispatchError.NoSuchObject;
-        const plaintext = try decodeSecret(self.gpa, encoded_secret, session.*);
+        const session = try self.sessionForPath(encoded_secret.session, call.header.sender);
+        const plaintext = try decodeSecret(self.gpa, encoded_secret, session.algorithm);
         defer {
             std.crypto.secureZero(u8, plaintext);
             self.gpa.free(plaintext);
@@ -648,19 +689,22 @@ pub const ServiceState = struct {
         if (std.mem.eql(u8, member, "GetSecret")) {
             var r = wire.Reader.init(call.body);
             const session_path = r.readObjectPath() catch return DispatchError.InvalidArgs;
-            const session = self.sessionForPath(session_path) orelse return DispatchError.NoSuchObject;
+            const session = try self.sessionForPath(session_path, call.header.sender);
             const item = &self.items.items[index];
             var body: std.ArrayList(u8) = .empty;
-            defer body.deinit(self.gpa);
+            defer {
+                std.crypto.secureZero(u8, body.items);
+                body.deinit(self.gpa);
+            }
             var w = wire.Writer.init(self.gpa, &body);
-            try writeSecret(self.gpa, &w, item.secret, item.content_type, session_path, session.*);
+            try writeSecret(self.gpa, &w, item.secret, item.content_type, session_path, session.algorithm);
             return self.reply(call, "(oayays)", body.items);
         }
         if (std.mem.eql(u8, member, "SetSecret")) {
             var r = wire.Reader.init(call.body);
             const encoded = try readSecretTuple(&r);
-            const session = self.sessionForPath(encoded.session) orelse return DispatchError.NoSuchObject;
-            const plaintext = try decodeSecret(self.gpa, encoded, session.*);
+            const session = try self.sessionForPath(encoded.session, call.header.sender);
+            const plaintext = try decodeSecret(self.gpa, encoded, session.algorithm);
             defer {
                 std.crypto.secureZero(u8, plaintext);
                 self.gpa.free(plaintext);
@@ -698,10 +742,11 @@ pub const ServiceState = struct {
     }
 
     fn handleSession(self: *ServiceState, call: message.Parsed, member: []const u8, session_id: u32) !OutboundMessages {
+        const existing = self.sessions.getPtr(session_id) orelse return DispatchError.NoSuchObject;
+        if (!existing.matchesSender(call.header.sender)) return DispatchError.NoSuchObject;
         if (!std.mem.eql(u8, member, "Close")) return DispatchError.UnknownMethod;
-        const removed = self.sessions.fetchRemove(session_id) orelse return DispatchError.NoSuchObject;
-        var session = removed.value;
-        session.deinit();
+        var session = self.sessions.fetchRemove(session_id).?.value;
+        session.deinit(self.gpa);
         return self.emptyReply(call);
     }
 
@@ -816,6 +861,7 @@ pub const ServiceState = struct {
         }
         if (itemIdFromPath(path)) |item_id| {
             if (!std.mem.eql(u8, interface, item_interface)) return DispatchError.UnknownInterface;
+            if (!self.unlocked) return DispatchError.IsLocked;
             const item = self.findItem(item_id) orelse return DispatchError.NoSuchObject;
             if (std.mem.eql(u8, property, "Locked")) {
                 try w.writeSignatureValue("b");
@@ -861,6 +907,7 @@ pub const ServiceState = struct {
             try w.writeU64(self.modified);
         } else if (itemIdFromPath(path)) |item_id| {
             if (!std.mem.eql(u8, interface, item_interface)) return DispatchError.UnknownInterface;
+            if (!self.unlocked) return DispatchError.IsLocked;
             const item = self.findItem(item_id) orelse return DispatchError.NoSuchObject;
             try writePropertyEntryStart(w, "Locked", "b");
             try w.writeBool(!self.unlocked);
@@ -945,9 +992,11 @@ pub const ServiceState = struct {
         return null;
     }
 
-    fn sessionForPath(self: *ServiceState, path: []const u8) ?*Session {
-        const id = sessionIdFromPath(path) orelse return null;
-        return self.sessions.getPtr(id);
+    fn sessionForPath(self: *ServiceState, path: []const u8, sender: ?[]const u8) DispatchError!*Session {
+        const id = sessionIdFromPath(path) orelse return DispatchError.NoSuchObject;
+        const session = self.sessions.getPtr(id) orelse return DispatchError.NoSuchObject;
+        if (!session.matchesSender(sender)) return DispatchError.NoSuchObject;
+        return session;
     }
 
     fn promptReply(self: *ServiceState, call: message.Parsed, dismissed: bool) !OutboundMessages {
@@ -1026,9 +1075,17 @@ pub const ServiceState = struct {
 
     fn appendFrame(self: *ServiceState, out: *OutboundMessages, header: message.Header, body: []const u8) !void {
         var frame: std.ArrayList(u8) = .empty;
-        errdefer frame.deinit(self.gpa);
+        errdefer {
+            std.crypto.secureZero(u8, frame.items);
+            frame.deinit(self.gpa);
+        }
         try message.serialize(self.gpa, &frame, header, body);
-        try out.frames.append(self.gpa, try frame.toOwnedSlice(self.gpa));
+        const slice = try frame.toOwnedSlice(self.gpa);
+        errdefer {
+            std.crypto.secureZero(u8, slice);
+            self.gpa.free(slice);
+        }
+        try out.frames.append(self.gpa, slice);
     }
 
     fn takeSerial(self: *ServiceState) u32 {
@@ -1089,6 +1146,31 @@ fn resolvePropertiesInterface(path: []const u8, raw_interface: []const u8) Dispa
     return DispatchError.NoSuchObject;
 }
 
+fn countsAsActivity(call: message.Parsed) bool {
+    if (call.header.msg_type != .method_call) return false;
+    const path = call.header.path orelse return false;
+    const member = call.header.member orelse return false;
+    const interface = call.header.interface orelse (inferInterface(path, member) orelse return false);
+
+    if (std.mem.eql(u8, interface, peer_interface)) return false;
+    if (std.mem.eql(u8, interface, introspectable_interface)) return false;
+    if (std.mem.eql(u8, interface, control_interface)) {
+        return std.mem.eql(u8, member, "UnlockWithMasterKey");
+    }
+    if (std.mem.eql(u8, interface, service_interface)) {
+        return !std.mem.eql(u8, member, "Lock");
+    }
+    if (std.mem.eql(u8, interface, collection_interface) or
+        std.mem.eql(u8, interface, item_interface))
+    {
+        return true;
+    }
+    if (std.mem.eql(u8, interface, properties_interface)) {
+        return isCollectionPath(path) or itemIdFromPath(path) != null;
+    }
+    return false;
+}
+
 fn readItemProperties(gpa: Allocator, r: *wire.Reader) !ItemProperties {
     var result: ItemProperties = .{};
     errdefer result.deinit(gpa);
@@ -1107,6 +1189,7 @@ fn readItemProperties(gpa: Allocator, r: *wire.Reader) !ItemProperties {
             try skipValue(r, signature);
         }
     }
+    if (r.pos != array.end) return DispatchError.InvalidArgs;
     return result;
 }
 
@@ -1129,6 +1212,7 @@ fn readAttributes(gpa: Allocator, r: *wire.Reader) !std.StringHashMapUnmanaged([
         }
         entry.value_ptr.* = value_owned;
     }
+    if (r.pos != array.end) return DispatchError.InvalidArgs;
     return result;
 }
 
@@ -1139,11 +1223,13 @@ fn readObjectPaths(gpa: Allocator, r: *wire.Reader) !std.ArrayListUnmanaged([]co
     while (r.arrayHasMore(array)) {
         try result.append(gpa, r.readObjectPath() catch return DispatchError.InvalidArgs);
     }
+    if (r.pos != array.end) return DispatchError.InvalidArgs;
     return result;
 }
 
 fn readByteArray(r: *wire.Reader) ![]const u8 {
     const array = r.beginArray(1) catch return DispatchError.InvalidArgs;
+    if (r.pos > array.end) return DispatchError.InvalidArgs;
     return r.readBytes(array.end - r.pos) catch return DispatchError.InvalidArgs;
 }
 
@@ -1169,6 +1255,7 @@ fn skipDictSv(r: *wire.Reader) !void {
         const signature = r.readSignatureValue() catch return DispatchError.InvalidArgs;
         try skipValue(r, signature);
     }
+    if (r.pos != array.end) return DispatchError.InvalidArgs;
 }
 
 fn skipValue(r: *wire.Reader, signature: []const u8) !void {
@@ -1222,7 +1309,7 @@ fn writePropertyEntryStart(w: *wire.Writer, name: []const u8, signature: []const
     try w.writeSignatureValue(signature);
 }
 
-fn writeSecret(gpa: Allocator, w: *wire.Writer, plaintext: []const u8, content_type: []const u8, session_path: []const u8, session: Session) !void {
+fn writeSecret(gpa: Allocator, w: *wire.Writer, plaintext: []const u8, content_type: []const u8, session_path: []const u8, session: SessionAlgorithm) !void {
     try w.alignStruct();
     try w.writeObjectPath(session_path);
     switch (session) {
@@ -1234,7 +1321,10 @@ fn writeSecret(gpa: Allocator, w: *wire.Writer, plaintext: []const u8, content_t
             var iv: [16]u8 = undefined;
             secureRandom(&iv);
             const ciphertext = try aesCbcEncrypt(gpa, key, iv, plaintext);
-            defer gpa.free(ciphertext);
+            defer {
+                std.crypto.secureZero(u8, ciphertext);
+                gpa.free(ciphertext);
+            }
             try writeByteArray(w, &iv);
             try writeByteArray(w, ciphertext);
         },
@@ -1242,7 +1332,7 @@ fn writeSecret(gpa: Allocator, w: *wire.Writer, plaintext: []const u8, content_t
     try w.writeString(content_type);
 }
 
-fn decodeSecret(gpa: Allocator, encoded: EncodedSecret, session: Session) ![]u8 {
+fn decodeSecret(gpa: Allocator, encoded: EncodedSecret, session: SessionAlgorithm) ![]u8 {
     return switch (session) {
         .plain => try gpa.dupe(u8, encoded.value),
         .dh_ietf => |key| blk: {
@@ -1416,7 +1506,10 @@ fn base64DecodeAlloc(gpa: Allocator, encoded: []const u8) ![]u8 {
     const decoder = std.base64.url_safe_no_pad.Decoder;
     const length = decoder.calcSizeForSlice(encoded) catch return error.InvalidVault;
     const output = try gpa.alloc(u8, length);
-    errdefer gpa.free(output);
+    errdefer {
+        std.crypto.secureZero(u8, output);
+        gpa.free(output);
+    }
     decoder.decode(output, encoded) catch return error.InvalidVault;
     return output;
 }
@@ -1424,6 +1517,11 @@ fn base64DecodeAlloc(gpa: Allocator, encoded: []const u8) ![]u8 {
 fn unixNow() u64 {
     const io = std.Io.Threaded.global_single_threaded.io();
     return @intCast(@max(@as(i64, 0), std.Io.Clock.real.now(io).toSeconds()));
+}
+
+fn monotonicNowMs() i64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return std.Io.Clock.awake.now(io).toMilliseconds();
 }
 
 fn secureRandom(output: []u8) void {
@@ -1438,9 +1536,10 @@ fn aesCbcEncrypt(gpa: Allocator, key: [16]u8, iv: [16]u8, plaintext: []const u8)
     @memset(output[plaintext.len..], padding);
     const context = Aes128.initEnc(key);
     var previous = iv;
+    var block: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &block);
     var offset: usize = 0;
     while (offset < output.len) : (offset += 16) {
-        var block: [16]u8 = undefined;
         for (0..16) |index| block[index] = output[offset + index] ^ previous[index];
         context.encrypt(output[offset..][0..16], &block);
         @memcpy(&previous, output[offset..][0..16]);
@@ -1451,27 +1550,31 @@ fn aesCbcEncrypt(gpa: Allocator, key: [16]u8, iv: [16]u8, plaintext: []const u8)
 fn aesCbcDecrypt(gpa: Allocator, key: [16]u8, iv: [16]u8, ciphertext: []const u8) ![]u8 {
     if (ciphertext.len == 0 or ciphertext.len % 16 != 0) return DispatchError.InvalidArgs;
     const output = try gpa.dupe(u8, ciphertext);
-    errdefer gpa.free(output);
+    errdefer {
+        std.crypto.secureZero(u8, output);
+        gpa.free(output);
+    }
     const context = Aes128.initDec(key);
     var previous = iv;
+    var block: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &block);
     var offset: usize = 0;
     while (offset < output.len) : (offset += 16) {
         var carry: [16]u8 = undefined;
         @memcpy(&carry, output[offset..][0..16]);
-        var block: [16]u8 = undefined;
         context.decrypt(&block, output[offset..][0..16]);
         for (0..16) |index| output[offset + index] = block[index] ^ previous[index];
         previous = carry;
     }
-    const padding = output[output.len - 1];
-    if (padding == 0 or padding > 16 or padding > output.len) return DispatchError.InvalidArgs;
-    var mismatch: u8 = 0;
+    const padding: usize = output[output.len - 1];
+    var mismatch: u8 = @intFromBool((padding -% 1) >= 16);
     for (0..16) |index| {
         const check: u8 = @intFromBool(index + padding >= 16);
-        mismatch |= (output[output.len - 16 + index] ^ padding) & (0 -% check);
+        mismatch |= (output[output.len - 16 + index] ^ @as(u8, @truncate(padding))) & (0 -% check);
     }
     if (mismatch != 0) return DispatchError.InvalidArgs;
     const final_length = output.len - padding;
+    std.crypto.secureZero(u8, output[final_length..]);
     if (gpa.resize(output, final_length)) return output[0..final_length];
     const trimmed = try gpa.dupe(u8, output[0..final_length]);
     std.crypto.secureZero(u8, output);
@@ -1492,6 +1595,16 @@ const dh_prime: [dh_prime_bytes]u8 = .{
     0xEE, 0x38, 0x6B, 0xFB, 0x5A, 0x89, 0x9F, 0xA5, 0xAE, 0x9F, 0x24, 0x11, 0x7C, 0x4B, 0x1F, 0xE6,
     0x49, 0x28, 0x66, 0x51, 0xEC, 0xE6, 0x53, 0x81, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 };
+const dh_prime_minus_one: [dh_prime_bytes]u8 = blk: {
+    var value = dh_prime;
+    value[dh_prime_bytes - 1] -= 1;
+    break :blk value;
+};
+const dh_one: [dh_prime_bytes]u8 = blk: {
+    var value: [dh_prime_bytes]u8 = @splat(0);
+    value[dh_prime_bytes - 1] = 1;
+    break :blk value;
+};
 const dh_generator: [dh_prime_bytes]u8 = blk: {
     var value: [dh_prime_bytes]u8 = @splat(0);
     value[dh_prime_bytes - 1] = 2;
@@ -1505,6 +1618,7 @@ const DhKeyPair = struct {
 
 fn generateDhKeyPair(random: std.Random) !DhKeyPair {
     var result: DhKeyPair = undefined;
+    errdefer std.crypto.secureZero(u8, &result.private);
     while (true) {
         random.bytes(&result.private);
         result.private[0] &= 0x7f;
@@ -1523,9 +1637,11 @@ fn deriveDhSharedKey(private: [dh_prime_bytes]u8, peer: []const u8) ![16]u8 {
     if (peer.len == 0 or peer.len > dh_prime_bytes) return DispatchError.InvalidArgs;
     var padded: [dh_prime_bytes]u8 = @splat(0);
     @memcpy(padded[dh_prime_bytes - peer.len ..], peer);
-    var nonzero: u8 = 0;
-    for (padded) |byte| nonzero |= byte;
-    if (nonzero == 0) return DispatchError.InvalidArgs;
+    if (std.mem.order(u8, &padded, &dh_one) != .gt or
+        std.mem.order(u8, &padded, &dh_prime_minus_one) != .lt)
+    {
+        return DispatchError.InvalidArgs;
+    }
     const modulus = try DhModulus.fromBytes(&dh_prime, .big);
     const peer_value = try DhFe.fromBytes(modulus, &padded, .big);
     const shared = try modulus.powWithEncodedExponent(peer_value, &private, .big);
@@ -1556,6 +1672,24 @@ const TestEnvironment = struct {
 
 var test_env_override: ?TestEnvironment = null;
 
+fn isPosix() bool {
+    return builtin.os.tag != .windows and builtin.os.tag != .wasi;
+}
+
+fn hasAsciiControlChars(s: []const u8) bool {
+    for (s) |c| {
+        if (c < 0x20 or c == 0x7f) return true;
+    }
+    return false;
+}
+
+fn isAbsoluteServicePath(path: []const u8) bool {
+    if (builtin.os.tag == .windows) {
+        return std.fs.path.isAbsolute(path) or std.fs.path.isAbsolutePosix(path);
+    }
+    return std.fs.path.isAbsolute(path);
+}
+
 pub fn resolveServicePathsFromDirs(
     gpa: Allocator,
     home: ?[]const u8,
@@ -1564,24 +1698,28 @@ pub fn resolveServicePathsFromDirs(
 ) !ServicePaths {
     const dbus_service_path = blk: {
         if (xdg_data_home) |data_dir| {
-            if (data_dir.len > 0 and std.fs.path.isAbsolute(data_dir)) {
+            if (data_dir.len > 0 and isAbsoluteServicePath(data_dir) and !hasAsciiControlChars(data_dir)) {
                 break :blk try std.fs.path.join(gpa, &.{ data_dir, "dbus-1", "services", "org.freedesktop.secrets.service" });
             }
         }
         const home_dir = home orelse return error.HomeNotFound;
-        if (home_dir.len == 0) return error.HomeNotFound;
+        if (home_dir.len == 0 or !isAbsoluteServicePath(home_dir) or hasAsciiControlChars(home_dir)) {
+            return error.HomeNotFound;
+        }
         break :blk try std.fs.path.join(gpa, &.{ home_dir, ".local", "share", "dbus-1", "services", "org.freedesktop.secrets.service" });
     };
     errdefer gpa.free(dbus_service_path);
 
     const systemd_unit_path = blk: {
         if (xdg_config_home) |config_dir| {
-            if (config_dir.len > 0 and std.fs.path.isAbsolute(config_dir)) {
+            if (config_dir.len > 0 and isAbsoluteServicePath(config_dir) and !hasAsciiControlChars(config_dir)) {
                 break :blk try std.fs.path.join(gpa, &.{ config_dir, "systemd", "user", "keyring.service" });
             }
         }
         const home_dir = home orelse return error.HomeNotFound;
-        if (home_dir.len == 0) return error.HomeNotFound;
+        if (home_dir.len == 0 or !isAbsoluteServicePath(home_dir) or hasAsciiControlChars(home_dir)) {
+            return error.HomeNotFound;
+        }
         break :blk try std.fs.path.join(gpa, &.{ home_dir, ".config", "systemd", "user", "keyring.service" });
     };
 
@@ -1605,7 +1743,7 @@ fn resolveServicePaths(gpa: Allocator) !ServicePaths {
 }
 
 fn validateExecutablePath(exe_path: []const u8) !void {
-    if (exe_path.len == 0 or std.mem.indexOfAny(u8, exe_path, "\r\n\x00") != null) {
+    if (exe_path.len == 0 or !isAbsoluteServicePath(exe_path) or hasAsciiControlChars(exe_path)) {
         return error.InvalidExecutablePath;
     }
 }
@@ -1615,20 +1753,14 @@ pub fn formatDbusServiceFile(gpa: Allocator, exe_path: []const u8) ![]u8 {
     var out = std.Io.Writer.Allocating.init(gpa);
     errdefer out.deinit();
 
-    try out.writer.writeAll(managed_marker ++ "\n[D-BUS Service]\nName=org.freedesktop.secrets\nExec=");
-    if (std.mem.indexOfAny(u8, exe_path, " \t\"'\\$`") != null) {
-        try out.writer.writeByte('"');
-        for (exe_path) |c| {
-            if (c == '\\' or c == '"' or c == '$' or c == '`') {
-                try out.writer.writeByte('\\');
-            }
-            try out.writer.writeByte(c);
+    try out.writer.writeAll(managed_marker ++ "\n[D-BUS Service]\nName=org.freedesktop.secrets\nExec=\"");
+    for (exe_path) |c| {
+        if (c == '\\' or c == '"' or c == '$' or c == '`') {
+            try out.writer.writeByte('\\');
         }
-        try out.writer.writeByte('"');
-    } else {
-        try out.writer.writeAll(exe_path);
+        try out.writer.writeByte(c);
     }
-    try out.writer.writeAll(" service\nSystemdService=keyring.service\n");
+    try out.writer.writeAll("\" service\nSystemdService=keyring.service\n");
     return out.toOwnedSlice();
 }
 
@@ -1739,18 +1871,24 @@ pub fn resolveInstallExecutablePath(gpa: Allocator, io: std.Io, home: ?[]const u
         }
     }
     if (home) |home_dir| {
-        if (home_dir.len > 0) {
+        if (home_dir.len > 0 and isAbsoluteServicePath(home_dir) and !hasAsciiControlChars(home_dir)) {
             const local_bin_exe = try std.fs.path.join(gpa, &.{ home_dir, ".local", "bin", "keyring" });
-            if (regularFileExists(io, local_bin_exe)) return local_bin_exe;
+            if (executableRegularFileExists(io, local_bin_exe)) return local_bin_exe;
             gpa.free(local_bin_exe);
         }
     }
-    return std.process.executablePathAlloc(io, gpa);
+    const self_exe = try std.process.executablePathAlloc(io, gpa);
+    defer gpa.free(self_exe);
+    return gpa.dupe(u8, self_exe);
 }
 
-fn regularFileExists(io: std.Io, path: []const u8) bool {
+fn executableRegularFileExists(io: std.Io, path: []const u8) bool {
     const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
-    return st.kind == .file;
+    if (st.kind != .file) return false;
+    if (comptime isPosix()) {
+        return (st.permissions.toMode() & 0o111) != 0;
+    }
+    return true;
 }
 
 fn readUnitFileIfExists(gpa: Allocator, io: std.Io, path: []const u8) !?[]u8 {
@@ -1760,10 +1898,18 @@ fn readUnitFileIfExists(gpa: Allocator, io: std.Io, path: []const u8) !?[]u8 {
     };
 }
 
+fn unitDirPermissions() std.Io.File.Permissions {
+    return if (comptime isPosix()) .fromMode(0o700) else .default_dir;
+}
+
+fn unitFilePermissions() std.Io.File.Permissions {
+    return if (comptime isPosix()) .fromMode(0o644) else .default_file;
+}
+
 fn writeUnitFileAtomic(gpa: Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
         if (parent.len > 0) {
-            _ = try std.Io.Dir.cwd().createDirPathStatus(io, parent, .default_dir);
+            _ = try std.Io.Dir.cwd().createDirPathStatus(io, parent, unitDirPermissions());
         }
     }
     var random_suffix: [8]u8 = undefined;
@@ -1779,9 +1925,12 @@ fn writeUnitFileAtomic(gpa: Allocator, io: std.Io, path: []const u8, contents: [
             .read = true,
             .truncate = true,
             .exclusive = true,
-            .permissions = .default_file,
+            .permissions = unitFilePermissions(),
         });
         defer file.close(io);
+        if (comptime isPosix()) {
+            try file.setPermissions(io, unitFilePermissions());
+        }
         try file.writeStreamingAll(io, contents);
         try file.sync(io);
     }
@@ -1790,6 +1939,18 @@ fn writeUnitFileAtomic(gpa: Allocator, io: std.Io, path: []const u8, contents: [
 }
 
 fn checkForeignConflict(gpa: Allocator, io: std.Io, path: []const u8) !bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    if (st.kind != .file) {
+        if (st.kind == .sym_link) {
+            const existing = (readUnitFileIfExists(gpa, io, path) catch return true) orelse return true;
+            defer gpa.free(existing);
+            return !isManagedUnitContent(existing);
+        }
+        return true;
+    }
     const existing = (try readUnitFileIfExists(gpa, io, path)) orelse return false;
     defer gpa.free(existing);
     return !isManagedUnitContent(existing);
@@ -2047,16 +2208,25 @@ fn writeUnitInstallStatus(
     label: []const u8,
     path: []const u8,
 ) !void {
-    if (try readUnitFileIfExists(gpa, io, path)) |contents| {
-        defer gpa.free(contents);
-        if (isManagedUnitContent(contents)) {
-            try stdout.print("{s}: installed ({s})\n", .{ label, path });
-        } else {
-            try stdout.print("{s}: installed (foreign: {s})\n", .{ label, path });
+    const st = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => {
+            try stdout.print("{s}: not installed\n", .{label});
+            return;
+        },
+        else => return err,
+    };
+    if (st.kind == .file or st.kind == .sym_link) {
+        if (readUnitFileIfExists(gpa, io, path) catch null) |contents| {
+            defer gpa.free(contents);
+            if (isManagedUnitContent(contents)) {
+                try stdout.print("{s}: installed ({s})\n", .{ label, path });
+            } else {
+                try stdout.print("{s}: installed (foreign: {s})\n", .{ label, path });
+            }
+            return;
         }
-    } else {
-        try stdout.print("{s}: not installed\n", .{label});
     }
+    try stdout.print("{s}: installed (foreign: {s})\n", .{ label, path });
 }
 
 pub fn runDaemon(gpa: Allocator, replace: bool, lock_timeout_seconds: ?u32) !void {
@@ -2109,17 +2279,17 @@ const Linux = if (builtin.os.tag == .linux) struct {
         var state = try ServiceState.init(gpa);
         defer state.deinit();
         state.next_serial = conn.next_serial;
-        var last_activity_sec: u64 = unixNow();
+        var last_activity_ms: i64 = monotonicNowMs();
         while (true) {
             if (state.unlocked) {
                 if (lock_timeout_seconds) |timeout_s| {
-                    const now = unixNow();
-                    if (state.checkIdleTimeout(now, last_activity_sec, timeout_s)) {
+                    const now_ms = monotonicNowMs();
+                    if (state.checkIdleTimeout(now_ms, last_activity_ms, timeout_s)) {
                         continue;
                     }
-                    const deadline = last_activity_sec +| @as(u64, timeout_s);
-                    const rem_sec = deadline - now;
-                    const timeout_ms: i32 = @intCast(@min(rem_sec *| 1000, @as(u64, std.math.maxInt(i32))));
+                    const deadline_ms = last_activity_ms +| (@as(i64, timeout_s) * 1000);
+                    const rem_ms = @max(@as(i64, 0), deadline_ms -| now_ms);
+                    const timeout_ms: i32 = @intCast(@min(rem_ms, @as(i64, std.math.maxInt(i32))));
                     var pfd = [1]std.posix.pollfd{.{
                         .fd = conn.fd,
                         .events = std.posix.POLL.IN,
@@ -2141,11 +2311,13 @@ const Linux = if (builtin.os.tag == .linux) struct {
                 const for_unique = conn.unique_name != null and std.mem.eql(u8, destination, conn.unique_name.?);
                 if (!for_service and !for_unique) continue;
             }
-            _ = state.checkIdleTimeout(unixNow(), last_activity_sec, lock_timeout_seconds);
+            _ = state.checkIdleTimeout(monotonicNowMs(), last_activity_ms, lock_timeout_seconds);
             var outbound = try state.handleMessage(parsed);
             defer outbound.deinit();
             for (outbound.frames.items) |response| try writeAll(conn.fd, response);
-            last_activity_sec = unixNow();
+            if (state.unlocked and countsAsActivity(parsed)) {
+                last_activity_ms = monotonicNowMs();
+            }
         }
     }
 
@@ -2262,13 +2434,18 @@ const Linux = if (builtin.os.tag == .linux) struct {
         };
     }
 
+    const max_dbus_frame_bytes: usize = 128 * 1024 * 1024;
+
     fn readFrame(gpa: Allocator, fd: linux.fd_t) ![]u8 {
         var prefix: [message.min_header_bytes]u8 = undefined;
         try readExact(fd, &prefix);
         const total = try message.totalLength(prefix);
-        if (total < prefix.len or total > 64 * 1024 * 1024) return error.InvalidFrame;
+        if (total < prefix.len or total > max_dbus_frame_bytes) return error.InvalidFrame;
         const frame = try gpa.alloc(u8, total);
-        errdefer gpa.free(frame);
+        errdefer {
+            std.crypto.secureZero(u8, frame);
+            gpa.free(frame);
+        }
         @memcpy(frame[0..prefix.len], &prefix);
         try readExact(fd, frame[prefix.len..]);
         return frame;
@@ -2308,7 +2485,7 @@ const Linux = if (builtin.os.tag == .linux) struct {
 fn testVaultPath(tmp: *std.testing.TmpDir, gpa: Allocator) ![]u8 {
     var root: [std.fs.max_path_bytes]u8 = undefined;
     const length = try tmp.dir.realPath(std.Io.Threaded.global_single_threaded.io(), &root);
-    return std.fs.path.join(gpa, &.{ root[0..length], "vault.json" });
+    return std.fs.path.join(gpa, &.{ root[0..length], "keyring", "vault.json" });
 }
 
 fn testDispatch(
@@ -3308,7 +3485,7 @@ test "service unit formatting escapes spaces and rejects control characters" {
         "# Managed by cataggar/keyring\n" ++
             "[D-BUS Service]\n" ++
             "Name=org.freedesktop.secrets\n" ++
-            "Exec=/home/alice/.local/bin/keyring service\n" ++
+            "Exec=\"/home/alice/.local/bin/keyring\" service\n" ++
             "SystemdService=keyring.service\n",
         plain_dbus,
     );
@@ -3341,6 +3518,9 @@ test "service unit formatting escapes spaces and rejects control characters" {
 
     try std.testing.expectError(error.InvalidExecutablePath, formatDbusServiceFile(gpa, "/bad\npath/keyring"));
     try std.testing.expectError(error.InvalidExecutablePath, formatSystemdUnitFile(gpa, "/bad\rpath/keyring"));
+    try std.testing.expectError(error.InvalidExecutablePath, formatDbusServiceFile(gpa, "/bad\x7fpath/keyring"));
+    try std.testing.expectError(error.InvalidExecutablePath, formatDbusServiceFile(gpa, "/bad\tpath/keyring"));
+    try std.testing.expectError(error.InvalidExecutablePath, formatDbusServiceFile(gpa, "relative/bin/keyring"));
     try std.testing.expectError(error.InvalidExecutablePath, formatDbusServiceFile(gpa, ""));
 
     try std.testing.expect(isManagedUnitContent("[D-BUS Service]\nName=org.freedesktop.secrets\nExec=/usr/local/bin/keyring service\n"));
@@ -3367,13 +3547,23 @@ test "service install, status, foreign-unit protection, and uninstall lifecycle"
     const vpath = try std.fs.path.join(gpa, &.{ xdg_data, "keyring", "vault.json" });
     defer gpa.free(vpath);
 
-    // Create ~/.local/bin/keyring shim to verify resolveInstallExecutablePath prefers it.
+    // Create ~/.local/bin/keyring shim to verify resolveInstallExecutablePath prefers it only when executable.
     const local_bin_dir = try std.fs.path.join(gpa, &.{ home_dir, ".local", "bin" });
     defer gpa.free(local_bin_dir);
     try std.Io.Dir.cwd().createDirPath(io, local_bin_dir);
     const local_bin_keyring = try std.fs.path.join(gpa, &.{ local_bin_dir, "keyring" });
     defer gpa.free(local_bin_keyring);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = local_bin_keyring, .data = "shim" });
+    {
+        var shim = try std.Io.Dir.cwd().createFile(io, local_bin_keyring, .{
+            .truncate = true,
+            .permissions = if (comptime isPosix()) .fromMode(0o755) else .default_file,
+        });
+        defer shim.close(io);
+        if (comptime isPosix()) {
+            try shim.setPermissions(io, .fromMode(0o755));
+        }
+        try shim.writeStreamingAll(io, "shim");
+    }
 
     vault.vault_path_override = vpath;
     defer vault.vault_path_override = null;
@@ -3534,20 +3724,20 @@ test "ServiceState.checkIdleTimeout locks at deadline and SetAlias rejects clear
     state.dek = @splat(0xAB);
 
     // No timeout configured -> stays unlocked.
-    try std.testing.expect(!state.checkIdleTimeout(1_000, 100, null));
+    try std.testing.expect(!state.checkIdleTimeout(1_000_000, 100_000, null));
     try std.testing.expect(state.unlocked);
 
-    // Before deadline (`100 + 60 = 160`) -> stays unlocked.
-    try std.testing.expect(!state.checkIdleTimeout(159, 100, 60));
+    // Before deadline (`100_000 + 60_000 = 160_000`) -> stays unlocked.
+    try std.testing.expect(!state.checkIdleTimeout(159_999, 100_000, 60));
     try std.testing.expect(state.unlocked);
 
-    // At deadline (`160 >= 160`) -> locks and zeroes DEK.
-    try std.testing.expect(state.checkIdleTimeout(160, 100, 60));
+    // At deadline (`160_000 >= 160_000`) -> locks and zeroes DEK.
+    try std.testing.expect(state.checkIdleTimeout(160_000, 100_000, 60));
     try std.testing.expect(!state.unlocked);
     try std.testing.expect(state.dek == null);
 
     // Once locked, subsequent checks return false.
-    try std.testing.expect(!state.checkIdleTimeout(500, 100, 60));
+    try std.testing.expect(!state.checkIdleTimeout(500_000, 100_000, 60));
 
     // SetAlias("default", "/") -> NotSupported; SetAlias("login", collection_path) -> NotSupported.
     for ([_]struct { name: []const u8, target: []const u8 }{
@@ -3642,4 +3832,310 @@ test "Linux daemon and client entry points compile" {
         var status = status_value;
         status.deinit(gpa);
     } else |_| {}
+}
+
+fn testDispatchSender(
+    state: *ServiceState,
+    sender: ?[]const u8,
+    path: []const u8,
+    interface: []const u8,
+    member: []const u8,
+    signature: ?[]const u8,
+    body: []const u8,
+) !OutboundMessages {
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(std.testing.allocator);
+    try message.serialize(std.testing.allocator, &frame, .{
+        .msg_type = .method_call,
+        .serial = 77,
+        .path = path,
+        .interface = interface,
+        .member = member,
+        .destination = service_destination,
+        .sender = sender,
+        .signature = signature,
+    }, body);
+    return state.handleMessage(try message.parse(frame.items));
+}
+
+test "DH small-subgroup peers, AES-CBC invalid padding, and wire array overruns are rejected" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xA1B2C3D4);
+    var kp = try generateDhKeyPair(prng.random());
+    defer std.crypto.secureZero(u8, &kp.private);
+
+    // Reject 0, 1, p - 1, p, and all-0xff DH peers.
+    const zero_peer: [dh_prime_bytes]u8 = @splat(0);
+    const max_peer: [dh_prime_bytes]u8 = @splat(0xff);
+    try std.testing.expectError(DispatchError.InvalidArgs, deriveDhSharedKey(kp.private, &.{0}));
+    try std.testing.expectError(DispatchError.InvalidArgs, deriveDhSharedKey(kp.private, &.{1}));
+    try std.testing.expectError(DispatchError.InvalidArgs, deriveDhSharedKey(kp.private, &zero_peer));
+    try std.testing.expectError(DispatchError.InvalidArgs, deriveDhSharedKey(kp.private, &dh_one));
+    try std.testing.expectError(DispatchError.InvalidArgs, deriveDhSharedKey(kp.private, &dh_prime_minus_one));
+    try std.testing.expectError(DispatchError.InvalidArgs, deriveDhSharedKey(kp.private, &dh_prime));
+    try std.testing.expectError(DispatchError.InvalidArgs, deriveDhSharedKey(kp.private, &max_peer));
+
+    // AES-CBC decrypt rejects padding 0, 17, 255, and tampered padding bytes without leaking.
+    const key: [16]u8 = @splat(0x42);
+    const iv: [16]u8 = @splat(0x24);
+    const enc = Aes128.initEnc(key);
+    for ([_]u8{ 0, 17, 255 }) |bad_pad| {
+        var plain_block: [16]u8 = @splat(bad_pad);
+        for (0..16) |i| plain_block[i] ^= iv[i];
+        var ct_block: [16]u8 = undefined;
+        enc.encrypt(&ct_block, &plain_block);
+        try std.testing.expectError(DispatchError.InvalidArgs, aesCbcDecrypt(gpa, key, iv, &ct_block));
+    }
+    {
+        var plain_block: [16]u8 = @splat(4);
+        plain_block[13] = 3; // mismatched byte inside padding
+        for (0..16) |i| plain_block[i] ^= iv[i];
+        var ct_block: [16]u8 = undefined;
+        enc.encrypt(&ct_block, &plain_block);
+        try std.testing.expectError(DispatchError.InvalidArgs, aesCbcDecrypt(gpa, key, iv, &ct_block));
+    }
+
+    // Malformed D-Bus array whose declared byte length ends mid-element is rejected.
+    var bad_paths: [16]u8 = undefined;
+    std.mem.writeInt(u32, bad_paths[0..4], 4, .little); // array.end = 8
+    std.mem.writeInt(u32, bad_paths[4..8], 5, .little); // object path len = 5 -> reads through offset 14 != 8
+    @memcpy(bad_paths[8..14], "/a/bc\x00");
+    @memset(bad_paths[14..16], 0);
+    var r = wire.Reader.init(&bad_paths);
+    try std.testing.expectError(DispatchError.InvalidArgs, readObjectPaths(gpa, &r));
+}
+
+test "sessions bind to D-Bus sender, locked item properties return IsLocked, and probes do not count as activity" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testVaultPath(&tmp, gpa);
+    defer gpa.free(path);
+    vault.vault_path_override = path;
+    defer vault.vault_path_override = null;
+
+    var enrolled = try vault.enrollInitialVault(gpa, io, .{
+        .label = "sender-key",
+        .credential_id = "sender-credential",
+        .cose_alg = -8,
+        .public_key = &@as([32]u8, @splat(0x55)),
+        .prf_output = @splat(0x66),
+        .created_at = 1_700_000_000,
+    }, .{
+        .payload_created = 1_700_000_000,
+        .argon2_t = 1,
+        .argon2_m = 1024,
+        .argon2_p = 1,
+    });
+    defer enrolled.deinit();
+    try vault.saveVaultEnvelope(gpa, &enrolled.document.value);
+
+    var state = try ServiceState.init(gpa);
+    defer state.deinit();
+
+    const locked_item_path = collection_path ++ "/1";
+
+    // While locked, Properties.Get and Properties.GetAll on item paths return IsLocked (not NoSuchObject).
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString(item_interface);
+        try w.writeString("Label");
+        var out = try testDispatch(&state, locked_item_path, properties_interface, "Get", "ss", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .error_reply);
+        try std.testing.expectEqualStrings("org.freedesktop.Secret.Error.IsLocked", reply.header.error_name.?);
+    }
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString(item_interface);
+        var out = try testDispatch(&state, locked_item_path, properties_interface, "GetAll", "s", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .error_reply);
+        try std.testing.expectEqualStrings("org.freedesktop.Secret.Error.IsLocked", reply.header.error_name.?);
+    }
+
+    // Unlock and open a session owned by ":1.10".
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try writeByteArray(&w, &enrolled.dek);
+        var out = try testDispatchSender(&state, ":1.10", service_path, control_interface, "UnlockWithMasterKey", "ay", body.items);
+        defer out.deinit();
+        _ = try expectReplyType(&out, .method_return);
+    }
+
+    var session_path: []u8 = undefined;
+    defer gpa.free(session_path);
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeString("plain");
+        try w.writeSignatureValue("s");
+        try w.writeString("");
+        var out = try testDispatchSender(&state, ":1.10", service_path, service_interface, "OpenSession", "sv", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        _ = try r.readSignatureValue();
+        _ = try r.readString();
+        session_path = try gpa.dupe(u8, try r.readObjectPath());
+    }
+
+    // Create item as ":1.10".
+    var item_path: []u8 = undefined;
+    defer gpa.free(item_path);
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        try writeTestCreateItemBody(gpa, &body, session_path, "bound-secret");
+        var out = try testDispatchSender(&state, ":1.10", collection_path, collection_interface, "CreateItem", "a{sv}(oayays)b", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        item_path = try gpa.dupe(u8, try r.readObjectPath());
+    }
+
+    // Another sender (":1.11" or null) cannot GetSecret, GetSecrets, or Close ":1.10"'s session.
+    for ([_]?[]const u8{ ":1.11", null }) |attacker| {
+        {
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(gpa);
+            var w = wire.Writer.init(gpa, &body);
+            try w.writeObjectPath(session_path);
+            var out = try testDispatchSender(&state, attacker, item_path, item_interface, "GetSecret", "o", body.items);
+            defer out.deinit();
+            const reply = try expectReplyType(&out, .error_reply);
+            try std.testing.expectEqualStrings("org.freedesktop.Secret.Error.NoSuchObject", reply.header.error_name.?);
+        }
+        {
+            var out = try testDispatchSender(&state, attacker, session_path, session_interface, "Close", null, &.{});
+            defer out.deinit();
+            const reply = try expectReplyType(&out, .error_reply);
+            try std.testing.expectEqualStrings("org.freedesktop.Secret.Error.NoSuchObject", reply.header.error_name.?);
+        }
+    }
+
+    // Owner ":1.10" can still GetSecret and Close its session.
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var w = wire.Writer.init(gpa, &body);
+        try w.writeObjectPath(session_path);
+        var out = try testDispatchSender(&state, ":1.10", item_path, item_interface, "GetSecret", "o", body.items);
+        defer out.deinit();
+        const reply = try expectReplyType(&out, .method_return);
+        var r = wire.Reader.init(reply.body);
+        const secret = try readSecretTuple(&r);
+        try std.testing.expectEqualStrings("bound-secret", secret.value);
+    }
+    {
+        var out = try testDispatchSender(&state, ":1.10", session_path, session_interface, "Close", null, &.{});
+        defer out.deinit();
+        _ = try expectReplyType(&out, .method_return);
+    }
+
+    // Verify countsAsActivity excludes Ping, Introspect, and GetStatus while counting secret/collection ops.
+    inline for ([_]struct { path: []const u8, iface: ?[]const u8, member: []const u8, expected: bool }{
+        .{ .path = service_path, .iface = peer_interface, .member = "Ping", .expected = false },
+        .{ .path = service_path, .iface = null, .member = "Ping", .expected = false },
+        .{ .path = collection_path, .iface = introspectable_interface, .member = "Introspect", .expected = false },
+        .{ .path = service_path, .iface = control_interface, .member = "GetStatus", .expected = false },
+        .{ .path = service_path, .iface = null, .member = "GetStatus", .expected = false },
+        .{ .path = service_path, .iface = control_interface, .member = "UnlockWithMasterKey", .expected = true },
+        .{ .path = collection_path, .iface = collection_interface, .member = "CreateItem", .expected = true },
+        .{ .path = locked_item_path, .iface = item_interface, .member = "GetSecret", .expected = true },
+    }) |tc| {
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(gpa);
+        try message.serialize(gpa, &frame, .{
+            .msg_type = .method_call,
+            .serial = 1,
+            .path = tc.path,
+            .interface = tc.iface,
+            .member = tc.member,
+            .destination = service_destination,
+        }, &.{});
+        try std.testing.expectEqual(tc.expected, countsAsActivity(try message.parse(frame.items)));
+    }
+}
+
+test "unit file permissions, dangling symlink conflict detection, relative HOME, and executable bit check" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    // Relative HOME and control chars in HOME are rejected.
+    try std.testing.expectError(error.HomeNotFound, resolveServicePathsFromDirs(gpa, "relative/home", null, null));
+    try std.testing.expectError(error.HomeNotFound, resolveServicePathsFromDirs(gpa, "/bad\x7fhome", null, null));
+
+    const home_dir = try std.fs.path.join(gpa, &.{ root, "home" });
+    defer gpa.free(home_dir);
+    const xdg_data = try std.fs.path.join(gpa, &.{ root, "xdg-data" });
+    defer gpa.free(xdg_data);
+    const xdg_config = try std.fs.path.join(gpa, &.{ root, "xdg-config" });
+    defer gpa.free(xdg_config);
+
+    if (comptime isPosix()) {
+        // Non-executable ~/.local/bin/keyring (0o644) is NOT preferred by resolveInstallExecutablePath.
+        const local_bin_dir = try std.fs.path.join(gpa, &.{ home_dir, ".local", "bin" });
+        defer gpa.free(local_bin_dir);
+        try std.Io.Dir.cwd().createDirPath(io, local_bin_dir);
+        const local_bin_keyring = try std.fs.path.join(gpa, &.{ local_bin_dir, "keyring" });
+        defer gpa.free(local_bin_keyring);
+        {
+            var non_exec = try std.Io.Dir.cwd().createFile(io, local_bin_keyring, .{
+                .truncate = true,
+                .permissions = .fromMode(0o644),
+            });
+            defer non_exec.close(io);
+            try non_exec.setPermissions(io, .fromMode(0o644));
+            try non_exec.writeStreamingAll(io, "non-exec");
+        }
+        const resolved_non_exec = try resolveInstallExecutablePath(gpa, io, home_dir);
+        defer gpa.free(resolved_non_exec);
+        try std.testing.expect(!std.mem.eql(u8, resolved_non_exec, local_bin_keyring));
+
+        // Unit file atomic writer sets 0o700 on parent dir and 0o644 on unit file.
+        var paths = try resolveServicePathsFromDirs(gpa, home_dir, xdg_data, xdg_config);
+        defer paths.deinit(gpa);
+        try writeUnitFileAtomic(gpa, io, paths.dbus_service_path, managed_marker ++ "\n");
+        const unit_stat = try std.Io.Dir.cwd().statFile(io, paths.dbus_service_path, .{ .follow_symlinks = false });
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), unit_stat.permissions.toMode() & 0o777);
+        const dir_stat = try std.Io.Dir.cwd().statFile(io, std.fs.path.dirname(paths.dbus_service_path).?, .{});
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), dir_stat.permissions.toMode() & 0o777);
+
+        // Dangling symlink at systemd_unit_path is detected as a foreign conflict when force == false.
+        try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(paths.systemd_unit_path).?);
+        const missing_target = try std.fs.path.join(gpa, &.{ root, "does-not-exist.service" });
+        defer gpa.free(missing_target);
+        try std.Io.Dir.cwd().symLink(io, missing_target, paths.systemd_unit_path, .{});
+
+        try std.testing.expect(try checkForeignConflict(gpa, io, paths.systemd_unit_path));
+        test_env_override = .{
+            .home = home_dir,
+            .xdg_data_home = xdg_data,
+            .xdg_config_home = xdg_config,
+            .exe_path = "/usr/local/bin/keyring",
+        };
+        defer test_env_override = null;
+
+        var stdout = std.Io.Writer.Allocating.init(gpa);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(gpa);
+        defer stderr.deinit();
+        try std.testing.expectEqual(@as(u8, 1), try runInstall(gpa, .{ .force = false }, &stdout.writer, &stderr.writer));
+        try std.testing.expectEqual(@as(u8, 1), try runUninstall(gpa, .{ .force = false }, &stdout.writer, &stderr.writer));
+    }
 }

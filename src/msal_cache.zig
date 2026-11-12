@@ -55,22 +55,57 @@ pub fn findFociRefreshToken(gpa: Allocator) ?Candidate {
     const files = candidateFiles(gpa) catch return null;
     defer freeCandidateFiles(gpa, files);
 
-    var best_secret: ?[]const u8 = null;
-    var best_home: []const u8 = "";
+    return findFociRefreshTokenInFiles(gpa, files);
+}
+
+fn findFociRefreshTokenInFiles(gpa: Allocator, files: []const CacheFile) ?Candidate {
+    var owned_secret: ?[]u8 = null;
+    defer if (owned_secret) |s| {
+        std.crypto.secureZero(u8, s);
+        gpa.free(s);
+    };
+    var owned_home: ?[]u8 = null;
+    defer if (owned_home) |h| gpa.free(h);
     var best_freshness: i64 = -1;
 
     for (files) |file| {
         const json = readDecoded(gpa, file.path) orelse continue;
-        defer gpa.free(json);
+        defer {
+            std.crypto.secureZero(u8, json);
+            gpa.free(json);
+        }
         var parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch continue;
         defer parsed.deinit();
-        selectBest(parsed.value, &best_secret, &best_home, &best_freshness);
+
+        var file_secret: ?[]const u8 = null;
+        var file_home: []const u8 = "";
+        var file_freshness: i64 = best_freshness;
+        selectBest(parsed.value, &file_secret, &file_home, &file_freshness);
+        if (file_secret) |sec| {
+            const dup_sec = gpa.dupe(u8, sec) catch return null;
+            const dup_home = gpa.dupe(u8, file_home) catch {
+                std.crypto.secureZero(u8, dup_sec);
+                gpa.free(dup_sec);
+                return null;
+            };
+            if (owned_secret) |old_s| {
+                std.crypto.secureZero(u8, old_s);
+                gpa.free(old_s);
+            }
+            if (owned_home) |old_h| gpa.free(old_h);
+            owned_secret = dup_sec;
+            owned_home = dup_home;
+            best_freshness = file_freshness;
+        }
     }
 
-    const secret = best_secret orelse return null;
+    const secret = owned_secret orelse return null;
+    const home = owned_home orelse return null;
+    owned_secret = null;
+    owned_home = null;
     return .{
-        .secret = gpa.dupe(u8, secret) catch return null,
-        .home_account_id = gpa.dupe(u8, best_home) catch return null,
+        .secret = secret,
+        .home_account_id = home,
     };
 }
 
@@ -88,8 +123,9 @@ pub fn diagnose(gpa: Allocator, writer: *std.Io.Writer) !void {
     };
     defer freeCandidateFiles(gpa, files);
 
-    var best_secret: ?[]const u8 = null;
-    var best_home: []const u8 = "";
+    var has_best = false;
+    var owned_home: ?[]u8 = null;
+    defer if (owned_home) |h| gpa.free(h);
     var best_freshness: i64 = -1;
     var any = false;
 
@@ -101,7 +137,10 @@ pub fn diagnose(gpa: Allocator, writer: *std.Io.Writer) !void {
             }
             continue;
         };
-        defer gpa.free(json);
+        defer {
+            std.crypto.secureZero(u8, json);
+            gpa.free(json);
+        }
         any = true;
         var counts: Counts = .{};
         var parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch {
@@ -109,7 +148,17 @@ pub fn diagnose(gpa: Allocator, writer: *std.Io.Writer) !void {
             continue;
         };
         defer parsed.deinit();
-        countAndSelect(parsed.value, &counts, &best_secret, &best_home, &best_freshness);
+        var file_secret: ?[]const u8 = null;
+        var file_home: []const u8 = "";
+        var file_freshness: i64 = best_freshness;
+        countAndSelect(parsed.value, &counts, &file_secret, &file_home, &file_freshness);
+        if (file_secret != null) {
+            const dup_home = try gpa.dupe(u8, file_home);
+            if (owned_home) |old_h| gpa.free(old_h);
+            owned_home = dup_home;
+            has_best = true;
+            best_freshness = file_freshness;
+        }
         try writer.print("  [{s}] {s}\n    status: readable, FOCI RTs: {d}, device-bound PRTs (unredeemable): {d}\n", .{ file.label, file.path, counts.foci_rt, counts.prt });
         if (counts.foci_rt == 0 and counts.prt > 0) {
             try writer.writeAll("    note: only device-bound PRTs present — strict Conditional Access tenants require WAM broker (not supported)\n");
@@ -120,9 +169,10 @@ pub fn diagnose(gpa: Allocator, writer: *std.Io.Writer) !void {
         try writer.writeAll("  no MSAL caches found\n");
         return;
     }
-    if (best_secret != null and best_home.len != 0) {
+    const best_home = owned_home orelse "";
+    if (has_best and best_home.len != 0) {
         try writer.print("  selected account: {s}\n", .{best_home});
-    } else if (best_secret != null) {
+    } else if (has_best) {
         try writer.writeAll("  selected account: (unknown home_account_id)\n");
     } else {
         try writer.writeAll("  selected account: none usable\n");
@@ -196,12 +246,16 @@ fn fileExists(gpa: Allocator, path: []const u8) bool {
 fn readDecoded(gpa: Allocator, path: []const u8) ?[]u8 {
     const io = std.Io.Threaded.global_single_threaded.io();
     const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8 * 1024 * 1024)) catch return null;
-    defer gpa.free(raw);
+    defer {
+        std.crypto.secureZero(u8, raw);
+        gpa.free(raw);
+    }
     if (raw.len == 0) return null;
 
     if (builtin.os.tag == .windows) {
         if (dpapiUnprotect(gpa, raw)) |decrypted| {
             if (looksLikeJson(decrypted)) return decrypted;
+            std.crypto.secureZero(u8, decrypted);
             gpa.free(decrypted);
         }
     }
@@ -352,6 +406,7 @@ fn dpapiUnprotect(gpa: Allocator, raw: []const u8) ?[]u8 {
     defer _ = LocalFree(out.pbData);
     const ptr = out.pbData orelse return null;
     const len: usize = @intCast(out.cbData);
+    defer std.crypto.secureZero(u8, ptr[0..len]);
     return gpa.dupe(u8, ptr[0..len]) catch null;
 }
 
@@ -489,4 +544,45 @@ test "looksLikeJson skips leading whitespace" {
     try std.testing.expect(looksLikeJson("   \n\t{\"a\":1}"));
     try std.testing.expect(!looksLikeJson("not json"));
     try std.testing.expect(!looksLikeJson(""));
+}
+
+test "findFociRefreshTokenInFiles preserves secret across multiple zeroed cache files" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buf);
+    const root = buf[0..len];
+
+    const p1 = try std.fs.path.join(gpa, &.{ root, "c1.json" });
+    defer gpa.free(p1);
+    const p2 = try std.fs.path.join(gpa, &.{ root, "c2.json" });
+    defer gpa.free(p2);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "c1.json",
+        .data =
+        \\{"RefreshToken":{"k1":{"secret":"1.fresher-frt","environment":"login.microsoftonline.com","client_id":"04b07795-8ddb-461a-bbee-02f9e1bf7b46","family_id":"1","home_account_id":"u1.t1","last_modification_time":"9000"}}}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "c2.json",
+        .data =
+        \\{"RefreshToken":{"k2":{"secret":"1.older-frt","environment":"login.microsoftonline.com","client_id":"04b07795-8ddb-461a-bbee-02f9e1bf7b46","family_id":"1","home_account_id":"u2.t2","last_modification_time":"1000"}}}
+        ,
+    });
+
+    const files = [_]CacheFile{
+        .{ .label = "first", .path = p1 },
+        .{ .label = "second", .path = p2 },
+    };
+    const cand = findFociRefreshTokenInFiles(gpa, &files).?;
+    defer {
+        gpa.free(cand.secret);
+        gpa.free(cand.home_account_id);
+    }
+    try std.testing.expectEqualStrings("1.fresher-frt", cand.secret);
+    try std.testing.expectEqualStrings("u1.t1", cand.home_account_id);
 }

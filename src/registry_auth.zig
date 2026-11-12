@@ -192,7 +192,7 @@ pub fn normalizeServerAlloc(gpa: Allocator, raw_server: []const u8, style: Docke
     if (s.len == 0) return error.InvalidServer;
     if (std.mem.indexOfAny(u8, s, " \t\r\n\\@") != null) return error.InvalidServer;
     for (s) |c| {
-        if (std.ascii.isControl(c)) return error.InvalidServer;
+        if (c <= 0x20 or c >= 0x7f) return error.InvalidServer;
     }
 
     const host_only = try extractHostWithoutPort(s);
@@ -211,6 +211,8 @@ pub fn normalizeServerAlloc(gpa: Allocator, raw_server: []const u8, style: Docke
         }
         return canon_host;
     }
+
+    if (!isStrictDnsOrIpv4Host(host_only)) return error.InvalidServer;
 
     const lowered = try gpa.dupe(u8, s);
     errdefer gpa.free(lowered);
@@ -291,11 +293,63 @@ pub fn resolveGhcrGitHubHostAlloc(gpa: Allocator, normalized_server: []const u8)
     return null;
 }
 
+fn isAllAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+fn isStrictIpv4(s: []const u8) bool {
+    if (s.len == 0 or s.len > 15) return false;
+    var octet_idx: usize = 0;
+    var it = std.mem.splitScalar(u8, s, '.');
+    while (it.next()) |part| {
+        if (octet_idx >= 4) return false;
+        if (part.len == 0 or part.len > 3) return false;
+        if (part.len > 1 and part[0] == '0') return false;
+        for (part) |c| {
+            if (!std.ascii.isDigit(c)) return false;
+        }
+        _ = std.fmt.parseUnsigned(u8, part, 10) catch return false;
+        octet_idx += 1;
+    }
+    return octet_idx == 4;
+}
+
+fn isValidDnsLabels(s: []const u8) bool {
+    if (s.len == 0 or s.len > 253) return false;
+    var labels = std.mem.splitScalar(u8, s, '.');
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63) return false;
+        if (label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+        }
+    }
+    return true;
+}
+
+fn isStrictDnsOrIpv4Host(host: []const u8) bool {
+    if (!isValidDnsLabels(host)) return false;
+    const last_dot = std.mem.lastIndexOfScalar(u8, host, '.');
+    const last_label = if (last_dot) |idx| host[idx + 1 ..] else host;
+    if (isAllAsciiDigits(last_label)) {
+        return isStrictIpv4(host);
+    }
+    return true;
+}
+
 /// Return true if `normalized_server` is an Azure Container Registry host
 /// (`<name>.azurecr.io`, `<name>.azurecr.cn`, `<name>.azurecr.de`, `<name>.azurecr.us`).
 pub fn isAcrServer(normalized_server: []const u8) bool {
-    if (std.mem.indexOf(u8, normalized_server, "://") != null) return false;
+    if (normalized_server.len == 0 or std.mem.indexOf(u8, normalized_server, "://") != null) return false;
+    for (normalized_server) |c| {
+        if (c <= 0x20 or c >= 0x7f) return false;
+    }
     const host = extractHostWithoutPort(normalized_server) catch return false;
+    if (!isStrictDnsOrIpv4Host(host)) return false;
     const suffixes = [_][]const u8{
         ".azurecr.io",
         ".azurecr.cn",
@@ -305,7 +359,7 @@ pub fn isAcrServer(normalized_server: []const u8) bool {
     for (suffixes) |suffix| {
         if (host.len > suffix.len and std.ascii.endsWithIgnoreCase(host, suffix)) {
             const prefix = host[0 .. host.len - suffix.len];
-            if (prefix.len > 0 and prefix[0] != '.' and prefix[prefix.len - 1] != '.') {
+            if (isValidDnsLabels(prefix)) {
                 return true;
             }
         }
@@ -492,6 +546,7 @@ fn extractTenantFromAuthorityUrlAlloc(gpa: Allocator, raw_url: []const u8) ?[]u8
 }
 
 pub fn liveDiscoverAcrTenant(gpa: Allocator, server: []const u8) ?[]u8 {
+    if (!isAcrServer(server)) return null;
     const url = std.fmt.allocPrint(gpa, "https://{s}/v2/", .{server}) catch return null;
     defer gpa.free(url);
     const uri = std.Uri.parse(url) catch return null;
@@ -538,6 +593,7 @@ pub fn buildAcrExchangeRequest(
     arm_access_token: []const u8,
     tenant_id: ?[]const u8,
 ) Error!AcrExchangeRequest {
+    if (!isAcrServer(server)) return error.InvalidServer;
     const service_host = try extractHostWithoutPort(server);
     const url = try std.fmt.allocPrint(gpa, "https://{s}/oauth2/exchange", .{server});
     errdefer gpa.free(url);
@@ -570,6 +626,7 @@ pub fn liveExchangeAcrToken(
     arm_access_token: []const u8,
     tenant_id: ?[]const u8,
 ) Error![]u8 {
+    if (!isAcrServer(server)) return error.InvalidServer;
     const req = try buildAcrExchangeRequest(gpa, server, arm_access_token, tenant_id);
     defer req.deinit(gpa);
 
@@ -599,7 +656,12 @@ pub fn liveExchangeAcrToken(
     var parsed = std.json.parseFromSlice(AcrExchangeResponse, gpa, response.written(), .{
         .ignore_unknown_fields = true,
     }) catch return error.AuthenticationFailed;
-    defer parsed.deinit();
+    defer {
+        if (parsed.value.refresh_token) |rt_buf| {
+            std.crypto.secureZero(u8, @constCast(rt_buf));
+        }
+        parsed.deinit();
+    }
 
     const rt = parsed.value.refresh_token orelse return error.AuthenticationFailed;
     if (rt.len == 0) return error.AuthenticationFailed;
@@ -682,6 +744,35 @@ fn activeGenericKeyringAdapter() stored_provider.KeyringOpsAdapter {
         .ops = stored_provider.live_keyring_ops,
         .enforce_secure_backend = true,
     };
+}
+
+pub fn isGenericStoreExplicitlyDisabled() bool {
+    if (generic_store_override != null) return false;
+    if (stored_provider.is_app_backend_disallowed_fn) |fn_ptr| {
+        if (fn_ptr()) return true;
+    }
+    return keyring_zig.currentBackend() == .null_backend;
+}
+
+pub fn checkGenericStoreAvailable(
+    gpa: Allocator,
+    interaction: credential_provider.InteractionPolicy,
+) Error!void {
+    if (generic_store_override) |override| {
+        if (override.get(gpa, "container-registry://__keyring_probe__", generic_default_account)) |raw| {
+            std.crypto.secureZero(u8, raw);
+            gpa.free(raw);
+            return;
+        } else |err| return switch (err) {
+            error.EntryNotFound => {},
+            else => mapKeyringError(err),
+        };
+    }
+    const adapter = activeGenericKeyringAdapter();
+    const backend = adapter.backend();
+    backend.checkAvailableFn(backend.ctx, gpa, .{
+        .interaction = interaction,
+    }) catch |err| return mapProviderError(err);
 }
 
 fn parseRegistryTargetAlloc(gpa: Allocator, bare_host: []const u8) Error!credential_provider.Target {
@@ -945,7 +1036,12 @@ pub fn getGenericCredentialDetailedAt(
                 const parsed = std.json.parseFromSlice(LegacyV0, gpa, raw_legacy, .{
                     .ignore_unknown_fields = true,
                 }) catch return error.StorageFailure;
-                defer parsed.deinit();
+                defer {
+                    if (parsed.value.secret) |sec_buf| {
+                        std.crypto.secureZero(u8, @constCast(sec_buf));
+                    }
+                    parsed.deinit();
+                }
 
                 const u = parsed.value.username orelse return error.StorageFailure;
                 const sec = parsed.value.secret orelse return error.StorageFailure;
@@ -1284,7 +1380,12 @@ pub fn parseHelperStoreStdinAlloc(gpa: Allocator, stdin: *Io.Reader) Error!Helpe
     const parsed = std.json.parseFromSlice(RawHelperStoreInput, gpa, raw_json, .{
         .ignore_unknown_fields = true,
     }) catch return error.InvalidInput;
-    defer parsed.deinit();
+    defer {
+        if (parsed.value.Secret) |sec_buf| {
+            std.crypto.secureZero(u8, @constCast(sec_buf));
+        }
+        parsed.deinit();
+    }
 
     const srv = parsed.value.ServerURL orelse return error.InvalidInput;
     const user = parsed.value.Username orelse return error.InvalidInput;
@@ -1524,26 +1625,94 @@ pub fn writeProtectedFileAtomic(gpa: Allocator, path: []const u8, contents: []co
         }
     }
 
-    var suffix_bytes: [8]u8 = undefined;
-    io.random(&suffix_bytes);
-    const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
-    const tmp = try std.fmt.allocPrint(gpa, "{s}.{s}.tmp", .{ path, suffix_hex });
-    defer gpa.free(tmp);
+    var tmp_owned: ?[]u8 = null;
+    defer if (tmp_owned) |t| gpa.free(t);
 
-    {
-        const empty_file = Io.Dir.cwd().createFile(io, tmp, .{
+    if (builtin.os.tag != .windows) {
+        var file: Io.File = undefined;
+        var open_attempt: usize = 0;
+        while (true) : (open_attempt += 1) {
+            var suffix_bytes: [16]u8 = undefined;
+            io.randomSecure(&suffix_bytes) catch io.random(&suffix_bytes);
+            const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
+            const candidate = try std.fmt.allocPrint(gpa, "{s}.{s}.tmp", .{ path, suffix_hex });
+            if (Io.Dir.cwd().createFile(io, candidate, .{
+                .truncate = true,
+                .exclusive = true,
+                .permissions = filePermissions(),
+            })) |f| {
+                tmp_owned = candidate;
+                file = f;
+                break;
+            } else |err| {
+                gpa.free(candidate);
+                if (err == error.PathAlreadyExists and open_attempt + 1 < fs_max_attempts) {
+                    continue;
+                }
+                return error.StorageFailure;
+            }
+        }
+        const tmp = tmp_owned.?;
+        {
+            defer file.close(io);
+            if (builtin.os.tag != .wasi) {
+                file.setPermissions(io, filePermissions()) catch {
+                    Io.Dir.cwd().deleteFile(io, tmp) catch {};
+                    return error.StorageFailure;
+                };
+            }
+            file.writeStreamingAll(io, contents) catch {
+                Io.Dir.cwd().deleteFile(io, tmp) catch {};
+                return error.StorageFailure;
+            };
+        }
+
+        var delay_ms: u32 = 10;
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            if (Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, io)) |_| {
+                break;
+            } else |err| {
+                if (attempt + 1 < fs_max_attempts and isTransientFsError(err)) {
+                    sleepRetryMs(delay_ms);
+                    delay_ms *= 2;
+                    continue;
+                }
+                Io.Dir.cwd().deleteFile(io, tmp) catch {};
+                return error.StorageFailure;
+            }
+        }
+        return;
+    }
+
+    var open_attempt: usize = 0;
+    while (true) : (open_attempt += 1) {
+        var suffix_bytes: [16]u8 = undefined;
+        io.randomSecure(&suffix_bytes) catch io.random(&suffix_bytes);
+        const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
+        const candidate = try std.fmt.allocPrint(gpa, "{s}.{s}.tmp", .{ path, suffix_hex });
+        if (Io.Dir.cwd().createFile(io, candidate, .{
             .truncate = true,
+            .exclusive = true,
             .permissions = filePermissions(),
-        }) catch return error.StorageFailure;
-        empty_file.close(io);
+        })) |empty_file| {
+            empty_file.close(io);
+            tmp_owned = candidate;
+            break;
+        } else |err| {
+            gpa.free(candidate);
+            if (err == error.PathAlreadyExists and open_attempt + 1 < fs_max_attempts) {
+                continue;
+            }
+            return error.StorageFailure;
+        }
     }
 
-    if (builtin.os.tag == .windows) {
-        restrictFileToCurrentUserWindows(gpa, tmp) catch {
-            Io.Dir.cwd().deleteFile(io, tmp) catch {};
-            return error.StorageFailure;
-        };
-    }
+    const tmp = tmp_owned.?;
+    restrictFileToCurrentUserWindows(gpa, tmp) catch {
+        Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        return error.StorageFailure;
+    };
 
     {
         var file = Io.Dir.cwd().createFile(io, tmp, .{
@@ -1576,9 +1745,7 @@ pub fn writeProtectedFileAtomic(gpa: Allocator, path: []const u8, contents: []co
         }
     }
 
-    if (builtin.os.tag == .windows) {
-        restrictFileToCurrentUserWindows(gpa, path) catch {};
-    }
+    restrictFileToCurrentUserWindows(gpa, path) catch {};
 }
 
 pub fn dirPermissions() Io.File.Permissions {
@@ -2126,4 +2293,100 @@ test "live null_backend fails closed with NoStorageAccess without touching regis
     const listed = try listGenericIndexAlloc(gpa);
     defer gpa.free(listed);
     try std.testing.expectEqual(@as(usize, 0), listed.len);
+}
+
+test "normalizeServerAlloc, isAcrServer, and ACR exchange guards enforce strict DNS/IPv4 rules" {
+    const gpa = std.testing.allocator;
+
+    const label_63 = &@as([63]u8, @splat('a'));
+    const label_64 = &@as([64]u8, @splat('a'));
+    const tail_62 = &@as([62]u8, @splat('b'));
+    const bad_servers = [_][]const u8{
+        "bad%2fhost.io",
+        "bad]host.io",
+        "bad[host.io",
+        "a..b.io",
+        ".leading.io",
+        "trailing.io.",
+        "-leading-dash.io",
+        "trailing-dash-.io",
+        "sub.-dash.io",
+        "sub.dash-.io",
+        "non\xc3\xa9ascii.io",
+        "ctrl\x7f.io",
+        "192.0.2.256",
+        "0177.0.0.1",
+        "127.1",
+        "2130706433",
+        "host.999",
+        label_64 ++ ".example.io",
+        label_63 ++ "." ++ label_63 ++ "." ++ label_63 ++ "." ++ tail_62,
+    };
+    for (bad_servers) |raw| {
+        try std.testing.expectError(error.InvalidServer, normalizeServerAlloc(gpa, raw, .bare_docker_io));
+        try std.testing.expectError(error.InvalidServer, normalizeServerAlloc(gpa, raw, .legacy_v1_url));
+    }
+
+    const v4_ok = try normalizeServerAlloc(gpa, "https://192.0.2.42:5000/v2/", .bare_docker_io);
+    defer gpa.free(v4_ok);
+    try std.testing.expectEqualStrings("192.0.2.42:5000", v4_ok);
+
+    // ACR host validation rejects path smuggling, malformed labels, and non-ACR hosts.
+    try std.testing.expect(isAcrServer("myacr.azurecr.io"));
+    try std.testing.expect(isAcrServer("my-acr.eastus.data.azurecr.io:443"));
+    try std.testing.expect(!isAcrServer("evil.com/myacr.azurecr.io"));
+    try std.testing.expect(!isAcrServer("evil.com#.azurecr.io"));
+    try std.testing.expect(!isAcrServer("-bad.azurecr.io"));
+    try std.testing.expect(!isAcrServer("bad-.azurecr.io"));
+    try std.testing.expect(!isAcrServer("a..b.azurecr.io"));
+    try std.testing.expect(!isAcrServer(label_64 ++ ".azurecr.io"));
+    try std.testing.expect(!isAcrServer("https://myacr.azurecr.io"));
+
+    // ARM token exchange & discovery refuse non-ACR servers before constructing requests or connecting.
+    for ([_][]const u8{
+        "ghcr.io",
+        "evil.example.com",
+        "evil.com/myacr.azurecr.io",
+        "-bad.azurecr.io",
+        "https://myacr.azurecr.io",
+    }) |non_acr| {
+        try std.testing.expect(liveDiscoverAcrTenant(gpa, non_acr) == null);
+        try std.testing.expectError(
+            error.InvalidServer,
+            buildAcrExchangeRequest(gpa, non_acr, "arm-secret-token", "tid"),
+        );
+        try std.testing.expectError(
+            error.InvalidServer,
+            liveExchangeAcrToken(gpa, non_acr, "arm-secret-token", "tid"),
+        );
+    }
+}
+
+test "writeProtectedFileAtomic writes 0600 permissions without following target symlinks" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    const gpa = std.testing.allocator;
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(dir_abs);
+
+    const victim_path = try std.fs.path.join(gpa, &.{ dir_abs, "victim.txt" });
+    defer gpa.free(victim_path);
+    try writeProtectedFileAtomic(gpa, victim_path, "untouched");
+
+    const target_path = try std.fs.path.join(gpa, &.{ dir_abs, "secret.json" });
+    defer gpa.free(target_path);
+    try tmp.dir.symLink(io, victim_path, "secret.json", .{});
+
+    try writeProtectedFileAtomic(gpa, target_path, "{\"secret\":\"val\"}");
+
+    const victim_after = (try readFileIfExists(gpa, victim_path)).?;
+    defer gpa.free(victim_after);
+    try std.testing.expectEqualStrings("untouched", victim_after);
+
+    const st = try Io.Dir.cwd().statFile(io, target_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(Io.File.Kind.file, st.kind);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
 }

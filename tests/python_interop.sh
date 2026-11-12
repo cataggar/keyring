@@ -1,15 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+IS_WINDOWS=0
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+esac
+
 if [ -n "${KEYRING_BIN:-}" ]; then
   BIN="$KEYRING_BIN"
-elif [ -f ./zig-out/bin/keyring ]; then
-  BIN="./zig-out/bin/keyring"
-elif [ -f ./zig-out/bin/keyring.exe ]; then
-  BIN="./zig-out/bin/keyring.exe"
+elif [ "$IS_WINDOWS" -eq 1 ] && [ -f "$ROOT_DIR/zig-out/bin/keyring.exe" ]; then
+  BIN="$ROOT_DIR/zig-out/bin/keyring.exe"
+elif [ -x "$ROOT_DIR/zig-out/bin/keyring" ]; then
+  BIN="$ROOT_DIR/zig-out/bin/keyring"
+elif [ -f "$ROOT_DIR/zig-out/bin/keyring.exe" ]; then
+  BIN="$ROOT_DIR/zig-out/bin/keyring.exe"
 else
   echo "FAIL: locate binary"
-  echo "Could not find ./zig-out/bin/keyring or ./zig-out/bin/keyring.exe. Set KEYRING_BIN to a custom path."
+  echo "Could not find $ROOT_DIR/zig-out/bin/keyring or $ROOT_DIR/zig-out/bin/keyring.exe. Set KEYRING_BIN to a custom path."
+  exit 1
+fi
+
+if [ ! -f "$BIN" ]; then
+  echo "FAIL: locate binary"
+  echo "Could not find $BIN. Set KEYRING_BIN to a custom path."
   exit 1
 fi
 
@@ -50,7 +64,7 @@ except Exception:
     pass
 PY
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 # 1. Python writes, Zig reads
 SERVICE="$SERVICE" USER="$USER" SECRET="$SECRET" python3 - <<'PY'

@@ -1,21 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+IS_WINDOWS=0
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+esac
+
 if [ -n "${KEYRING_BIN:-}" ]; then
   BIN="$KEYRING_BIN"
-elif [ -f ./zig-out/bin/keyring ]; then
-  BIN="./zig-out/bin/keyring"
-elif [ -f ./zig-out/bin/keyring.exe ]; then
-  BIN="./zig-out/bin/keyring.exe"
+elif [ "$IS_WINDOWS" -eq 1 ] && [ -f "$ROOT_DIR/zig-out/bin/keyring.exe" ]; then
+  BIN="$ROOT_DIR/zig-out/bin/keyring.exe"
+elif [ -x "$ROOT_DIR/zig-out/bin/keyring" ]; then
+  BIN="$ROOT_DIR/zig-out/bin/keyring"
+elif [ -f "$ROOT_DIR/zig-out/bin/keyring.exe" ]; then
+  BIN="$ROOT_DIR/zig-out/bin/keyring.exe"
 else
   echo "FAIL: locate binary"
-  echo "Could not find ./zig-out/bin/keyring or ./zig-out/bin/keyring.exe. Set KEYRING_BIN to a custom path."
+  echo "Could not find $ROOT_DIR/zig-out/bin/keyring or $ROOT_DIR/zig-out/bin/keyring.exe. Set KEYRING_BIN to a custom path."
   exit 1
+fi
+
+if [ ! -f "$BIN" ]; then
+  echo "FAIL: locate binary"
+  echo "Could not find $BIN. Set KEYRING_BIN to a custom path."
+  exit 1
+fi
+
+BIN_DIR="$(cd -- "$(dirname -- "$BIN")" && pwd -P)"
+BIN_ABS="$BIN_DIR/$(basename -- "$BIN")"
+EXE_EXT=""
+if [ "$IS_WINDOWS" -eq 1 ] || [[ "$BIN_ABS" == *.exe ]]; then
+  EXE_EXT=".exe"
 fi
 
 SUFFIX="$(date +%s)-$$-$RANDOM"
 SERVICE="keyring-it-svc-$SUFFIX"
 USER="keyring-it-usr-$SUFFIX"
+IT_TMP_DIR=""
 
 fail() {
   local name="$1"
@@ -33,8 +55,11 @@ pass() {
 
 cleanup() {
   "$BIN" del "$SERVICE" "$USER" >/dev/null 2>&1 || true
+  if [ -n "$IT_TMP_DIR" ]; then
+    rm -rf -- "$IT_TMP_DIR"
+  fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 # 1. set + get round-trip
 EXPECTED="secret-value-$SUFFIX"
@@ -134,3 +159,38 @@ RC=$?
 set -e
 [ "$RC" -eq 3 ] || fail "ado backend non-DevOps URL exits 3" "expected rc: 3" "actual rc: $RC" "output: $ADO_MISS_OUT"
 pass "ado backend non-DevOps URL exits 3"
+
+# 10. docker-credential-keyring argv0 version smoke check (when present beside BIN)
+DOCKER_HELPER="$BIN_DIR/docker-credential-keyring$EXE_EXT"
+if [ -f "$DOCKER_HELPER" ]; then
+  set +e
+  DOCKER_VER_OUT=$("$DOCKER_HELPER" version 2>&1)
+  RC=$?
+  set -e
+  [ "$RC" -eq 0 ] || fail "docker-credential-keyring version exits 0" "expected rc: 0" "actual rc: $RC" "output: $DOCKER_VER_OUT"
+  printf '%s\n' "$DOCKER_VER_OUT" | grep -Eq '^docker-credential-keyring [^[:space:]]+' || \
+    fail "docker-credential-keyring version prints version" "output: $DOCKER_VER_OUT"
+  pass "docker-credential-keyring version exits 0"
+fi
+
+# 11. git-credential-keyring argv0 get + invalid-op smoke check
+IT_TMP_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/keyring-it.XXXXXX")" || fail "create integration temp dir"
+GIT_HELPER="$IT_TMP_DIR/git-credential-keyring$EXE_EXT"
+if ! ln -s "$BIN_ABS" "$GIT_HELPER" 2>/dev/null; then
+  cp "$BIN_ABS" "$GIT_HELPER"
+  chmod +x "$GIT_HELPER" 2>/dev/null || true
+fi
+
+set +e
+GIT_GET_OUT=$(printf 'protocol=https\nhost=example.invalid\n\n' | "$GIT_HELPER" get)
+RC=$?
+set -e
+[ "$RC" -eq 0 ] || fail "git-credential-keyring get exits 0" "expected rc: 0" "actual rc: $RC" "output: $GIT_GET_OUT"
+[ -z "$GIT_GET_OUT" ] || fail "git-credential-keyring get unknown host prints empty output" "actual: $GIT_GET_OUT"
+
+set +e
+GIT_BAD_OUT=$("$GIT_HELPER" invalid-op 2>&1)
+RC=$?
+set -e
+[ "$RC" -eq 2 ] || fail "git-credential-keyring invalid-op exits 2" "expected rc: 2" "actual rc: $RC" "output: $GIT_BAD_OUT"
+pass "git-credential-keyring argv0 get + invalid-op"

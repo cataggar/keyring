@@ -1873,5 +1873,36 @@ test "conformance matrix: Target normalization, port/scheme non-equivalence, IPv
         try testing.expectError(error.InvalidInput, Target.parseAlloc(gpa, "https://[:::1]", .{}));
         try testing.expectError(error.InvalidInput, Target.parseAlloc(gpa, "https://[2001:db800::1]", .{}));
         try testing.expectError(error.InvalidInput, Target.parseAlloc(gpa, "https://[1:2:3:4:5:6:7:8:9]", .{}));
+
+        // RFC 1035 label/host length bounds and non-canonical/overflowing IPv4 forms are rejected.
+        try testing.expectError(error.InvalidInput, Target.parseAlloc(gpa, "https://192.0.2.256", .{}));
+        try testing.expectError(error.InvalidInput, Target.parseAlloc(gpa, "https://0177.0.0.1", .{}));
+        try testing.expectError(error.InvalidInput, Target.parseAlloc(gpa, "https://127.1", .{}));
+        try testing.expectError(error.InvalidInput, Target.parseAlloc(gpa, "https://2130706433", .{}));
+        const label_63 = &@as([63]u8, @splat('a'));
+        const label_64 = &@as([64]u8, @splat('a'));
+        const tail_62 = &@as([62]u8, @splat('b'));
+        const tail_61 = &@as([61]u8, @splat('b'));
+        try testing.expectError(
+            error.InvalidInput,
+            Target.parseAlloc(gpa, "https://" ++ label_64 ++ ".example.com", .{}),
+        );
+        try testing.expectError(
+            error.InvalidInput,
+            Target.parseAlloc(gpa, "https://" ++ label_63 ++ "." ++ label_63 ++ "." ++ label_63 ++ "." ++ tail_62, .{}),
+        );
+
+        // Exact RFC 1035 boundary (63-byte label, 253-byte host) and canonical IPv4 succeed.
+        var max_valid = try Target.parseAlloc(
+            gpa,
+            "https://" ++ label_63 ++ "." ++ label_63 ++ "." ++ label_63 ++ "." ++ tail_61,
+            .{},
+        );
+        defer max_valid.deinit(gpa);
+        try testing.expectEqual(@as(usize, 253), max_valid.host.len);
+
+        var valid_v4 = try Target.parseAlloc(gpa, "https://192.0.2.255:5000", .{});
+        defer valid_v4.deinit(gpa);
+        try testing.expectEqualStrings("192.0.2.255", valid_v4.host);
     }
 }

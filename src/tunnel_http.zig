@@ -55,6 +55,8 @@ pub const Result = union(Mode) {
 
 const max_header_bytes = 32 * 1024;
 const max_body_bytes = 1024 * 1024;
+const default_socket_timeout_ms: i64 = 5_000;
+var socket_timeout_ms_override: ?i64 = null;
 
 pub const Server = struct {
     gpa: Allocator,
@@ -149,12 +151,21 @@ pub const Server = struct {
                 if (err == error.Timeout) self.closeListener();
                 return err;
             };
-            var stream = self.listener.accept(self.io) catch return error.NetworkFailure;
+            var stream = self.listener.accept(self.io) catch |err| switch (err) {
+                error.ConnectionAborted => {
+                    if (!self.expired()) continue;
+                    return error.NetworkFailure;
+                },
+                else => return error.NetworkFailure,
+            };
             defer stream.socket.close(self.io);
 
-            var request = readRequest(self.gpa, self.io, stream, self.deadline_ms) catch |err| {
-                sendJson(self.io, stream, self.deadline_ms, 400, "Bad Request", "{\"ok\":false}") catch {};
-                if (err == error.Timeout) {
+            var request = readRequest(self.gpa, self.io, stream, self.socketDeadlineMs()) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                if (err != error.Timeout) {
+                    sendJson(self.io, stream, self.socketDeadlineMs(), 400, "Bad Request", "{\"ok\":false}") catch {};
+                }
+                if (self.expired()) {
                     self.closeListener();
                     return error.Timeout;
                 }
@@ -163,58 +174,67 @@ pub const Server = struct {
             defer request.deinit(self.gpa);
 
             if (!validHost(&request, self.bound_port)) {
-                try sendJson(self.io, stream, self.deadline_ms, 403, "Forbidden", "{\"ok\":false}");
+                sendJson(self.io, stream, self.socketDeadlineMs(), 403, "Forbidden", "{\"ok\":false}") catch {};
                 continue;
             }
 
             if (request.is("GET", "/")) {
-                try sendHtml(self.io, stream, self.deadline_ms, ceremony_html);
+                sendHtml(self.io, stream, self.socketDeadlineMs(), ceremony_html) catch {};
                 continue;
             }
             if (request.is("POST", "/api/options")) {
                 const security_status = self.apiSecurityStatus(&request);
                 if (security_status != .ok) {
-                    try sendSecurityFailure(self.io, stream, self.deadline_ms, security_status);
+                    sendSecurityFailure(self.io, stream, self.socketDeadlineMs(), security_status) catch {};
                     continue;
                 }
                 if (self.expired() or self.completed) {
-                    try sendJson(self.io, stream, self.deadline_ms, 410, "Gone", "{\"ok\":false}");
+                    sendJson(self.io, stream, self.socketDeadlineMs(), 410, "Gone", "{\"ok\":false}") catch {};
                     continue;
                 }
                 self.options_issued = true;
                 const options = try self.optionsJson();
                 defer self.gpa.free(options);
-                try sendJson(self.io, stream, self.deadline_ms, 200, "OK", options);
+                sendJson(self.io, stream, self.socketDeadlineMs(), 200, "OK", options) catch {};
                 continue;
             }
             if (request.is("POST", "/api/complete")) {
                 const security_status = self.apiSecurityStatus(&request);
                 if (security_status != .ok) {
-                    try sendSecurityFailure(self.io, stream, self.deadline_ms, security_status);
+                    sendSecurityFailure(self.io, stream, self.socketDeadlineMs(), security_status) catch {};
                     continue;
                 }
                 if (self.expired() or self.completed) {
-                    try sendJson(self.io, stream, self.deadline_ms, 410, "Gone", "{\"ok\":false}");
+                    sendJson(self.io, stream, self.socketDeadlineMs(), 410, "Gone", "{\"ok\":false}") catch {};
                     continue;
                 }
                 self.consumeChallenge() catch {
-                    try sendJson(self.io, stream, self.deadline_ms, 400, "Bad Request", "{\"ok\":false}");
+                    sendJson(self.io, stream, self.socketDeadlineMs(), 400, "Bad Request", "{\"ok\":false}") catch {};
                     continue;
                 };
 
-                const verified = self.verifyCompletion(request.body()) catch |err| {
-                    try sendJson(self.io, stream, self.deadline_ms, 400, "Bad Request", "{\"ok\":false}");
+                var verified = self.verifyCompletion(request.body()) catch |err| {
+                    sendJson(self.io, stream, self.socketDeadlineMs(), 400, "Bad Request", "{\"ok\":false}") catch {};
                     self.closeListener();
                     return err;
                 };
                 self.completed = true;
-                try sendJson(self.io, stream, self.deadline_ms, 200, "OK", "{\"ok\":true,\"status\":\"verified\"}");
+                errdefer {
+                    verified.deinit(self.gpa);
+                    self.closeListener();
+                }
+                try sendJson(self.io, stream, self.socketDeadlineMs(), 200, "OK", "{\"ok\":true,\"status\":\"verified\"}");
                 self.closeListener();
                 return verified;
             }
 
-            try sendJson(self.io, stream, self.deadline_ms, 404, "Not Found", "{\"ok\":false}");
+            sendJson(self.io, stream, self.socketDeadlineMs(), 404, "Not Found", "{\"ok\":false}") catch {};
         }
+    }
+
+    fn socketDeadlineMs(self: *const Server) i64 {
+        const socket_timeout = socket_timeout_ms_override orelse default_socket_timeout_ms;
+        return @min(self.deadline_ms, nowMs(self.io) + socket_timeout);
     }
 
     fn expired(self: *const Server) bool {
@@ -292,7 +312,12 @@ pub const Server = struct {
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch return error.InvalidRequest;
-        defer payload.deinit();
+        defer {
+            if (payload.value.prfOutput) |prf| {
+                std.crypto.secureZero(u8, @constCast(prf));
+            }
+            payload.deinit();
+        }
 
         const client_data = try decodeB64Alloc(self.gpa, payload.value.clientDataJSON orelse return error.InvalidRequest);
         defer self.gpa.free(client_data);
@@ -378,6 +403,7 @@ const Request = struct {
     body_start: usize,
 
     fn deinit(self: *Request, gpa: Allocator) void {
+        std.crypto.secureZero(u8, self.storage);
         gpa.free(self.storage);
         self.* = undefined;
     }
@@ -421,8 +447,12 @@ const Request = struct {
 
 fn readRequest(gpa: Allocator, io: Io, stream: std.Io.net.Stream, deadline_ms: i64) !Request {
     var storage: std.ArrayList(u8) = .empty;
-    errdefer storage.deinit(gpa);
+    errdefer {
+        if (storage.capacity > 0) std.crypto.secureZero(u8, storage.allocatedSlice());
+        storage.deinit(gpa);
+    }
     var read_buffer: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &read_buffer);
     var reader = stream.reader(io, &read_buffer);
 
     var header_end: ?usize = null;
@@ -453,7 +483,18 @@ fn readRequest(gpa: Allocator, io: Io, stream: std.Io.net.Stream, deadline_ms: i
         storage.appendAssumeCapacity(b);
     }
 
-    const owned = try storage.toOwnedSlice(gpa);
+    const full = storage.allocatedSlice();
+    if (storage.capacity == storage.items.len) {
+        return .{ .storage = storage.items, .header_end = header_end.?, .body_start = body_start };
+    }
+    std.crypto.secureZero(u8, full[storage.items.len..]);
+    if (gpa.resize(full, storage.items.len)) {
+        return .{ .storage = full[0..storage.items.len], .header_end = header_end.?, .body_start = body_start };
+    }
+    const owned = try gpa.dupe(u8, storage.items);
+    std.crypto.secureZero(u8, full);
+    storage.deinit(gpa);
+    storage = .empty;
     return .{ .storage = owned, .header_end = header_end.?, .body_start = body_start };
 }
 
@@ -472,7 +513,10 @@ fn validHost(request: *const Request, port: u16) bool {
 fn decodeB64Alloc(gpa: Allocator, encoded: []const u8) ![]u8 {
     const len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(encoded) catch return error.InvalidRequest;
     const result = try gpa.alloc(u8, len);
-    errdefer gpa.free(result);
+    errdefer {
+        std.crypto.secureZero(u8, result);
+        gpa.free(result);
+    }
     std.base64.url_safe_no_pad.Decoder.decode(result, encoded) catch return error.InvalidRequest;
     return result;
 }
@@ -862,4 +906,106 @@ test "server timeout closes the listener" {
     defer server.deinit();
     try std.testing.expectError(error.Timeout, server.run());
     try std.testing.expect(!server.listener_open);
+}
+
+test "server survives idle preconnect sockets and aborted non-final responses" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    socket_timeout_ms_override = 40;
+    defer socket_timeout_ms_override = null;
+
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const key_pair = try Ed25519.KeyPair.generateDeterministic(@splat(0x45));
+    const public_key = key_pair.public_key.toBytes();
+    const credential_id = "preconnect-ed25519-id";
+    const credential_id_b64 = try b64Alloc(gpa, credential_id);
+    defer gpa.free(credential_id_b64);
+    const prf_bytes: [32]u8 = @splat(0x5b);
+    const prf_b64 = try b64Alloc(gpa, &prf_bytes);
+    defer gpa.free(prf_b64);
+    const salt_bytes: [32]u8 = @splat(0x6c);
+    const salt_b64 = try b64Alloc(gpa, &salt_bytes);
+    defer gpa.free(salt_b64);
+    const store_id_bytes: [16]u8 = @splat(0x7d);
+    const store_id_b64 = try b64Alloc(gpa, &store_id_bytes);
+    defer gpa.free(store_id_b64);
+    const cose = try testEdCose(gpa, public_key);
+    defer gpa.free(cose);
+    const registration_auth = try testAuthData(gpa, "localhost", 0x41, 1, credential_id, cose);
+    defer gpa.free(registration_auth);
+    const registration_b64 = try b64Alloc(gpa, registration_auth);
+    defer gpa.free(registration_b64);
+
+    var server = try Server.init(gpa, io, .{
+        .mode = .enroll,
+        .timeout_ms = 5_000,
+        .store_id_b64 = store_id_b64,
+        .enrollment_prf_salt_b64 = salt_b64,
+    });
+    defer server.deinit();
+    var ctx = TestThreadContext{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, TestThreadContext.run, .{&ctx});
+
+    var address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(server.bound_port) };
+
+    // 1. Speculative preconnect that immediately closes (0-byte EOF).
+    {
+        var eof_stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
+        eof_stream.socket.close(io);
+    }
+
+    // 2. Speculative idle preconnect that holds the socket open past per-socket timeout while ceremony is active.
+    var idle_stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
+    defer idle_stream.socket.close(io);
+
+    // 3. Aborted GET /favicon.ico (404) where client closes immediately without reading response.
+    {
+        var fav_stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
+        var wbuf: [256]u8 = undefined;
+        var w = fav_stream.writer(io, &wbuf);
+        const req = try std.fmt.allocPrint(gpa, "GET /favicon.ico HTTP/1.1\r\nHost: localhost:{d}\r\n\r\n", .{server.bound_port});
+        defer gpa.free(req);
+        w.interface.writeAll(req) catch {};
+        w.interface.flush() catch {};
+        fav_stream.socket.close(io);
+    }
+
+    // 4. Complete the real enrollment ceremony on a fresh connection.
+    const options_request = try apiRequest(gpa, server.bound_port, "/api/options", &server.session_token, "{}");
+    defer gpa.free(options_request);
+    const options_response = try sendTestRequest(gpa, io, server.bound_port, options_request);
+    defer gpa.free(options_response);
+    try std.testing.expect(std.mem.indexOf(u8, options_response, "200 OK") != null);
+
+    const enroll_origin = try server.originAlloc(gpa);
+    defer gpa.free(enroll_origin);
+    const create_json = try std.fmt.allocPrint(
+        gpa,
+        "{{\"type\":\"webauthn.create\",\"challenge\":\"{s}\",\"origin\":\"{s}\"}}",
+        .{ server.challenge, enroll_origin },
+    );
+    defer gpa.free(create_json);
+    const create_json_b64 = try b64Alloc(gpa, create_json);
+    defer gpa.free(create_json_b64);
+    const complete_body = try std.fmt.allocPrint(
+        gpa,
+        "{{\"credentialId\":\"{s}\",\"clientDataJSON\":\"{s}\",\"attestationObject\":\"{s}\",\"prfOutput\":\"{s}\"}}",
+        .{ credential_id_b64, create_json_b64, registration_b64, prf_b64 },
+    );
+    defer gpa.free(complete_body);
+    const complete_request = try apiRequest(gpa, server.bound_port, "/api/complete", &server.session_token, complete_body);
+    defer gpa.free(complete_request);
+    const complete_response = try sendTestRequest(gpa, io, server.bound_port, complete_request);
+    defer gpa.free(complete_response);
+
+    thread.join();
+    try std.testing.expect(ctx.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, complete_response, "200 OK") != null);
+    var result = ctx.result.?;
+    defer result.deinit(gpa);
+    try std.testing.expectEqualSlices(u8, credential_id, result.enroll.credential_id);
 }

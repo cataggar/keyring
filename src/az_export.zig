@@ -56,7 +56,10 @@ pub fn run(gpa: Allocator, dest_dir: []const u8, stdout: *std.Io.Writer, stderr:
     defer gpa.free(azure_dir);
 
     const resolved = resolveTokenCache(gpa, azure_dir) catch |err| return reportResolveError(stderr, err);
-    defer gpa.free(resolved.content);
+    defer {
+        std.crypto.secureZero(u8, resolved.content);
+        gpa.free(resolved.content);
+    }
 
     writeFilePlain(gpa, dest_dir, "msal_token_cache.json", resolved.content) catch |err| {
         try stderr.print("keyring: az export: failed to write msal_token_cache.json: {s}\n", .{@errorName(err)});
@@ -68,7 +71,10 @@ pub fn run(gpa: Allocator, dest_dir: []const u8, stdout: *std.Io.Writer, stderr:
     const profile_src = try std.fs.path.join(gpa, &.{ azure_dir, "azureProfile.json" });
     defer gpa.free(profile_src);
     if (readFileIfExists(gpa, profile_src)) |profile_content| {
-        defer gpa.free(profile_content);
+        defer {
+            std.crypto.secureZero(u8, profile_content);
+            gpa.free(profile_content);
+        }
         writeFilePlain(gpa, dest_dir, "azureProfile.json", profile_content) catch |err| {
             try stderr.print("keyring: az export: failed to write azureProfile.json: {s}\n", .{@errorName(err)});
             try stderr.flush();
@@ -87,6 +93,8 @@ pub fn run(gpa: Allocator, dest_dir: []const u8, stdout: *std.Io.Writer, stderr:
     return 0;
 }
 
+var skip_keychain_for_test: bool = false;
+
 /// Find the local az-cli MSAL token cache content, preferring the plaintext
 /// file (the default on macOS/Linux) and falling back to the macOS Keychain
 /// entry when encryption was explicitly enabled.
@@ -97,18 +105,20 @@ fn resolveTokenCache(gpa: Allocator, azure_dir: []const u8) ResolveError!Resolve
         return .{ .content = content, .source_label = "plaintext file (msal_token_cache.json)" };
     }
 
-    switch (builtin.os.tag) {
-        .macos => {
-            if (keychain.get(gpa, keychain_service, keychain_account)) |content| {
-                return .{ .content = content, .source_label = "macOS Keychain (service \"" ++ keychain_service ++ "\")" };
-            } else |err| switch (err) {
-                error.EntryNotFound => {},
-                error.NoStorageAccess => return error.NoStorageAccess,
-                error.StorageFailure => return error.ReadFailure,
-                error.OutOfMemory => return error.OutOfMemory,
-            }
-        },
-        else => {},
+    if (!skip_keychain_for_test) {
+        switch (builtin.os.tag) {
+            .macos => {
+                if (keychain.get(gpa, keychain_service, keychain_account)) |content| {
+                    return .{ .content = content, .source_label = "macOS Keychain (service \"" ++ keychain_service ++ "\")" };
+                } else |err| switch (err) {
+                    error.EntryNotFound => {},
+                    error.NoStorageAccess => return error.NoStorageAccess,
+                    error.StorageFailure => return error.ReadFailure,
+                    error.OutOfMemory => return error.OutOfMemory,
+                }
+            },
+            else => {},
+        }
     }
 
     const bin_path = try std.fs.path.join(gpa, &.{ azure_dir, "msal_token_cache.bin" });
@@ -162,9 +172,30 @@ fn writeFilePlain(gpa: Allocator, dir: []const u8, name: []const u8, contents: [
     _ = std.Io.Dir.cwd().createDirPathStatus(io, dir, dirPermissions()) catch return error.WriteFailure;
     const path = try std.fs.path.join(gpa, &.{ dir, name });
     defer gpa.free(path);
-    var file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = filePermissions() }) catch return error.WriteFailure;
-    defer file.close(io);
-    file.writeStreamingAll(io, contents) catch return error.WriteFailure;
+
+    var suffix_bytes: [8]u8 = undefined;
+    io.randomSecure(&suffix_bytes) catch io.random(&suffix_bytes);
+    const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.{s}.tmp", .{ path, suffix_hex });
+    defer gpa.free(tmp);
+
+    var cleanup_tmp = false;
+    defer if (cleanup_tmp) std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    {
+        var file = std.Io.Dir.cwd().createFile(io, tmp, .{
+            .truncate = true,
+            .exclusive = true,
+            .permissions = filePermissions(),
+        }) catch return error.WriteFailure;
+        cleanup_tmp = true;
+        defer file.close(io);
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            file.setPermissions(io, .fromMode(0o600)) catch return error.WriteFailure;
+        }
+        file.writeStreamingAll(io, contents) catch return error.WriteFailure;
+    }
+    std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, io) catch return error.WriteFailure;
+    cleanup_tmp = false;
 }
 
 fn dirPermissions() std.Io.File.Permissions {
@@ -194,6 +225,8 @@ test "resolveTokenCache prefers plaintext json over bin" {
 }
 
 test "resolveTokenCache reports NotFound when nothing is present" {
+    skip_keychain_for_test = true;
+    defer skip_keychain_for_test = false;
     const gpa = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
@@ -206,8 +239,9 @@ test "resolveTokenCache reports NotFound when nothing is present" {
     try std.testing.expectError(error.NotFound, resolveTokenCache(gpa, dir_path));
 }
 
-test "resolveTokenCache reports EncryptedUnsupported when only bin is present on non-macOS" {
-    if (builtin.os.tag == .macos) return error.SkipZigTest;
+test "resolveTokenCache reports EncryptedUnsupported when only bin is present" {
+    skip_keychain_for_test = true;
+    defer skip_keychain_for_test = false;
     const gpa = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
@@ -220,4 +254,31 @@ test "resolveTokenCache reports EncryptedUnsupported when only bin is present on
     try tmp.dir.writeFile(io, .{ .sub_path = "msal_token_cache.bin", .data = "\x01\x02not-json" });
 
     try std.testing.expectError(error.EncryptedUnsupported, resolveTokenCache(gpa, dir_path));
+}
+
+test "writeFilePlain writes atomically with 0600 permissions" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buf);
+    const out_dir = try std.fs.path.join(gpa, &.{ buf[0..len], "exported" });
+    defer gpa.free(out_dir);
+
+    try writeFilePlain(gpa, out_dir, "msal_token_cache.json", "{\"first\":1}");
+    try writeFilePlain(gpa, out_dir, "msal_token_cache.json", "{\"second\":2}");
+
+    const out_file = try std.fs.path.join(gpa, &.{ out_dir, "msal_token_cache.json" });
+    defer gpa.free(out_file);
+    const data = readFileIfExists(gpa, out_file).?;
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("{\"second\":2}", data);
+
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        var f = try std.Io.Dir.cwd().openFile(io, out_file, .{});
+        defer f.close(io);
+        const st = try f.stat(io);
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+    }
 }

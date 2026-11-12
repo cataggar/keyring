@@ -16,6 +16,9 @@ pub const gcm_tag_len: usize = 16;
 const version: u32 = 1;
 const max_vault_size: u64 = 64 * 1024 * 1024;
 const max_credential_id_len: usize = 1023;
+const max_argon2_t: u32 = 64;
+const max_argon2_p: u32 = 64;
+const max_argon2_m: u32 = 2 * 1024 * 1024;
 const recovery_key_chars: usize = 24;
 const crockford_alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const prf_kek_info_prefix = "keyring-webauthn-prf-kek-v1:";
@@ -206,14 +209,15 @@ pub fn wrapDekWithPrf(
     store_id: [store_id_len]u8,
     credential_id: []const u8,
 ) Error!WrappedDek {
-    if (credential_id.len == 0 or credential_id.len > max_credential_id_len) {
-        return error.InvalidCredential;
-    }
-
     var dek = dek_value;
     defer std.crypto.secureZero(u8, &dek);
     var prf_output = prf_output_value;
     defer std.crypto.secureZero(u8, &prf_output);
+
+    if (credential_id.len == 0 or credential_id.len > max_credential_id_len) {
+        return error.InvalidCredential;
+    }
+
     var kek = derivePrfKek(prf_output, prf_salt, store_id, credential_id);
     defer std.crypto.secureZero(u8, &kek);
 
@@ -225,10 +229,12 @@ pub fn wrapDekWithPrf(
     var nonce: [gcm_nonce_len]u8 = undefined;
     secureRandom(io, &nonce);
     var ciphertext: [dek_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &ciphertext);
     var tag: [gcm_tag_len]u8 = undefined;
     Aes256Gcm.encrypt(&ciphertext, &tag, &dek, aad, nonce, kek);
 
     var combined: [dek_len + gcm_tag_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &combined);
     @memcpy(combined[0..dek_len], &ciphertext);
     @memcpy(combined[dek_len..], &tag);
 
@@ -258,6 +264,7 @@ pub fn unwrapDekWithPrf(
     var nonce: [gcm_nonce_len]u8 = undefined;
     try base64DecodeExact(slot.wrap_nonce_b64, &nonce);
     var combined: [dek_len + gcm_tag_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &combined);
     try base64DecodeExact(slot.wrapped_dek_b64, &combined);
 
     var kek = derivePrfKek(prf_output, prf_salt, store_id, credential_id[0..credential_len]);
@@ -311,7 +318,8 @@ pub fn generateRecoveryKey(io: std.Io) [29]u8 {
 }
 
 pub fn normalizeRecoveryKey(input: []const u8) Error![recovery_key_chars]u8 {
-    var normalized: [recovery_key_chars]u8 = undefined;
+    var normalized: [recovery_key_chars]u8 = @splat(0);
+    errdefer std.crypto.secureZero(u8, &normalized);
     var len: usize = 0;
     for (input) |raw| {
         if (raw == '-' or std.ascii.isWhitespace(raw)) continue;
@@ -332,6 +340,12 @@ pub fn normalizeRecoveryKey(input: []const u8) Error![recovery_key_chars]u8 {
     return normalized;
 }
 
+fn validateArgon2Params(t: u32, m: u32, p: u32) Error!void {
+    if (p < 1 or p > max_argon2_p) return error.InvalidVault;
+    if (t < 1 or t > max_argon2_t) return error.InvalidVault;
+    if (m < 8 * p or m > max_argon2_m) return error.InvalidVault;
+}
+
 pub fn deriveRecoveryKek(
     gpa: Allocator,
     normalized_key: *const [recovery_key_chars]u8,
@@ -340,8 +354,9 @@ pub fn deriveRecoveryKek(
     m: u32,
     p: u32,
 ) Error![dek_len]u8 {
-    if (p == 0 or p > std.math.maxInt(u24)) return error.InvalidVault;
-    var kek: [dek_len]u8 = undefined;
+    try validateArgon2Params(t, m, p);
+    var kek: [dek_len]u8 = @splat(0);
+    errdefer std.crypto.secureZero(u8, &kek);
     std.crypto.pwhash.argon2.kdf(
         gpa,
         &kek,
@@ -378,10 +393,12 @@ pub fn wrapDekWithRecovery(
     var nonce: [gcm_nonce_len]u8 = undefined;
     secureRandom(io, &nonce);
     var ciphertext: [dek_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &ciphertext);
     var tag: [gcm_tag_len]u8 = undefined;
     Aes256Gcm.encrypt(&ciphertext, &tag, &dek, aad, nonce, kek);
 
     var combined: [dek_len + gcm_tag_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &combined);
     @memcpy(combined[0..dek_len], &ciphertext);
     @memcpy(combined[dek_len..], &tag);
     const nonce_b64 = try base64EncodeAlloc(gpa, &nonce);
@@ -404,6 +421,7 @@ pub fn unwrapDekWithRecovery(
     var nonce: [gcm_nonce_len]u8 = undefined;
     try base64DecodeExact(slot.wrap_nonce_b64, &nonce);
     var combined: [dek_len + gcm_tag_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &combined);
     try base64DecodeExact(slot.wrapped_dek_b64, &combined);
     var kek = try deriveRecoveryKek(
         gpa,
@@ -427,6 +445,41 @@ pub fn unwrapDekWithRecovery(
     return dek;
 }
 
+const ZeroOnFreeAllocator = struct {
+    backing: Allocator,
+
+    fn allocator(self: *ZeroOnFreeAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = Allocator.noRemap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ZeroOnFreeAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ZeroOnFreeAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len < memory.len) {
+            std.crypto.secureZero(u8, memory[new_len..]);
+        }
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ZeroOnFreeAllocator = @ptrCast(@alignCast(ctx));
+        std.crypto.secureZero(u8, memory);
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 pub fn encryptPayload(
     gpa: Allocator,
     io: std.Io,
@@ -436,11 +489,10 @@ pub fn encryptPayload(
 ) Error!EncryptedPayload {
     var dek = dek_value;
     defer std.crypto.secureZero(u8, &dek);
-    const plaintext = std.json.Stringify.valueAlloc(gpa, payload.*, .{}) catch return error.OutOfMemory;
-    defer {
-        std.crypto.secureZero(u8, plaintext);
-        gpa.free(plaintext);
-    }
+    var zero_alloc: ZeroOnFreeAllocator = .{ .backing = gpa };
+    const z_gpa = zero_alloc.allocator();
+    const plaintext = std.json.Stringify.valueAlloc(z_gpa, payload.*, .{}) catch return error.OutOfMemory;
+    defer z_gpa.free(plaintext);
     const aad = try storeBoundAad(gpa, payload_aad_prefix, store_id);
     defer gpa.free(aad);
 
@@ -502,8 +554,18 @@ pub fn enrollInitialVault(
     enrollment: PrfEnrollment,
     options: EnrollmentOptions,
 ) Error!EnrollmentResult {
+    var prf_output = enrollment.prf_output;
+    defer std.crypto.secureZero(u8, &prf_output);
+    var dek: [dek_len]u8 = @splat(0);
+    errdefer std.crypto.secureZero(u8, &dek);
+    var recovery_key: [29]u8 = @splat(0);
+    errdefer std.crypto.secureZero(u8, &recovery_key);
+    var normalized_recovery_key: [recovery_key_chars]u8 = @splat(0);
+    defer std.crypto.secureZero(u8, &normalized_recovery_key);
+
     try validateCredential(enrollment.credential_id, enrollment.cose_alg, enrollment.public_key);
     if (options.rp_id.len == 0) return error.InvalidVault;
+    try validateArgon2Params(options.argon2_t, options.argon2_m, options.argon2_p);
 
     const arena = gpa.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
     arena.* = .init(gpa);
@@ -515,19 +577,14 @@ pub fn enrollInitialVault(
 
     var store_id: [store_id_len]u8 = options.store_id orelse undefined;
     if (options.store_id == null) secureRandom(io, &store_id);
-    var dek: [dek_len]u8 = undefined;
     secureRandom(io, &dek);
-    errdefer std.crypto.secureZero(u8, &dek);
-    var prf_output = enrollment.prf_output;
-    defer std.crypto.secureZero(u8, &prf_output);
     var prf_salt: [prf_salt_len]u8 = options.prf_salt orelse enrollment.prf_salt orelse undefined;
     if (options.prf_salt == null and enrollment.prf_salt == null) secureRandom(io, &prf_salt);
     var recovery_salt: [recovery_salt_len]u8 = undefined;
     secureRandom(io, &recovery_salt);
 
-    const recovery_key = generateRecoveryKey(io);
-    var normalized_recovery_key = try normalizeRecoveryKey(&recovery_key);
-    defer std.crypto.secureZero(u8, &normalized_recovery_key);
+    recovery_key = generateRecoveryKey(io);
+    normalized_recovery_key = try normalizeRecoveryKey(&recovery_key);
 
     const prf_wrapped = try wrapDekWithPrf(
         a,
@@ -610,11 +667,12 @@ pub fn addPrfSlot(
     dek_value: [dek_len]u8,
     enrollment: PrfEnrollment,
 ) Error!void {
-    try validateCredential(enrollment.credential_id, enrollment.cose_alg, enrollment.public_key);
     var dek = dek_value;
     defer std.crypto.secureZero(u8, &dek);
     var prf_output = enrollment.prf_output;
     defer std.crypto.secureZero(u8, &prf_output);
+
+    try validateCredential(enrollment.credential_id, enrollment.cose_alg, enrollment.public_key);
     const a = document.allocator();
     const id = try slotIdAlloc(a, enrollment.credential_id);
     for (document.value.prf_slots) |slot| {
@@ -752,25 +810,41 @@ pub fn saveVaultEnvelope(gpa: Allocator, vault: *const VaultFile) Error!void {
     try writeAtomic(gpa, io, path, json);
 }
 
-pub fn vaultPath(gpa: Allocator) Error![]u8 {
-    if (vault_path_override) |path| {
+fn vaultPathFromEnv(
+    gpa: Allocator,
+    override: ?[]const u8,
+    env_vault_path: ?[]const u8,
+    xdg_data_home: ?[]const u8,
+    home: ?[]const u8,
+) Error![]u8 {
+    if (override) |path| {
         if (path.len == 0) return error.VaultPathUnavailable;
         return gpa.dupe(u8, path) catch error.OutOfMemory;
     }
-    if (getEnvVarOwned(gpa, "KEYRING_VAULT_PATH")) |path| {
-        if (path.len != 0) return path;
-        gpa.free(path);
+    if (env_vault_path) |path| {
+        if (path.len != 0) return gpa.dupe(u8, path) catch error.OutOfMemory;
     }
-    if (getEnvVarOwned(gpa, "XDG_DATA_HOME")) |xdg| {
-        defer gpa.free(xdg);
-        if (xdg.len != 0) {
+    if (xdg_data_home) |xdg| {
+        if (xdg.len != 0 and std.fs.path.isAbsolute(xdg)) {
             return std.fs.path.join(gpa, &.{ xdg, "keyring", "vault.json" }) catch error.OutOfMemory;
         }
     }
-    const home = getEnvVarOwned(gpa, "HOME") orelse return error.VaultPathUnavailable;
-    defer gpa.free(home);
-    if (home.len == 0) return error.VaultPathUnavailable;
-    return std.fs.path.join(gpa, &.{ home, ".local", "share", "keyring", "vault.json" }) catch error.OutOfMemory;
+    const home_dir = home orelse return error.VaultPathUnavailable;
+    if (home_dir.len == 0 or !std.fs.path.isAbsolute(home_dir)) return error.VaultPathUnavailable;
+    return std.fs.path.join(gpa, &.{ home_dir, ".local", "share", "keyring", "vault.json" }) catch error.OutOfMemory;
+}
+
+pub fn vaultPath(gpa: Allocator) Error![]u8 {
+    if (vault_path_override) |override| {
+        return vaultPathFromEnv(gpa, override, null, null, null);
+    }
+    const env_vault_path = getEnvVarOwned(gpa, "KEYRING_VAULT_PATH");
+    defer if (env_vault_path) |v| gpa.free(v);
+    const xdg_data_home = getEnvVarOwned(gpa, "XDG_DATA_HOME");
+    defer if (xdg_data_home) |v| gpa.free(v);
+    const home = getEnvVarOwned(gpa, "HOME");
+    defer if (home) |v| gpa.free(v);
+    return vaultPathFromEnv(gpa, null, env_vault_path, xdg_data_home, home);
 }
 
 pub fn validateEnvelope(vault: *const VaultFile) Error!void {
@@ -813,13 +887,11 @@ pub fn validateEnvelope(vault: *const VaultFile) Error!void {
     }
     var recovery_salt: [recovery_salt_len]u8 = undefined;
     try base64DecodeExact(vault.recovery_slot.kdf_salt_b64, &recovery_salt);
-    if (vault.recovery_slot.argon2_t == 0 or
-        vault.recovery_slot.argon2_m == 0 or
-        vault.recovery_slot.argon2_p == 0 or
-        vault.recovery_slot.argon2_p > std.math.maxInt(u24))
-    {
-        return error.InvalidVault;
-    }
+    try validateArgon2Params(
+        vault.recovery_slot.argon2_t,
+        vault.recovery_slot.argon2_m,
+        vault.recovery_slot.argon2_p,
+    );
     try base64DecodeExact(vault.recovery_slot.wrap_nonce_b64, &nonce);
     var recovery_wrapped: [dek_len + gcm_tag_len]u8 = undefined;
     try base64DecodeExact(vault.recovery_slot.wrapped_dek_b64, &recovery_wrapped);
@@ -889,7 +961,10 @@ fn base64DecodeAlloc(gpa: Allocator, encoded: []const u8) Error![]u8 {
     const decoder = std.base64.url_safe_no_pad.Decoder;
     const len = decoder.calcSizeForSlice(encoded) catch return error.InvalidVault;
     const out = gpa.alloc(u8, len) catch return error.OutOfMemory;
-    errdefer gpa.free(out);
+    errdefer {
+        std.crypto.secureZero(u8, out);
+        gpa.free(out);
+    }
     decoder.decode(out, encoded) catch return error.InvalidVault;
     return out;
 }
@@ -924,17 +999,43 @@ const LockFile = struct {
 fn acquireLock(gpa: Allocator, io: std.Io, path: []const u8) Error!LockFile {
     const lock_path = std.fmt.allocPrint(gpa, "{s}.lock", .{path}) catch return error.OutOfMemory;
     defer gpa.free(lock_path);
-    const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
-        .read = true,
-        .truncate = false,
-        .lock = .exclusive,
-        .permissions = privateFilePermissions(),
-    }) catch return error.PlatformFailure;
+
+    const file: std.Io.File = blk: {
+        for (0..4) |_| {
+            if (std.Io.Dir.cwd().openFile(io, lock_path, .{
+                .mode = .read_write,
+                .allow_directory = false,
+                .lock = .exclusive,
+                .follow_symlinks = false,
+            })) |opened| {
+                break :blk opened;
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => return error.PlatformFailure,
+            }
+
+            if (std.Io.Dir.cwd().createFile(io, lock_path, .{
+                .read = true,
+                .truncate = false,
+                .exclusive = true,
+                .lock = .exclusive,
+                .permissions = privateFilePermissions(),
+            })) |created| {
+                break :blk created;
+            } else |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return error.PlatformFailure,
+            }
+        }
+        return error.PlatformFailure;
+    };
     errdefer {
         file.unlock(io);
         file.close(io);
     }
     if (comptime isPosix()) {
+        const st = file.stat(io) catch return error.PlatformFailure;
+        if (st.kind != .file) return error.PlatformFailure;
         file.setPermissions(io, privateFilePermissions()) catch return error.PlatformFailure;
     }
     return .{ .file = file };
@@ -977,6 +1078,13 @@ fn ensureParentDir(io: std.Io, path: []const u8) Error!void {
     _ = std.Io.Dir.cwd().createDirPathStatus(io, parent, privateDirPermissions()) catch {
         return error.PlatformFailure;
     };
+    if (comptime isPosix()) {
+        const stat = std.Io.Dir.cwd().statFile(io, parent, .{}) catch return error.PlatformFailure;
+        if (stat.kind != .directory) return error.PlatformFailure;
+        if ((stat.permissions.toMode() & 0o022) != 0) {
+            return error.InsecurePermissions;
+        }
+    }
 }
 
 fn privateFilePermissions() std.Io.File.Permissions {
@@ -1020,7 +1128,7 @@ fn getEnvVarOwned(gpa: Allocator, name: []const u8) ?[]u8 {
 fn testVaultPath(tmp: *std.testing.TmpDir, gpa: Allocator) ![]u8 {
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.Io.Threaded.global_single_threaded.io(), &root_buf);
-    return std.fs.path.join(gpa, &.{ root_buf[0..root_len], "vault.json" });
+    return std.fs.path.join(gpa, &.{ root_buf[0..root_len], "keyring", "vault.json" });
 }
 
 fn testEnrollment(prf_output: [prf_salt_len]u8, credential_id: []const u8, label: []const u8) PrfEnrollment {
@@ -1254,7 +1362,10 @@ test "payload encryption round-trips binary-safe items" {
         encrypted.nonce_b64,
         encrypted.ciphertext_b64,
     );
-    defer decrypted.deinit();
+    defer {
+        for (decrypted.value.items) |item| std.crypto.secureZero(u8, @constCast(item.secret_b64));
+        decrypted.deinit();
+    }
     try std.testing.expectEqual(@as(usize, 1), decrypted.value.items.len);
     try std.testing.expectEqualStrings("AP8Q", decrypted.value.items[0].secret_b64);
     try std.testing.expectEqualStrings(
@@ -1315,4 +1426,107 @@ test "vault loader rejects group-readable permissions" {
     defer file.close(io);
     try file.setPermissions(io, .fromMode(0o644));
     try std.testing.expectError(error.InsecurePermissions, loadVaultEnvelope(gpa));
+}
+
+test "vaultPathFromEnv requires absolute XDG_DATA_HOME and HOME" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const abs_root = root_buf[0..root_len];
+
+    // Relative XDG_DATA_HOME is ignored and falls back to absolute HOME.
+    const fallback = try vaultPathFromEnv(gpa, null, null, "relative/xdg", abs_root);
+    defer gpa.free(fallback);
+    const expected_fallback = try std.fs.path.join(gpa, &.{ abs_root, ".local", "share", "keyring", "vault.json" });
+    defer gpa.free(expected_fallback);
+    try std.testing.expectEqualStrings(expected_fallback, fallback);
+
+    // Relative HOME is rejected.
+    try std.testing.expectError(error.VaultPathUnavailable, vaultPathFromEnv(gpa, null, null, null, "relative/home"));
+    try std.testing.expectError(error.VaultPathUnavailable, vaultPathFromEnv(gpa, null, null, "relative/xdg", "relative/home"));
+}
+
+test "Argon2id parameter bounds are enforced in validateEnvelope and deriveRecoveryKek" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const prf_output: [prf_salt_len]u8 = @splat(0x93);
+    var enrolled = try enrollInitialVault(
+        gpa,
+        io,
+        testEnrollment(prf_output, "credential-argon2", "primary"),
+        fast_enrollment_options,
+    );
+    defer enrolled.deinit();
+
+    const key: [recovery_key_chars]u8 = @splat('A');
+    const salt: [recovery_salt_len]u8 = @splat(0x22);
+    for ([_][3]u32{
+        .{ 0, 1024, 1 },
+        .{ 65, 1024, 1 },
+        .{ 1, 1024, 0 },
+        .{ 1, 1024, 65 },
+        .{ 1, 31, 4 },
+        .{ 1, 2 * 1024 * 1024 + 1, 1 },
+    }) |bad| {
+        try std.testing.expectError(error.InvalidVault, deriveRecoveryKek(gpa, &key, salt, bad[0], bad[1], bad[2]));
+        var copy = enrolled.document.value;
+        copy.recovery_slot.argon2_t = bad[0];
+        copy.recovery_slot.argon2_m = bad[1];
+        copy.recovery_slot.argon2_p = bad[2];
+        try std.testing.expectError(error.InvalidVault, validateEnvelope(&copy));
+    }
+}
+
+test "vault rejects group/world-writable parent directory and symlinked lock file" {
+    if (comptime !isPosix()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testVaultPath(&tmp, gpa);
+    defer gpa.free(path);
+    vault_path_override = path;
+    defer vault_path_override = null;
+
+    const prf_output: [prf_salt_len]u8 = @splat(0xa7);
+    var enrolled = try enrollInitialVault(
+        gpa,
+        io,
+        testEnrollment(prf_output, "credential-perms", "primary"),
+        fast_enrollment_options,
+    );
+    defer enrolled.deinit();
+    try saveVaultEnvelope(gpa, &enrolled.document.value);
+
+    // 1. Group-writable parent directory is rejected.
+    const parent = std.fs.path.dirname(path).?;
+    {
+        var parent_dir = try std.Io.Dir.cwd().openDir(io, parent, .{ .iterate = true });
+        defer parent_dir.close(io);
+        try parent_dir.setPermissions(io, .fromMode(0o770));
+        defer parent_dir.setPermissions(io, .fromMode(0o700)) catch {};
+        try std.testing.expectError(error.InsecurePermissions, loadVaultEnvelope(gpa));
+        try std.testing.expectError(error.InsecurePermissions, saveVaultEnvelope(gpa, &enrolled.document.value));
+    }
+
+    // 2. Symlink at vault.json.lock is refused without following the symlink.
+    const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
+    defer gpa.free(lock_path);
+    const victim_path = try std.fmt.allocPrint(gpa, "{s}.victim", .{path});
+    defer gpa.free(victim_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = victim_path, .data = "keep" });
+    std.Io.Dir.cwd().deleteFile(io, lock_path) catch {};
+    try std.Io.Dir.cwd().symLink(io, victim_path, lock_path, .{});
+    try std.testing.expectError(error.PlatformFailure, loadVaultEnvelope(gpa));
+    try std.testing.expectError(error.PlatformFailure, saveVaultEnvelope(gpa, &enrolled.document.value));
+}
+
+test {
+    _ = @import("term.zig");
+    _ = @import("dpapi.zig");
+    _ = @import("wincred.zig");
+    _ = @import("keychain.zig");
 }

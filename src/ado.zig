@@ -84,7 +84,10 @@ fn verifyOrganization(gpa: Allocator, org_url: []const u8, token: []const u8) Er
     const url = try std.fmt.allocPrint(gpa, "{s}/_apis/connectionData", .{org_url});
     defer gpa.free(url);
     const auth = try std.fmt.allocPrint(gpa, "Bearer {s}", .{token});
-    defer gpa.free(auth);
+    defer {
+        std.crypto.secureZero(u8, auth);
+        gpa.free(auth);
+    }
     var response = Io.Writer.Allocating.init(gpa);
     defer response.deinit();
     var client: std.http.Client = .{ .allocator = gpa, .io = ioGlobal() };
@@ -744,22 +747,58 @@ fn deleteLegacyFile(gpa: Allocator, name: []const u8) bool {
     return true;
 }
 
-pub fn isDevOpsUrl(url: []const u8) bool {
-    return std.mem.indexOf(u8, url, "visualstudio.com") != null or
-        std.mem.indexOf(u8, url, "dev.azure.com") != null or
-        std.mem.indexOf(u8, url, "pkgs.codedev.ms") != null or
-        std.mem.indexOf(u8, url, "pkgs.vsts.me") != null;
+const DevOpsHostKind = enum {
+    dev_azure_com,
+    subdomain_org,
+};
+
+const ParsedDevOpsUrl = struct {
+    host: []const u8,
+    path: []const u8,
+    kind: DevOpsHostKind,
+};
+
+fn isValidDnsHost(host: []const u8) bool {
+    if (host.len == 0 or host[0] == '.' or host[host.len - 1] == '.') return false;
+    var prev_dot = false;
+    for (host) |c| {
+        if (c == '.') {
+            if (prev_dot) return false;
+            prev_dot = true;
+        } else if (std.ascii.isAlphanumeric(c) or c == '-') {
+            prev_dot = false;
+        } else {
+            return false;
+        }
+    }
+    return true;
 }
 
-pub fn extractOrg(service_url: []const u8) ?[]const u8 {
-    // Slice the host and path directly out of `service_url` rather than going
-    // through std.Uri.getHost, which copies the host into a caller-provided
-    // stack buffer. Returning a slice into such a buffer yields a dangling
-    // pointer once this function returns and the stack frame is reused (e.g. by
-    // a subsequent loadCache JSON parse), corrupting the org name. All slices
-    // returned here point into `service_url`, which outlives the call.
-    const scheme_sep = std.mem.indexOf(u8, service_url, "://") orelse return null;
-    const after_scheme = service_url[scheme_sep + 3 ..];
+fn isSafeOrgSegment(org: []const u8) bool {
+    if (org.len == 0) return false;
+    if (std.mem.eql(u8, org, ".") or std.mem.eql(u8, org, "..")) return false;
+    for (org) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '_' and c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn parseDevOpsUrl(input: []const u8, require_https_scheme: bool) ?ParsedDevOpsUrl {
+    if (input.len == 0) return null;
+    for (input) |c| {
+        if (c <= 0x20 or c == 0x7f or c == '\\') return null;
+    }
+
+    const after_scheme = if (std.mem.indexOf(u8, input, "://")) |scheme_sep| blk: {
+        if (!std.ascii.eqlIgnoreCase(input[0..scheme_sep], "https")) return null;
+        break :blk input[scheme_sep + 3 ..];
+    } else blk: {
+        if (require_https_scheme) return null;
+        if (input[0] == '/') return null;
+        break :blk input;
+    };
 
     var host_end: usize = after_scheme.len;
     for (after_scheme, 0..) |c, i| {
@@ -769,29 +808,77 @@ pub fn extractOrg(service_url: []const u8) ?[]const u8 {
         }
     }
 
-    var host = after_scheme[0..host_end];
-    if (std.mem.lastIndexOfScalar(u8, host, '@')) |at| host = host[at + 1 ..];
-    if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
+    const authority = after_scheme[0..host_end];
+    if (authority.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, authority, '@') != null) return null;
 
-    if (std.mem.endsWith(u8, host, "visualstudio.com") or
-        std.mem.endsWith(u8, host, "vsts.me") or
-        std.mem.endsWith(u8, host, "codedev.ms"))
-    {
-        const dot = std.mem.indexOfScalar(u8, host, '.') orelse return null;
-        return if (dot == 0) null else host[0..dot];
+    var host = authority;
+    if (std.mem.indexOfScalar(u8, authority, ':')) |colon| {
+        host = authority[0..colon];
+        const port_str = authority[colon + 1 ..];
+        if (port_str.len == 0) return null;
+        for (port_str) |c| {
+            if (!std.ascii.isDigit(c)) return null;
+        }
+        const port = std.fmt.parseUnsigned(u16, port_str, 10) catch return null;
+        if (port == 0) return null;
     }
 
-    if (std.mem.indexOf(u8, host, "dev.azure.com") != null) {
-        const path = after_scheme[host_end..];
-        var start: usize = 0;
-        while (start < path.len and path[start] == '/') start += 1;
-        if (start >= path.len) return null;
-        var end = start;
-        while (end < path.len and (path[end] != '/' and path[end] != '?' and path[end] != '#')) end += 1;
-        return if (end == start) null else path[start..end];
+    if (!isValidDnsHost(host)) return null;
+
+    const path = if (host_end < after_scheme.len and after_scheme[host_end] == '/')
+        after_scheme[host_end..]
+    else
+        "";
+
+    if (std.ascii.eqlIgnoreCase(host, "dev.azure.com") or
+        (host.len > ".dev.azure.com".len and std.ascii.endsWithIgnoreCase(host, ".dev.azure.com")) or
+        std.ascii.eqlIgnoreCase(host, "pkgs.codedev.ms") or
+        std.ascii.eqlIgnoreCase(host, "pkgs.vsts.me"))
+    {
+        return .{ .host = host, .path = path, .kind = .dev_azure_com };
+    }
+
+    if ((host.len > ".visualstudio.com".len and std.ascii.endsWithIgnoreCase(host, ".visualstudio.com")) or
+        (host.len > ".codedev.ms".len and std.ascii.endsWithIgnoreCase(host, ".codedev.ms")) or
+        (host.len > ".vsts.me".len and std.ascii.endsWithIgnoreCase(host, ".vsts.me")))
+    {
+        return .{ .host = host, .path = path, .kind = .subdomain_org };
     }
 
     return null;
+}
+
+pub fn isDevOpsUrl(url: []const u8) bool {
+    return parseDevOpsUrl(url, false) != null;
+}
+
+pub fn extractOrg(service_url: []const u8) ?[]const u8 {
+    // Slice the host and path directly out of `service_url` rather than going
+    // through std.Uri.getHost, which copies the host into a caller-provided
+    // stack buffer. Returning a slice into such a buffer yields a dangling
+    // pointer once this function returns and the stack frame is reused (e.g. by
+    // a subsequent loadCache JSON parse), corrupting the org name. All slices
+    // returned here point into `service_url`, which outlives the call.
+    const parsed = parseDevOpsUrl(service_url, true) orelse return null;
+
+    switch (parsed.kind) {
+        .subdomain_org => {
+            const dot = std.mem.indexOfScalar(u8, parsed.host, '.') orelse return null;
+            const org = parsed.host[0..dot];
+            return if (isSafeOrgSegment(org)) org else null;
+        },
+        .dev_azure_com => {
+            const path = parsed.path;
+            var start: usize = 0;
+            while (start < path.len and path[start] == '/') start += 1;
+            if (start >= path.len) return null;
+            var end = start;
+            while (end < path.len and (path[end] != '/' and path[end] != '?' and path[end] != '#')) end += 1;
+            const org = path[start..end];
+            return if (isSafeOrgSegment(org)) org else null;
+        },
+    }
 }
 
 test "login normalizes equivalent Azure Repos organization addresses" {
@@ -841,7 +928,8 @@ test "login verifies an active authenticated organization identity, not HTTP suc
 
 pub fn generatePkce(verifier_out: *[43]u8, challenge_out: *[43]u8) void {
     var random_bytes: [32]u8 = undefined;
-    std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
+    defer std.crypto.secureZero(u8, &random_bytes);
+    secureRandom(&random_bytes);
     _ = std.base64.url_safe_no_pad.Encoder.encode(verifier_out, &random_bytes);
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -968,6 +1056,7 @@ pub fn exchangeForSessionToken(
     org: []const u8,
     bypass_session_cache: bool,
 ) Error![]u8 {
+    if (!isSafeOrgSegment(org)) return error.Unsupported;
     const now = unixNow();
     if (!bypass_session_cache and !diskCacheDisabled()) {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -992,10 +1081,14 @@ pub fn exchangeForSessionToken(
 }
 
 fn getSessionToken(gpa: Allocator, access_token: []const u8, org: []const u8) Error!std.json.Parsed(SessionTokenResponse) {
+    if (!isSafeOrgSegment(org)) return error.Unsupported;
     const url = try std.fmt.allocPrint(gpa, "https://vssps.dev.azure.com/{s}/_apis/token/sessiontokens?api-version=5.0-preview.1", .{org});
     defer gpa.free(url);
     const auth = try std.fmt.allocPrint(gpa, "Bearer {s}", .{access_token});
-    defer gpa.free(auth);
+    defer {
+        std.crypto.secureZero(u8, auth);
+        gpa.free(auth);
+    }
     const body = "{\"scope\":\"vso.packaging\",\"targetAccounts\":[]}";
     return postJson(SessionTokenResponse, gpa, url, body, "application/json", &.{
         .{ .name = "authorization", .value = auth },
@@ -1018,6 +1111,7 @@ fn postJson(comptime T: type, gpa: Allocator, url: []const u8, body: []const u8,
         .payload = body,
         .headers = .{ .content_type = .{ .override = content_type } },
         .extra_headers = extra_headers,
+        .redirect_behavior = .not_allowed,
         .response_writer = &response.writer,
     }) catch return error.NetworkFailure;
 
@@ -1139,6 +1233,62 @@ fn sendHtml(io: Io, stream: std.Io.net.Stream, html: []const u8) Error!void {
     writer.interface.flush() catch return error.NetworkFailure;
 }
 
+pub fn isSafeBrowserUrl(url: []const u8) bool {
+    if (url.len == 0) return false;
+    for (url) |c| {
+        if (c <= 0x20 or c == 0x7f) return false;
+    }
+    if (url.len > "https://".len and std.ascii.startsWithIgnoreCase(url, "https://")) {
+        const rest = url["https://".len..];
+        if (rest[0] == '/' or rest[0] == '?' or rest[0] == '#') return false;
+        return true;
+    }
+    const loopback_rest = if (std.ascii.startsWithIgnoreCase(url, "http://localhost:"))
+        url["http://localhost:".len..]
+    else if (std.ascii.startsWithIgnoreCase(url, "http://127.0.0.1:"))
+        url["http://127.0.0.1:".len..]
+    else
+        return false;
+
+    var port_end: usize = loopback_rest.len;
+    for (loopback_rest, 0..) |c, i| {
+        if (c == '/' or c == '?' or c == '#') {
+            port_end = i;
+            break;
+        }
+    }
+    const port_str = loopback_rest[0..port_end];
+    if (port_str.len == 0) return false;
+    for (port_str) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    const port = std.fmt.parseUnsigned(u16, port_str, 10) catch return false;
+    return port != 0;
+}
+
+/// Build the `-Command` script passed to `powershell.exe` on WSL, quoting `url`
+/// inside PowerShell single quotes (`'...'` with `'` doubled as `''`) so OAuth
+/// query strings containing `&`, `?`, and `=` are never truncated or executed.
+pub fn buildWslPowerShellCommand(gpa: Allocator, url: []const u8) Error![]u8 {
+    if (!isSafeBrowserUrl(url)) return error.Unsupported;
+    for (url) |c| {
+        if (c == '"' or c >= 0x80) return error.Unsupported;
+    }
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    errdefer out.deinit();
+    out.writer.writeAll("Start-Process -FilePath ('") catch return error.OutOfMemory;
+    for (url) |c| {
+        if (c == '\'') {
+            out.writer.writeAll("''") catch return error.OutOfMemory;
+        } else {
+            out.writer.writeByte(c) catch return error.OutOfMemory;
+        }
+    }
+    out.writer.writeAll("')") catch return error.OutOfMemory;
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
 pub fn openBrowser(gpa: Allocator, stderr: *Io.Writer, url: []const u8) Error!void {
     return openBrowserWithEnv(gpa, stderr, url, getEnvVarOwned, false);
 }
@@ -1150,7 +1300,11 @@ pub fn openBrowserWithEnv(
     env_fn: EnvLookupFn,
     check_gh_browser: bool,
 ) Error!void {
-    if (!canLaunchBrowserWithEnv(gpa, env_fn, check_gh_browser, builtin.os.tag, isWsl())) {
+    if (!isSafeBrowserUrl(url)) {
+        return error.NoStorageAccess;
+    }
+    const wsl = isWsl();
+    if (!canLaunchBrowserWithEnv(gpa, env_fn, check_gh_browser, builtin.os.tag, wsl)) {
         return error.NoStorageAccess;
     }
     // global_single_threaded uses a failing allocator, which makes
@@ -1178,12 +1332,30 @@ pub fn openBrowserWithEnv(
         return error.NoStorageAccess;
     }
 
-    const attempts = browserAttempts();
-    for (attempts) |argv_prefix| {
-        const argv = try appendUrlArg(gpa, argv_prefix, url);
-        defer gpa.free(argv);
-        if (spawnBrowserAttempt(io, stderr, argv)) return;
+    if (builtin.os.tag == .macos) {
+        if (spawnBrowserAttempt(io, stderr, &.{ "open", url })) return;
+        return error.NoStorageAccess;
     }
+
+    if (wsl) {
+        if (spawnBrowserAttempt(io, stderr, &.{ "wslview", url })) return;
+        if (buildWslPowerShellCommand(gpa, url)) |ps_cmd| {
+            defer gpa.free(ps_cmd);
+            const ps_argv: []const []const u8 = &.{
+                "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                ps_cmd,
+            };
+            if (spawnBrowserAttempt(io, stderr, ps_argv)) return;
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        }
+    }
+
+    if (spawnBrowserAttempt(io, stderr, &.{ "xdg-open", url })) return;
     return error.NoStorageAccess;
 }
 
@@ -1247,27 +1419,6 @@ fn shellExecuteOpen(gpa: Allocator, url: []const u8) bool {
     // <= 32 are error codes; success returns a value > 32.
     const code: usize = @intFromPtr(result);
     return code > 32;
-}
-
-fn browserAttempts() []const []const []const u8 {
-    if (builtin.os.tag == .macos) {
-        return &.{&.{"open"}};
-    }
-    if (isWsl()) {
-        return &.{
-            &.{ "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-Command", "Start-Process" },
-            &.{ "/mnt/c/Windows/system32/cmd.exe", "/c", "start", "" },
-            &.{"xdg-open"},
-        };
-    }
-    return &.{&.{"xdg-open"}};
-}
-
-fn appendUrlArg(gpa: Allocator, prefix: []const []const u8, url: []const u8) Error![]const []const u8 {
-    var argv = try gpa.alloc([]const u8, prefix.len + 1);
-    @memcpy(argv[0..prefix.len], prefix);
-    argv[prefix.len] = url;
-    return argv;
 }
 
 pub fn isWsl() bool {
@@ -1391,11 +1542,19 @@ pub fn canLaunchBrowser() bool {
 
 fn randomUrlToken(gpa: Allocator, byte_len: usize) Error![]u8 {
     const bytes = try gpa.alloc(u8, byte_len);
-    defer gpa.free(bytes);
-    std.Io.Threaded.global_single_threaded.io().random(bytes);
+    defer {
+        std.crypto.secureZero(u8, bytes);
+        gpa.free(bytes);
+    }
+    secureRandom(bytes);
     const out = try gpa.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(byte_len));
     _ = std.base64.url_safe_no_pad.Encoder.encode(out, bytes);
     return out;
+}
+
+fn secureRandom(bytes: []u8) void {
+    const io = ioGlobal();
+    io.randomSecure(bytes) catch io.random(bytes);
 }
 
 fn ioGlobal() std.Io {
@@ -1838,16 +1997,28 @@ fn writeFileAtomic(gpa: Allocator, path: []const u8, contents: []const u8) Error
     // forces a re-authentication on every subsequent call. A per-process random
     // suffix keeps each writer's temp file private before the atomic rename.
     var suffix_bytes: [8]u8 = undefined;
-    io.random(&suffix_bytes);
+    secureRandom(&suffix_bytes);
     const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
     const tmp = try std.fmt.allocPrint(gpa, "{s}.{s}.tmp", .{ path, suffix_hex });
     defer gpa.free(tmp);
+
+    var cleanup_tmp = false;
+    defer if (cleanup_tmp) std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
     {
-        var file = std.Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true, .permissions = cacheFilePermissions() }) catch return error.CacheFailure;
+        var file = std.Io.Dir.cwd().createFile(io, tmp, .{
+            .truncate = true,
+            .exclusive = true,
+            .permissions = cacheFilePermissions(),
+        }) catch return error.CacheFailure;
+        cleanup_tmp = true;
         defer file.close(io);
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            file.setPermissions(io, cacheFilePermissions()) catch return error.CacheFailure;
+        }
         file.writeStreamingAll(io, contents) catch return error.CacheFailure;
     }
-    std.Io.Dir.renameAbsolute(tmp, path, io) catch return error.CacheFailure;
+    std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, io) catch return error.CacheFailure;
+    cleanup_tmp = false;
 }
 
 /// An exclusive cross-process lock over the cache directory, held for the
@@ -2170,20 +2341,99 @@ const success_html =
     "<p>You can close this tab and return to the terminal.</p>" ++
     "</body></html>";
 
-test "recognizes Azure DevOps URLs" {
+test "recognizes Azure DevOps URLs and rejects spoofed hosts or insecure schemes" {
     try std.testing.expect(isDevOpsUrl("https://myorg.pkgs.visualstudio.com/_packaging/foo/pypi/simple/"));
     try std.testing.expect(isDevOpsUrl("https://pkgs.dev.azure.com/myorg/_packaging/feed/pypi/simple/"));
     try std.testing.expect(isDevOpsUrl("https://pkgs.codedev.ms/myorg/_packaging/feed/pypi/simple/"));
     try std.testing.expect(isDevOpsUrl("https://pkgs.vsts.me/myorg/_packaging/feed/pypi/simple/"));
-    try std.testing.expect(!isDevOpsUrl("https://pypi.org/simple/"));
+    try std.testing.expect(isDevOpsUrl("https://dev.azure.com/contoso/_git/repo"));
+    try std.testing.expect(isDevOpsUrl("https://dev.azure.com"));
+    try std.testing.expect(isDevOpsUrl("HTTPS://MYORG.VisualStudio.com/project"));
+    // Bare host inputs used by `keyring git config -h <host>`.
+    try std.testing.expect(isDevOpsUrl("dev.azure.com"));
+    try std.testing.expect(isDevOpsUrl("myorg.visualstudio.com"));
+    try std.testing.expect(isDevOpsUrl("pkgs.codedev.ms"));
+    try std.testing.expect(isDevOpsUrl("pkgs.vsts.me"));
+
+    // Reject unrelated, spoofed, non-HTTPS, userinfo, and bare apex hosts.
+    for ([_][]const u8{
+        "",
+        "https://pypi.org/simple/",
+        "https://evil-visualstudio.com/repo",
+        "https://visualstudio.com.evil.com/repo",
+        "https://dev.azure.com.evil.com/org",
+        "https://evil-dev.azure.com/org",
+        "https://evil.com/dev.azure.com/org",
+        "https://evil.com?next=https://dev.azure.com/org",
+        "http://dev.azure.com/org",
+        "http://myorg.visualstudio.com/repo",
+        "https://visualstudio.com/org",
+        "visualstudio.com",
+        "https://evil-codedev.ms/org",
+        "https://codedev.ms.evil.com/org",
+        "https://codedev.ms/org",
+        "https://evil-vsts.me/org",
+        "https://vsts.me.evil.com/org",
+        "https://vsts.me/org",
+        "https://user@dev.azure.com/org",
+        "https://dev.azure.com@evil.com/org",
+        "https://.visualstudio.com/org",
+        "https://.dev.azure.com/org",
+    }) |bad| {
+        try std.testing.expect(!isDevOpsUrl(bad));
+        try std.testing.expect(extractOrg(bad) == null);
+    }
 }
 
-test "extracts Azure DevOps org" {
+test "extracts Azure DevOps org and rejects unsafe org segments or missing https scheme" {
     try std.testing.expectEqualStrings("myorg", extractOrg("https://myorg.pkgs.visualstudio.com/_packaging/feed/pypi/simple/").?);
     try std.testing.expectEqualStrings("myorg", extractOrg("https://pkgs.dev.azure.com/myorg/_packaging/feed/pypi/simple/").?);
     try std.testing.expectEqualStrings("contoso", extractOrg("https://dev.azure.com/contoso/_packaging/feed/pypi/simple/").?);
-    try std.testing.expectEqualStrings("pkgs", extractOrg("https://pkgs.codedev.ms/myorg/_packaging/feed/pypi/simple/").?);
+    try std.testing.expectEqualStrings("myorg", extractOrg("https://pkgs.codedev.ms/myorg/_packaging/feed/pypi/simple/").?);
+    try std.testing.expectEqualStrings("myorg", extractOrg("https://pkgs.vsts.me/myorg/_packaging/feed/pypi/simple/").?);
+    try std.testing.expectEqualStrings("myorg", extractOrg("https://myorg.pkgs.codedev.ms/_packaging/feed/pypi/simple/").?);
+    try std.testing.expectEqualStrings("myorg", extractOrg("https://myorg.pkgs.vsts.me/_packaging/feed/pypi/simple/").?);
     try std.testing.expect(extractOrg("https://dev.azure.com/") == null);
+    try std.testing.expect(extractOrg("https://pkgs.codedev.ms/") == null);
+    try std.testing.expect(extractOrg("dev.azure.com/contoso") == null);
+    try std.testing.expect(extractOrg("myorg.visualstudio.com") == null);
+    try std.testing.expect(extractOrg("https://dev.azure.com/./_packaging") == null);
+    try std.testing.expect(extractOrg("https://dev.azure.com/../_packaging") == null);
+    try std.testing.expect(extractOrg("https://dev.azure.com/%2e%2e/_packaging") == null);
+    try std.testing.expect(extractOrg("https://dev.azure.com/org%2Fevil/_packaging") == null);
+}
+
+test "isSafeBrowserUrl and buildWslPowerShellCommand preserve &, ?, =, and escape single quotes safely" {
+    const gpa = std.testing.allocator;
+
+    try std.testing.expect(isSafeBrowserUrl("https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?a=1&b=2"));
+    try std.testing.expect(isSafeBrowserUrl("http://localhost:54321/callback?code=1"));
+    try std.testing.expect(isSafeBrowserUrl("http://127.0.0.1:8080/callback"));
+    try std.testing.expect(!isSafeBrowserUrl("http://evil.example.com/phish"));
+    try std.testing.expect(!isSafeBrowserUrl("http://localhost.evil.com:8080/"));
+    try std.testing.expect(!isSafeBrowserUrl("file:///etc/passwd"));
+    try std.testing.expect(!isSafeBrowserUrl("javascript:alert(1)"));
+    try std.testing.expect(!isSafeBrowserUrl("https://login.microsoftonline.com/path with space"));
+    try std.testing.expect(!isSafeBrowserUrl("https://login.microsoftonline.com/path\nCalc"));
+    try std.testing.expect(!isSafeBrowserUrl("https://login.microsoftonline.com/path\x7f"));
+
+    const cmd = try buildWslPowerShellCommand(
+        gpa,
+        "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?client_id=abc&scope=vso.code&state=o'hare",
+    );
+    defer gpa.free(cmd);
+    try std.testing.expectEqualStrings(
+        "Start-Process -FilePath ('https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?client_id=abc&scope=vso.code&state=o''hare')",
+        cmd,
+    );
+
+    try std.testing.expectError(error.Unsupported, buildWslPowerShellCommand(gpa, "file:///C:/Windows/System32/calc.exe"));
+    try std.testing.expectError(error.Unsupported, buildWslPowerShellCommand(gpa, "https://example.com/a\rb"));
+    try std.testing.expectError(error.Unsupported, buildWslPowerShellCommand(gpa, "https://example.com/\"quote\""));
+
+    var stderr = std.Io.Writer.Allocating.init(gpa);
+    defer stderr.deinit();
+    try std.testing.expectError(error.NoStorageAccess, openBrowserWithEnv(gpa, &stderr.writer, "file:///etc/passwd", getEnvVarOwned, false));
 }
 
 test "PKCE challenge hashes verifier text" {

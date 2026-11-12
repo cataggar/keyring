@@ -98,8 +98,7 @@ pub fn mapKeyringError(err: keyring_zig.Error) cp.ProviderError {
 pub fn checkSecureBackendAvailable(gpa: Allocator) cp.ProviderError!void {
     if (is_app_backend_disallowed_fn) |disallowed_fn| {
         if (disallowed_fn()) return error.StorageUnavailable;
-    }
-    if (try getEnvOwned(gpa, "KEYRING_BACKEND")) |backend_env| {
+    } else if (try getEnvOwned(gpa, "KEYRING_BACKEND")) |backend_env| {
         defer gpa.free(backend_env);
         const trimmed = std.mem.trim(u8, backend_env, " \t\r\n");
         if (std.ascii.eqlIgnoreCase(trimmed, "ado") or
@@ -2121,8 +2120,12 @@ test "mapKeyringError and KeyringPersistence enforce secure backend requirements
     is_app_backend_disallowed_fn = DisallowHook.allowed;
     try checkSecureBackendAvailable(gpa);
 
-    is_app_backend_disallowed_fn = null;
+    // Explicit CLI `-b <backend>` override (`is_app_backend_disallowed_fn` returning false)
+    // takes precedence even when `KEYRING_BACKEND=ado` is set in the environment.
     EnvMock.backend_name = "ado";
+    try checkSecureBackendAvailable(gpa);
+
+    is_app_backend_disallowed_fn = null;
     try testing.expectError(error.StorageUnavailable, checkSecureBackendAvailable(gpa));
     EnvMock.backend_name = null;
 

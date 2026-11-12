@@ -33,7 +33,11 @@ eval "$(keyring copilot env)"    # export COPILOT_GITHUB_TOKEN (e.g. WSL via ghr
 
 # Git credential helper for github.com, *.ghe.com, GHES, and Azure DevOps:
 keyring gh login --hostname example.ghe.com
+keyring ado login --hostname https://dev.azure.com/myorg
 keyring git config --hostname example.ghe.com
+
+# Azure Artifacts npm feed authentication (.npmrc -> ~/.npmrc):
+keyring devops-npm
 
 # Podman Desktop and Podman CLI registry authentication (GHCR, ACR, Docker Hub, generic):
 keyring podman login ghcr.io myregistry.azurecr.io
@@ -53,7 +57,7 @@ Use `keyring enroll --add-key`, `--list`, and `--revoke <id>` for multiple authe
 - [GitHub Copilot CLI](doc/copilot.md)
 - [Podman Desktop and Podman](doc/podman.md)
 - [Environment variables](doc/environment-variables.md)
-- [Azure DevOps feeds](doc/azure-devops.md) — the `ado` backend, token caching, and `az login` SSO
+- [Azure DevOps feeds](doc/azure-devops.md) — `ado login`, `devops-npm`, the `ado` backend, token caching, and `az login` SSO
 - [Headless Linux](doc/headless-linux.md)
 - [Exit codes](doc/exit-codes.md)
 - [Compatibility with Python `keyring`](doc/python-compatibility.md)

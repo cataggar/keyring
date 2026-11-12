@@ -485,7 +485,11 @@ fn resolveWslcLockPath(gpa: Allocator, wslc_dir: []const u8) Error![]u8 {
 /// Parse `credentialStore` from `settings.yaml` content, matching `wslc`'s
 /// `WSLCUserSettings.cpp` (`wincred` or `default` -> `.wincred`, `file` -> `.file`).
 pub fn parseSettingsCredentialStore(content: []const u8) Error!CredentialStoreKind {
-    var lines = std.mem.splitScalar(u8, content, '\n');
+    const stripped = if (std.mem.startsWith(u8, content, "\xEF\xBB\xBF"))
+        content[3..]
+    else
+        content;
+    var lines = std.mem.splitScalar(u8, stripped, '\n');
     while (lines.next()) |raw_line| {
         const no_cr = std.mem.trimEnd(u8, raw_line, "\r");
         if (no_cr.len == 0) continue;
@@ -782,6 +786,12 @@ fn acquireWslcLock(gpa: Allocator, wslc_dir: []const u8) Error!FileLock {
     return .{ .file = file };
 }
 
+fn zeroFileCredDocSecrets(doc: *const FileCredentialDocument) void {
+    for (doc.Credentials.map.values()) |entry| {
+        std.crypto.secureZero(u8, @constCast(entry.Secret));
+    }
+}
+
 fn storeFileCred(gpa: Allocator, normalized_server: []const u8, username: []const u8, secret: []const u8) Error!void {
     const wslc_dir = resolveWslcDir(gpa) orelse return error.NoStorageAccess;
     defer gpa.free(wslc_dir);
@@ -795,7 +805,9 @@ fn storeFileCred(gpa: Allocator, normalized_server: []const u8, username: []cons
 
     const creds_path = try std.fs.path.join(a, &.{ wslc_dir, credentials_filename });
     var doc: FileCredentialDocument = .{};
+    defer zeroFileCredDocSecrets(&doc);
     if (try readFileIfExists(a, creds_path)) |bytes| {
+        defer std.crypto.secureZero(u8, bytes);
         if (bytes.len > 0) {
             doc = std.json.parseFromSliceLeaky(FileCredentialDocument, a, bytes, .{
                 .ignore_unknown_fields = true,
@@ -805,6 +817,9 @@ fn storeFileCred(gpa: Allocator, normalized_server: []const u8, username: []cons
     }
 
     const encoded_secret = try encodeFileSecretAlloc(a, secret);
+    if (doc.Credentials.map.get(normalized_server)) |prev_entry| {
+        std.crypto.secureZero(u8, @constCast(prev_entry.Secret));
+    }
     try doc.Credentials.map.put(a, normalized_server, .{
         .UserName = username,
         .Secret = encoded_secret,
@@ -827,12 +842,14 @@ fn getFileCred(gpa: Allocator, normalized_server: []const u8) Error!StoredCreden
 
     const creds_path = try std.fs.path.join(a, &.{ wslc_dir, credentials_filename });
     const bytes = (try readFileIfExists(a, creds_path)) orelse return error.EntryNotFound;
+    defer std.crypto.secureZero(u8, bytes);
     if (bytes.len == 0) return error.EntryNotFound;
 
     const doc = std.json.parseFromSliceLeaky(FileCredentialDocument, a, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch return error.StorageFailure;
+    defer zeroFileCredDocSecrets(&doc);
 
     const entry = doc.Credentials.map.get(normalized_server) orelse return error.EntryNotFound;
     const secret = try decodeFileSecretAlloc(gpa, entry.Secret);
@@ -864,13 +881,18 @@ fn eraseFileCred(gpa: Allocator, normalized_server: []const u8) Error!void {
 
     const creds_path = try std.fs.path.join(a, &.{ wslc_dir, credentials_filename });
     const bytes = (try readFileIfExists(a, creds_path)) orelse return error.EntryNotFound;
+    defer std.crypto.secureZero(u8, bytes);
     if (bytes.len == 0) return error.EntryNotFound;
 
     var doc = std.json.parseFromSliceLeaky(FileCredentialDocument, a, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch return error.StorageFailure;
+    defer zeroFileCredDocSecrets(&doc);
 
+    if (doc.Credentials.map.get(normalized_server)) |old_entry| {
+        std.crypto.secureZero(u8, @constCast(old_entry.Secret));
+    }
     if (!doc.Credentials.map.orderedRemove(normalized_server)) {
         return error.EntryNotFound;
     }
@@ -892,12 +914,14 @@ fn listFileCred(gpa: Allocator) Error![]StoredCredential {
 
     const creds_path = try std.fs.path.join(a, &.{ wslc_dir, credentials_filename });
     const bytes = (try readFileIfExists(a, creds_path)) orelse return gpa.alloc(StoredCredential, 0);
+    defer std.crypto.secureZero(u8, bytes);
     if (bytes.len == 0) return gpa.alloc(StoredCredential, 0);
 
     const doc = std.json.parseFromSliceLeaky(FileCredentialDocument, a, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch return error.StorageFailure;
+    defer zeroFileCredDocSecrets(&doc);
 
     var out = try std.ArrayList(StoredCredential).initCapacity(gpa, doc.Credentials.map.count());
     errdefer {
@@ -1271,7 +1295,7 @@ fn resolveRegistryCredentialLazy(
                     if (getWslcCredential(gpa, store_kind, normalized_server)) |existing| {
                         if (std.mem.eql(u8, existing.username, user)) {
                             if (extractJwtExpiration(gpa, existing.secret)) |exp| {
-                                if (exp > hooks.nowSeconds() + 300) {
+                                if (@as(i128, exp) > @as(i128, hooks.nowSeconds()) + 300) {
                                     return existing;
                                 }
                             } else {
@@ -1295,7 +1319,7 @@ fn resolveRegistryCredentialLazy(
             if (getWslcCredential(gpa, store_kind, normalized_server)) |existing| {
                 if (requested_username == null or std.mem.eql(u8, existing.username, requested_username.?)) {
                     if (extractJwtExpiration(gpa, existing.secret)) |exp| {
-                        if (exp > hooks.nowSeconds() + 300) {
+                        if (@as(i128, exp) > @as(i128, hooks.nowSeconds()) + 300) {
                             return existing;
                         }
                     } else {
@@ -1647,7 +1671,7 @@ fn writeStatusReport(a: Allocator, store_kind: CredentialStoreKind, stdout: *Io.
     for (entries) |entry| {
         if (extractJwtExpiration(a, entry.secret)) |exp| {
             if (exp > now) {
-                const remaining_mins = @divFloor(exp - now, 60);
+                const remaining_mins: i128 = @divFloor(@as(i128, exp) - @as(i128, now), 60);
                 try stdout.print("  {s}: user={s}, status=valid (expires in {d}m)\n", .{
                     entry.server,
                     entry.username,
@@ -1756,7 +1780,12 @@ fn runCredentialHelper(
                 try stderr.flush();
                 return 1;
             };
-            defer parsed.deinit();
+            defer {
+                if (parsed.value.Secret) |sec_buf| {
+                    std.crypto.secureZero(u8, @constCast(sec_buf));
+                }
+                parsed.deinit();
+            }
 
             const srv = parsed.value.ServerURL orelse return 1;
             const user = parsed.value.Username orelse return 1;
@@ -1952,6 +1981,13 @@ fn renameAbsoluteWithRetry(io: Io, old_path: []const u8, new_path: []const u8) E
 }
 
 fn writeFileAtomic(gpa: Allocator, path: []const u8, contents: []const u8) Error!void {
+    if (fs_rename_override_fn == null and fs_retry_sleep_override == null) {
+        return registry_auth.writeProtectedFileAtomic(gpa, path, contents) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.StorageFailure,
+        };
+    }
+
     const io = Io.Threaded.global_single_threaded.io();
     if (std.fs.path.dirname(path)) |parent| {
         if (parent.len > 0) {
@@ -1959,16 +1995,89 @@ fn writeFileAtomic(gpa: Allocator, path: []const u8, contents: []const u8) Error
         }
     }
 
-    var suffix_bytes: [8]u8 = undefined;
-    io.random(&suffix_bytes);
-    const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
-    const tmp = try std.fmt.allocPrint(gpa, "{s}.{s}.tmp", .{ path, suffix_hex });
-    defer gpa.free(tmp);
+    var tmp_owned: ?[]u8 = null;
+    defer if (tmp_owned) |t| gpa.free(t);
+
+    if (builtin.os.tag != .windows) {
+        var file: Io.File = undefined;
+        var open_attempt: usize = 0;
+        while (true) : (open_attempt += 1) {
+            var suffix_bytes: [16]u8 = undefined;
+            io.randomSecure(&suffix_bytes) catch io.random(&suffix_bytes);
+            const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
+            const candidate = try std.fmt.allocPrint(gpa, "{s}.{s}.tmp", .{ path, suffix_hex });
+            if (Io.Dir.cwd().createFile(io, candidate, .{
+                .truncate = true,
+                .exclusive = true,
+                .permissions = filePermissions(),
+            })) |f| {
+                tmp_owned = candidate;
+                file = f;
+                break;
+            } else |err| {
+                gpa.free(candidate);
+                if (err == error.PathAlreadyExists and open_attempt + 1 < fs_max_attempts) {
+                    continue;
+                }
+                return error.StorageFailure;
+            }
+        }
+        const tmp = tmp_owned.?;
+        {
+            defer file.close(io);
+            if (builtin.os.tag != .wasi) {
+                file.setPermissions(io, filePermissions()) catch {
+                    Io.Dir.cwd().deleteFile(io, tmp) catch {};
+                    return error.StorageFailure;
+                };
+            }
+            file.writeStreamingAll(io, contents) catch {
+                Io.Dir.cwd().deleteFile(io, tmp) catch {};
+                return error.StorageFailure;
+            };
+        }
+        renameAbsoluteWithRetry(io, tmp, path) catch {
+            Io.Dir.cwd().deleteFile(io, tmp) catch {};
+            return error.StorageFailure;
+        };
+        return;
+    }
+
+    var open_attempt: usize = 0;
+    while (true) : (open_attempt += 1) {
+        var suffix_bytes: [16]u8 = undefined;
+        io.randomSecure(&suffix_bytes) catch io.random(&suffix_bytes);
+        const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
+        const candidate = try std.fmt.allocPrint(gpa, "{s}.{s}.tmp", .{ path, suffix_hex });
+        if (Io.Dir.cwd().createFile(io, candidate, .{
+            .truncate = true,
+            .exclusive = true,
+            .permissions = filePermissions(),
+        })) |empty_file| {
+            empty_file.close(io);
+            tmp_owned = candidate;
+            break;
+        } else |err| {
+            gpa.free(candidate);
+            if (err == error.PathAlreadyExists and open_attempt + 1 < fs_max_attempts) {
+                continue;
+            }
+            return error.StorageFailure;
+        }
+    }
+    const tmp = tmp_owned.?;
+    registry_auth.restrictFileToCurrentUserWindows(gpa, tmp) catch {
+        Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        return error.StorageFailure;
+    };
     {
         var file = Io.Dir.cwd().createFile(io, tmp, .{
-            .truncate = true,
+            .truncate = false,
             .permissions = filePermissions(),
-        }) catch return error.StorageFailure;
+        }) catch {
+            Io.Dir.cwd().deleteFile(io, tmp) catch {};
+            return error.StorageFailure;
+        };
         defer file.close(io);
         file.writeStreamingAll(io, contents) catch {
             Io.Dir.cwd().deleteFile(io, tmp) catch {};
@@ -1979,6 +2088,7 @@ fn writeFileAtomic(gpa: Allocator, path: []const u8, contents: []const u8) Error
         Io.Dir.cwd().deleteFile(io, tmp) catch {};
         return error.StorageFailure;
     };
+    registry_auth.restrictFileToCurrentUserWindows(gpa, path) catch {};
 }
 
 fn dirPermissions() Io.File.Permissions {
@@ -2202,6 +2312,8 @@ test "parseSettingsCredentialStore handles wincred, file, default, comments, and
     try std.testing.expectEqual(CredentialStoreKind.wincred, try parseSettingsCredentialStore("credentialStore: default\n"));
     try std.testing.expectEqual(CredentialStoreKind.wincred, try parseSettingsCredentialStore("credentialStore: \"wincred\" # inline comment\n"));
     try std.testing.expectEqual(CredentialStoreKind.file, try parseSettingsCredentialStore("credentialStore: file\n"));
+    try std.testing.expectEqual(CredentialStoreKind.file, try parseSettingsCredentialStore("\xEF\xBB\xBFcredentialStore: file\r\n"));
+    try std.testing.expectEqual(CredentialStoreKind.file, try parseSettingsCredentialStore("\xEF\xBB\xBF# BOM comment\ncredentialStore: file\n"));
     try std.testing.expectError(error.InvalidSettings, parseSettingsCredentialStore("credentialStore: bogus\n"));
 }
 
@@ -3328,5 +3440,60 @@ test "ACR explicit non-sentinel username refreshes from genericGet on -f and ret
         defer refreshed.deinit(gpa);
         try std.testing.expectEqualStrings("deploy-bot", refreshed.username);
         try std.testing.expectEqualStrings("rotated_generic_secret", refreshed.secret);
+    }
+
+    // 5. Extreme JWT `exp` / clock timestamps never overflow signed `i64` in status or ACR refresh checks.
+    const ExtremeClock = struct {
+        var now_val: i64 = std.math.maxInt(i64) - 10;
+        var exchange_count: usize = 0;
+
+        fn acquireGh(_: Allocator, _: []const u8, _: ?[]const u8, _: bool, _: bool, _: *Io.Writer) gh.AuthError!?gh.GitCredential {
+            return null;
+        }
+        fn acquireArm(alloc: Allocator, _: *Io.Writer, _: bool, _: bool) ado.Error![]u8 {
+            return alloc.dupe(u8, "arm_tok");
+        }
+        fn exchangeAcr(alloc: Allocator, _: []const u8, _: []const u8, _: ?[]const u8) Error![]u8 {
+            exchange_count += 1;
+            return alloc.dupe(u8, "fresh_acr_tok");
+        }
+        fn genericGet(_: Allocator, _: []const u8, _: []const u8) keyring_zig.Error![]u8 {
+            return error.EntryNotFound;
+        }
+        fn genericSet(_: Allocator, _: []const u8, _: []const u8, _: []const u8) keyring_zig.Error!void {}
+        fn nowSeconds() i64 {
+            return now_val;
+        }
+    };
+    provider_hooks_override = .{
+        .acquireGhCredential = ExtremeClock.acquireGh,
+        .acquireArmToken = ExtremeClock.acquireArm,
+        .exchangeAcrToken = ExtremeClock.exchangeAcr,
+        .genericGet = ExtremeClock.genericGet,
+        .genericSet = ExtremeClock.genericSet,
+        .nowSeconds = ExtremeClock.nowSeconds,
+    };
+    // Payload: {"exp":9223372036854775807}
+    const max_exp_jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjkyMjMzNzIwMzY4NTQ3NzU4MDd9.sig";
+    try storeWslcCredential(gpa, .file, "myacr.azurecr.io", acr_token_username, max_exp_jwt);
+    {
+        var err_out = Io.Writer.Allocating.init(gpa);
+        defer err_out.deinit();
+        // `now_val` is within 10s of maxInt(i64) (< 300s buffer), so it refreshes without overflowing `now + 300`!
+        const c = try resolveRegistryCredential(gpa, .file, "myacr.azurecr.io", null, false, true, &err_out.writer);
+        defer c.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), ExtremeClock.exchange_count);
+    }
+    try storeWslcCredential(gpa, .file, "myacr.azurecr.io", acr_token_username, max_exp_jwt);
+    ExtremeClock.now_val = -1_000_000;
+    {
+        var out = Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        var err_out = Io.Writer.Allocating.init(gpa);
+        defer err_out.deinit();
+        var empty_in = Io.Reader.fixed("");
+        // `exp - now > maxInt(i64)` must not overflow in `wslc status`!
+        try std.testing.expectEqual(@as(u8, 0), try run(gpa, .status, &empty_in, &out.writer, &err_out.writer));
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "status=valid") != null);
     }
 }

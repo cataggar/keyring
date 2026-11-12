@@ -51,8 +51,8 @@ keyring gh export /tmp/gh-export
 
 # Authenticate with GitHub (github.com, *.ghe.com data residency, or GHES) and configure Git.
 keyring gh login
-keyring gh login -h example.ghe.com
-keyring gh login --hostname example.ghe.com --device
+keyring gh login -h example.ghe.com -s "repo read:org" -w
+keyring gh login --hostname example.ghe.com --scopes "repo read:packages" --device
 keyring git config
 keyring git config -h example.ghe.com
 keyring git config -h example.ghe.com -g
@@ -69,7 +69,7 @@ ssh vm 'cat ~/.config/gh/hosts.yml' | keyring gh import -
 # Authenticate Azure Artifacts npm feeds from .npmrc and update ~/.npmrc.
 keyring devops-npm
 keyring devops-npm -c path/to/.npmrc -f
-keyring devops-npm --validate-only
+keyring devops-npm --config-file path/to/.npmrc --validate-only
 
 # Authenticate container registries for Podman Desktop and Podman CLI.
 keyring podman login ghcr.io myregistry.azurecr.io
@@ -90,6 +90,7 @@ keyring copilot status
 keyring copilot token
 eval "$(keyring copilot env)"
 keyring copilot import
+ssh vm 'cat ~/.copilot/config.json' | keyring copilot import -
 keyring copilot export /tmp/copilot-export
 keyring copilot logout
 
@@ -100,8 +101,9 @@ keyring --disable get my-service alice
 
 ## Backends
 
-Backends are `secret_service`, `keychain`, `win_credential`, `file`, `ado`, and
-`null_backend` (`null` is accepted as an alias for `null_backend`).
+Backends are `secret_service`, `keychain`, `win_credential`, `file`, `ado`
+(`azure_devops` is accepted as an alias), and `null_backend` (`null` is accepted
+as an alias for `null_backend`).
 
 The `file` backend comes from the upstream keyring-zig package and stores
 encrypted credentials on disk, which is useful when no secret-service daemon is
@@ -111,7 +113,9 @@ The Linux-only built-in service stores encrypted items in `vault.json` and is un
 
 Typed credential providers layer target normalization, `get`/`login`/`logout` lifecycle, interaction policy, and expiry semantics over encrypted persistence backends; see [Credential provider contract](credential-provider.md).
 
-## Git credential helper (`keyring git credential`)
+## GitHub login and Git credential helper (`keyring gh` and `keyring git`)
+
+`keyring gh login [-h|--hostname <host>] [-s|--scopes <scopes>] [-w|--web | --device]` authenticates to `github.com`, GitHub Enterprise Cloud with data residency (`*.ghe.com`), or GitHub Enterprise Server, storing OAuth tokens in the OS keyring (`gh:<host>`) and updating `hosts.yml` (`$GH_CONFIG_DIR/hosts.yml` or `~/.config/gh/hosts.yml`). Use `-s` / `--scopes <scopes>` to request custom OAuth scopes (default `repo read:org gist workflow`), and `-w` / `--web` or `--device` to select browser PKCE vs. device-code login explicitly.
 
 `keyring git credential <get|store|erase>` (or invoking the binary via a `git-credential-keyring` symlink) implements the Git credential helper protocol over HTTPS for `github.com`, GitHub Enterprise Cloud with data residency (`*.ghe.com`, resolving REST calls to `https://api.<tenant>.ghe.com/user`), GitHub Enterprise Server, Azure DevOps (`dev.azure.com` and `*.visualstudio.com`), and generic HTTPS hosts stored in the active `keyring` backend.
 
@@ -119,6 +123,11 @@ Run `keyring git config` to configure `keyring` globally as your Git credential 
 
 `-g` is a short alias for `--global` (the default). Use `--local` to configure
 only the current repository; when multiple scope flags are given, the last wins.
+
+## Azure DevOps (`keyring ado login` and `keyring devops-npm`)
+
+- `keyring ado login -h|--hostname <org>.visualstudio.com|https://dev.azure.com/<org>` authenticates and verifies organization access before noninteractive Git operations.
+- `keyring devops-npm [-c|--config-file <path>] [-f|--force] [--validate-only]` discovers Azure Artifacts npm registries in a workspace `.npmrc` (or `--config-file <path>` / `--config-file=<path>`) and writes `//<registry>:_authToken=<token>` entries into `~/.npmrc` (or `$NPM_CONFIG_USERCONFIG`). In CI/CD pipelines, `SYSTEM_ACCESSTOKEN` and `AZURE_DEVOPS_EXT_PAT` are checked first before consulting cached `ado` / MSAL credentials or interactive browser OAuth. See [Azure DevOps feeds](azure-devops.md).
 
 ## WSL Container CLI (`keyring wslc`)
 
@@ -145,12 +154,12 @@ See [Podman Desktop and Podman](podman.md) for Windows WinGet + WSL 2 setup, pla
 
 `keyring copilot` manages GitHub Copilot CLI (`copilot`) credentials across Windows Credential Manager, macOS Keychain, Linux Secret Service (`org.freedesktop.secrets`), and WSL (`ghr link cataggar/keyring`):
 
-- `keyring copilot login [-h|--hostname <host>] [-u|--user <login>] [--web|--device] [-f|--force]` resolves or acquires a GitHub token, writes it to the OS keyring in Copilot CLI's native format, updates `loggedInUsers` and `lastLoggedInUser` in `~/.copilot/config.json` (`$COPILOT_HOME/config.json`), and scrubs any matching plaintext `copilotTokens` entry.
-- `keyring copilot logout [-h|--hostname <host>] [-u|--user <login> | --all]` removes stored Copilot CLI credentials for the target account (or `--all` accounts) without revoking shared `gh` tokens.
+- `keyring copilot login [-h|--hostname <host>] [-u|--user|--username <login>] [--web|--device] [-f|--force]` resolves or acquires a GitHub token, writes it to the OS keyring in Copilot CLI's native format, updates `loggedInUsers` and `lastLoggedInUser` in `~/.copilot/config.json` (`$COPILOT_HOME/config.json`), and scrubs any matching plaintext `copilotTokens` entry.
+- `keyring copilot logout [-h|--hostname <host>] [-u|--user|--username <login> | --all]` removes stored Copilot CLI credentials for the target account (or `--all` accounts) without revoking shared `gh` tokens.
 - `keyring copilot status` reports the resolved `config.json` path, configured accounts, and whether tokens are stored in the OS keyring or plaintext `copilotTokens` (`keyring diagnose` also reports Copilot CLI config and vault status when `~/.copilot/config.json` exists).
-- `keyring copilot token [-h|--hostname <host>] [-u|--user <login>]` prints the stored Copilot CLI token for the selected or active account.
-- `keyring copilot env [-h|--hostname <host>] [-u|--user <login>] [--shell <sh|pwsh|cmd|fish>]` prints shell exports setting `COPILOT_GITHUB_TOKEN` without writing secrets to disk.
-- `keyring copilot import [<dir-or-file>]` migrates plaintext `copilotTokens` from `config.json` into the OS keyring (scrubbing `config.json` in place) or imports an exported bundle.
+- `keyring copilot token [-h|--hostname <host>] [-u|--user|--username <login>]` prints the stored Copilot CLI token for the selected or active account.
+- `keyring copilot env [-h|--hostname <host>] [-u|--user|--username <login>] [--shell <sh|pwsh|cmd|fish>]` prints shell exports setting `COPILOT_GITHUB_TOKEN` without writing secrets to disk.
+- `keyring copilot import [<dir-or-file|->]` migrates plaintext `copilotTokens` from `config.json` into the OS keyring (scrubbing `config.json` in place), imports an exported bundle or file, or reads JSON/JSONC from `stdin` when `-` is passed.
 - `keyring copilot export <dir>` exports Copilot CLI credentials and account metadata to `<dir>` for transfer to another machine.
 
 See [GitHub Copilot CLI](copilot.md) for platform credential schemas, WSL setup with `ghr link`, headless Linux `keyring service` setup, and migrating plaintext `copilotTokens`.

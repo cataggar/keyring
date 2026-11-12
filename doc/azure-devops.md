@@ -133,10 +133,18 @@ present.
 `keyring devops-npm` is a drop-in replacement for `@microsoft/artifacts-npm-credprovider` that reads Azure Artifacts npm registries from a workspace `.npmrc` and writes `//<registry>:_authToken=<token>` entries to `~/.npmrc` (or `$NPM_CONFIG_USERCONFIG`):
 
 ```sh
-keyring devops-npm                           # discover ./.npmrc (or git root .npmrc) and update ~/.npmrc
-keyring devops-npm -c path/to/.npmrc         # use an explicit workspace .npmrc
-keyring devops-npm -f                        # force refresh even if existing tokens are valid
-keyring devops-npm --validate-only           # check whether existing ~/.npmrc tokens are valid
+keyring devops-npm                                   # discover ./.npmrc (or git root .npmrc) and update ~/.npmrc
+keyring devops-npm -c path/to/.npmrc                 # use an explicit workspace .npmrc (-c or --config-file)
+keyring devops-npm --config-file path/to/.npmrc -f   # force refresh even if existing tokens are valid
+keyring devops-npm --validate-only                   # check whether existing ~/.npmrc tokens are valid
 ```
 
-Registries (`registry=<url>` and `@scope:registry=<url>`) are grouped by Azure DevOps organization so multi-feed workspaces authenticate once per organization using the `ado` backend's token cache, `az login` SSO, and browser OAuth2 + PKCE fallback.
+Options and environment:
+
+- `-c <path>`, `--config-file <path>` (`--config-file=<path>`): Explicit workspace `.npmrc` file (otherwise `keyring` searches `./.npmrc` and the enclosing Git repository root).
+- `-f`, `--force`: Re-acquire tokens even when existing user `.npmrc` tokens still validate against the organization.
+- `--validate-only`: Exit `0` when all workspace registries already have valid user `.npmrc` tokens, or `1` without prompting/writing otherwise.
+- `SYSTEM_ACCESSTOKEN`, `AZURE_DEVOPS_EXT_PAT`: Checked first in CI/CD pipelines (such as Azure Pipelines or GitHub Actions) before consulting cached `ado` tokens, `az login` MSAL SSO, or interactive browser OAuth2 + PKCE.
+- `NPM_CONFIG_USERCONFIG`: Overrides the destination user `.npmrc` path (`~/.npmrc` by default).
+
+Registries (`registry=<url>` and `@scope:registry=<url>`) are grouped by Azure DevOps organization so multi-feed workspaces authenticate once per organization.

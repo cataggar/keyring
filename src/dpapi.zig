@@ -12,6 +12,7 @@
 //! These declarations are only referenced under `builtin.os.tag == .windows`
 //! branches, so the unreferenced externs are dropped on other targets.
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 
@@ -49,33 +50,66 @@ extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 
 /// Encrypt `data` with DPAPI (current-user). Caller owns the returned slice.
 pub fn protect(gpa: Allocator, data: []const u8) Error![]u8 {
-    if (data.len == 0) return gpa.dupe(u8, "") catch error.OutOfMemory;
-
-    var in = DATA_BLOB{ .cbData = @intCast(data.len), .pbData = @constCast(data.ptr) };
+    const cb_in = std.math.cast(u32, data.len) orelse return error.ProtectFailed;
+    var empty_byte: u8 = 0;
+    var in = DATA_BLOB{
+        .cbData = cb_in,
+        .pbData = if (data.len == 0) @ptrCast(&empty_byte) else @constCast(data.ptr),
+    };
     var out = DATA_BLOB{ .cbData = 0, .pbData = null };
     if (CryptProtectData(&in, null, null, null, null, CRYPTPROTECT_UI_FORBIDDEN, &out) == 0) {
         return error.ProtectFailed;
     }
-    defer _ = LocalFree(out.pbData);
+    defer if (out.pbData) |p| {
+        const out_len: usize = @intCast(out.cbData);
+        if (out_len > 0) std.crypto.secureZero(u8, p[0..out_len]);
+        _ = LocalFree(p);
+    };
 
     const ptr = out.pbData orelse return error.ProtectFailed;
     const len: usize = @intCast(out.cbData);
+    if (len == 0) return error.ProtectFailed;
     return gpa.dupe(u8, ptr[0..len]) catch error.OutOfMemory;
 }
 
 /// Decrypt a DPAPI blob produced by `protect`. Caller owns the returned slice.
 /// Returns `error.UnprotectFailed` for blobs this user/machine cannot decrypt.
 pub fn unprotect(gpa: Allocator, data: []const u8) Error![]u8 {
-    if (data.len == 0) return gpa.dupe(u8, "") catch error.OutOfMemory;
+    if (data.len == 0) return error.UnprotectFailed;
+    const cb_in = std.math.cast(u32, data.len) orelse return error.UnprotectFailed;
 
-    var in = DATA_BLOB{ .cbData = @intCast(data.len), .pbData = @constCast(data.ptr) };
+    var in = DATA_BLOB{ .cbData = cb_in, .pbData = @constCast(data.ptr) };
     var out = DATA_BLOB{ .cbData = 0, .pbData = null };
     if (CryptUnprotectData(&in, null, null, null, null, CRYPTPROTECT_UI_FORBIDDEN, &out) == 0) {
         return error.UnprotectFailed;
     }
-    defer _ = LocalFree(out.pbData);
+    defer if (out.pbData) |p| {
+        const out_len: usize = @intCast(out.cbData);
+        if (out_len > 0) std.crypto.secureZero(u8, p[0..out_len]);
+        _ = LocalFree(p);
+    };
 
-    const ptr = out.pbData orelse return error.UnprotectFailed;
     const len: usize = @intCast(out.cbData);
+    if (len == 0) return gpa.dupe(u8, "") catch error.OutOfMemory;
+    const ptr = out.pbData orelse return error.UnprotectFailed;
     return gpa.dupe(u8, ptr[0..len]) catch error.OutOfMemory;
+}
+
+test "dpapi unprotect rejects empty input and round-trips on Windows" {
+    if (comptime builtin.os.tag != .windows) return;
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.UnprotectFailed, unprotect(gpa, ""));
+
+    const empty_ct = try protect(gpa, "");
+    defer gpa.free(empty_ct);
+    try std.testing.expect(empty_ct.len > 0);
+    const empty_pt = try unprotect(gpa, empty_ct);
+    defer gpa.free(empty_pt);
+    try std.testing.expectEqualStrings("", empty_pt);
+
+    const ct = try protect(gpa, "dpapi-secret");
+    defer gpa.free(ct);
+    const pt = try unprotect(gpa, ct);
+    defer gpa.free(pt);
+    try std.testing.expectEqualStrings("dpapi-secret", pt);
 }

@@ -21,9 +21,11 @@ const builtin = @import("builtin");
 const keyring_zig = @import("keyring_zig");
 const ado = @import("ado.zig");
 const color = @import("color.zig");
+const credential_provider = @import("credential_provider.zig");
 const gh = @import("gh.zig");
 const keychain = @import("keychain.zig");
 const registry_auth = @import("registry_auth.zig");
+const stored_provider = @import("stored_provider.zig");
 const term = @import("term.zig");
 const wincred = @import("wincred.zig");
 
@@ -68,6 +70,7 @@ const live_secret_store: SecretStore = .{
 var secret_store_override: ?SecretStore = null;
 var copilot_config_dir_override: ?[]const u8 = null;
 var env_override_fn: ?*const fn (name: []const u8) ?[]const u8 = null;
+threadlocal var noninteractive_secret_read: bool = false;
 
 pub fn setTestOverrides(
     store: ?SecretStore,
@@ -85,6 +88,9 @@ fn activeSecretStore() SecretStore {
 
 pub fn isDefaultNativeStoreActive() bool {
     if (secret_store_override != null) return false;
+    if (stored_provider.is_app_backend_disallowed_fn) |disallowed_fn| {
+        if (disallowed_fn()) return false;
+    }
     return switch (builtin.os.tag) {
         .windows => keyring_zig.currentBackend() == .win_credential,
         .macos => keyring_zig.currentBackend() == .keychain,
@@ -222,29 +228,29 @@ fn parseLoginArgs(args: []const []const u8) ?LoginOptions {
     while (i < args.len) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--hostname")) {
-            if (i + 1 >= args.len or args[i + 1].len == 0) return null;
+            if (i + 1 >= args.len or hasForbiddenControlOrSpace(args[i + 1])) return null;
             opts.hostname = args[i + 1];
             i += 2;
         } else if (std.mem.startsWith(u8, arg, "--hostname=")) {
             const val = arg["--hostname=".len..];
-            if (val.len == 0) return null;
+            if (hasForbiddenControlOrSpace(val)) return null;
             opts.hostname = val;
             i += 1;
         } else if (std.mem.eql(u8, arg, "-u") or
             std.mem.eql(u8, arg, "--user") or
             std.mem.eql(u8, arg, "--username"))
         {
-            if (i + 1 >= args.len or args[i + 1].len == 0) return null;
+            if (i + 1 >= args.len or !isValidLoginInput(args[i + 1])) return null;
             opts.username = args[i + 1];
             i += 2;
         } else if (std.mem.startsWith(u8, arg, "--user=")) {
             const val = arg["--user=".len..];
-            if (val.len == 0) return null;
+            if (!isValidLoginInput(val)) return null;
             opts.username = val;
             i += 1;
         } else if (std.mem.startsWith(u8, arg, "--username=")) {
             const val = arg["--username=".len..];
-            if (val.len == 0) return null;
+            if (!isValidLoginInput(val)) return null;
             opts.username = val;
             i += 1;
         } else if (std.mem.eql(u8, arg, "--web")) {
@@ -276,29 +282,29 @@ fn parseLogoutArgs(args: []const []const u8) ?LogoutOptions {
             opts.all = true;
             i += 1;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--hostname")) {
-            if (i + 1 >= args.len or args[i + 1].len == 0) return null;
+            if (i + 1 >= args.len or hasForbiddenControlOrSpace(args[i + 1])) return null;
             opts.hostname = args[i + 1];
             i += 2;
         } else if (std.mem.startsWith(u8, arg, "--hostname=")) {
             const val = arg["--hostname=".len..];
-            if (val.len == 0) return null;
+            if (hasForbiddenControlOrSpace(val)) return null;
             opts.hostname = val;
             i += 1;
         } else if (std.mem.eql(u8, arg, "-u") or
             std.mem.eql(u8, arg, "--user") or
             std.mem.eql(u8, arg, "--username"))
         {
-            if (i + 1 >= args.len or args[i + 1].len == 0) return null;
+            if (i + 1 >= args.len or !isValidLoginInput(args[i + 1])) return null;
             opts.username = args[i + 1];
             i += 2;
         } else if (std.mem.startsWith(u8, arg, "--user=")) {
             const val = arg["--user=".len..];
-            if (val.len == 0) return null;
+            if (!isValidLoginInput(val)) return null;
             opts.username = val;
             i += 1;
         } else if (std.mem.startsWith(u8, arg, "--username=")) {
             const val = arg["--username=".len..];
-            if (val.len == 0) return null;
+            if (!isValidLoginInput(val)) return null;
             opts.username = val;
             i += 1;
         } else {
@@ -315,29 +321,29 @@ fn parseLookupArgs(args: []const []const u8) ?LookupOptions {
     while (i < args.len) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--hostname")) {
-            if (i + 1 >= args.len or args[i + 1].len == 0) return null;
+            if (i + 1 >= args.len or hasForbiddenControlOrSpace(args[i + 1])) return null;
             opts.hostname = args[i + 1];
             i += 2;
         } else if (std.mem.startsWith(u8, arg, "--hostname=")) {
             const val = arg["--hostname=".len..];
-            if (val.len == 0) return null;
+            if (hasForbiddenControlOrSpace(val)) return null;
             opts.hostname = val;
             i += 1;
         } else if (std.mem.eql(u8, arg, "-u") or
             std.mem.eql(u8, arg, "--user") or
             std.mem.eql(u8, arg, "--username"))
         {
-            if (i + 1 >= args.len or args[i + 1].len == 0) return null;
+            if (i + 1 >= args.len or !isValidLoginInput(args[i + 1])) return null;
             opts.username = args[i + 1];
             i += 2;
         } else if (std.mem.startsWith(u8, arg, "--user=")) {
             const val = arg["--user=".len..];
-            if (val.len == 0) return null;
+            if (!isValidLoginInput(val)) return null;
             opts.username = val;
             i += 1;
         } else if (std.mem.startsWith(u8, arg, "--username=")) {
             const val = arg["--username=".len..];
-            if (val.len == 0) return null;
+            if (!isValidLoginInput(val)) return null;
             opts.username = val;
             i += 1;
         } else {
@@ -353,29 +359,29 @@ fn parseEnvArgs(args: []const []const u8) ?EnvOptions {
     while (i < args.len) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--hostname")) {
-            if (i + 1 >= args.len or args[i + 1].len == 0) return null;
+            if (i + 1 >= args.len or hasForbiddenControlOrSpace(args[i + 1])) return null;
             opts.hostname = args[i + 1];
             i += 2;
         } else if (std.mem.startsWith(u8, arg, "--hostname=")) {
             const val = arg["--hostname=".len..];
-            if (val.len == 0) return null;
+            if (hasForbiddenControlOrSpace(val)) return null;
             opts.hostname = val;
             i += 1;
         } else if (std.mem.eql(u8, arg, "-u") or
             std.mem.eql(u8, arg, "--user") or
             std.mem.eql(u8, arg, "--username"))
         {
-            if (i + 1 >= args.len or args[i + 1].len == 0) return null;
+            if (i + 1 >= args.len or !isValidLoginInput(args[i + 1])) return null;
             opts.username = args[i + 1];
             i += 2;
         } else if (std.mem.startsWith(u8, arg, "--user=")) {
             const val = arg["--user=".len..];
-            if (val.len == 0) return null;
+            if (!isValidLoginInput(val)) return null;
             opts.username = val;
             i += 1;
         } else if (std.mem.startsWith(u8, arg, "--username=")) {
             const val = arg["--username=".len..];
-            if (val.len == 0) return null;
+            if (!isValidLoginInput(val)) return null;
             opts.username = val;
             i += 1;
         } else if (std.mem.eql(u8, arg, "--shell")) {
@@ -396,14 +402,38 @@ fn parseEnvArgs(args: []const []const u8) ?EnvOptions {
 // Host / Account Key Normalization & Config Path Resolution
 // ---------------------------------------------------------------------------
 
-pub fn normalizeCopilotHostUrlAlloc(gpa: Allocator, raw_input: []const u8) gh.AuthError![]u8 {
+fn hasForbiddenControlOrSpace(s: []const u8) bool {
+    if (s.len == 0) return true;
+    for (s) |c| {
+        if (c <= 0x20 or c == 0x7f) return true;
+    }
+    return false;
+}
+
+fn isValidLoginInput(login: []const u8) bool {
+    if (hasForbiddenControlOrSpace(login)) return false;
+    if (std.mem.indexOfAny(u8, login, "/:") != null) return false;
+    return true;
+}
+
+fn normalizeValidatedHostnameAlloc(gpa: Allocator, raw_input: []const u8) gh.AuthError![]u8 {
+    if (hasForbiddenControlOrSpace(raw_input)) return error.InvalidHostname;
     const canonical = try gh.normalizeHostnameAlloc(gpa, raw_input);
+    if (hasForbiddenControlOrSpace(canonical)) {
+        gpa.free(canonical);
+        return error.InvalidHostname;
+    }
+    return canonical;
+}
+
+pub fn normalizeCopilotHostUrlAlloc(gpa: Allocator, raw_input: []const u8) gh.AuthError![]u8 {
+    const canonical = try normalizeValidatedHostnameAlloc(gpa, raw_input);
     defer gpa.free(canonical);
     return std.fmt.allocPrint(gpa, "https://{s}", .{canonical});
 }
 
 pub fn extractBareHostAlloc(gpa: Allocator, host_or_url: []const u8) gh.AuthError![]u8 {
-    return gh.normalizeHostnameAlloc(gpa, host_or_url);
+    return normalizeValidatedHostnameAlloc(gpa, host_or_url);
 }
 
 pub fn formatAccountKeyAlloc(gpa: Allocator, https_host: []const u8, login: []const u8) ![]u8 {
@@ -412,14 +442,13 @@ pub fn formatAccountKeyAlloc(gpa: Allocator, https_host: []const u8, login: []co
 
 /// Split `"<https_host>:<login>"` (e.g. `"https://github.com:alice"`).
 pub fn parseAccountKey(key: []const u8) ?AccountSpec {
-    const trimmed = std.mem.trim(u8, key, " \t\r\n");
-    const last_colon = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse return null;
-    if (last_colon == 0 or last_colon + 1 >= trimmed.len) return null;
+    const last_colon = std.mem.lastIndexOfScalar(u8, key, ':') orelse return null;
+    if (last_colon == 0 or last_colon + 1 >= key.len) return null;
 
-    const host_part = trimmed[0..last_colon];
-    const login_part = trimmed[last_colon + 1 ..];
+    const host_part = key[0..last_colon];
+    const login_part = key[last_colon + 1 ..];
 
-    if (std.mem.indexOfAny(u8, login_part, "/ \t\r\n:") != null) return null;
+    if (hasForbiddenControlOrSpace(host_part) or !isValidLoginInput(login_part)) return null;
     if (std.mem.eql(u8, host_part, "https") or std.mem.eql(u8, host_part, "http")) return null;
     if (std.mem.indexOf(u8, host_part, "://")) |scheme_end| {
         if (scheme_end + 3 >= host_part.len) return null;
@@ -598,6 +627,9 @@ fn zeroSnapshotSecrets(snap: *const ParsedConfigSnapshot) void {
     for (snap.plaintext_tokens.values()) |v| {
         std.crypto.secureZero(u8, @constCast(v));
     }
+    for (snap.raw_plaintext_tokens.items) |rt| {
+        std.crypto.secureZero(u8, rt.token);
+    }
 }
 
 fn parseJsoncObjectLeaky(a: Allocator, maybe_bytes: ?[]const u8) Error!std.json.ObjectMap {
@@ -768,8 +800,28 @@ fn windowsAtTargetAlloc(gpa: Allocator, service: []const u8, account: []const u8
     return std.fmt.allocPrint(gpa, "{s}@{s}", .{ account, service });
 }
 
+fn mapProviderPreflightError(err: credential_provider.ProviderError) SecretError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StorageLocked => error.Locked,
+        error.StorageUnavailable, error.AccessDenied => error.NoStorageAccess,
+        else => error.StorageFailure,
+    };
+}
+
+fn preflightLiveSecretBackend(
+    gpa: Allocator,
+    interaction: credential_provider.InteractionPolicy,
+) SecretError!void {
+    stored_provider.checkSecureBackendAvailable(gpa) catch |err| return mapProviderPreflightError(err);
+    const persistence = stored_provider.defaultKeyringPersistence();
+    persistence.checkAvailableFn(persistence.ctx, gpa, .{
+        .interaction = interaction,
+    }) catch |err| return mapProviderPreflightError(err);
+}
+
 fn liveSecretGet(gpa: Allocator, service: []const u8, account: []const u8) SecretError![]u8 {
-    if (keyring_zig.currentBackend() == .null_backend) return error.NoStorageAccess;
+    try preflightLiveSecretBackend(gpa, if (noninteractive_secret_read) .never else .if_available);
 
     if (builtin.os.tag == .windows and keyring_zig.currentBackend() == .win_credential) {
         const target_dot = windowsDotTargetAlloc(gpa, service, account) catch return error.OutOfMemory;
@@ -850,7 +902,7 @@ fn liveSecretGet(gpa: Allocator, service: []const u8, account: []const u8) Secre
 }
 
 fn liveSecretSet(gpa: Allocator, service: []const u8, account: []const u8, value: []const u8) SecretError!void {
-    if (keyring_zig.currentBackend() == .null_backend) return error.NoStorageAccess;
+    try preflightLiveSecretBackend(gpa, .if_available);
 
     if (builtin.os.tag == .windows and keyring_zig.currentBackend() == .win_credential) {
         const target_dot = windowsDotTargetAlloc(gpa, service, account) catch return error.OutOfMemory;
@@ -923,7 +975,7 @@ fn liveSecretSet(gpa: Allocator, service: []const u8, account: []const u8, value
 }
 
 fn liveSecretDelete(gpa: Allocator, service: []const u8, account: []const u8) SecretError!void {
-    if (keyring_zig.currentBackend() == .null_backend) return error.NoStorageAccess;
+    try preflightLiveSecretBackend(gpa, .if_available);
 
     if (builtin.os.tag == .windows and keyring_zig.currentBackend() == .win_credential) {
         var deleted_any = false;
@@ -1160,10 +1212,16 @@ fn macosSecurityDelete(gpa: Allocator, service: []const u8, account: []const u8)
 // Config Model Helpers (`loggedInUsers`, `lastLoggedInUser`, `copilotTokens`)
 // ---------------------------------------------------------------------------
 
+const RawTokenEntry = struct {
+    key: []const u8,
+    token: []u8,
+};
+
 const ParsedConfigSnapshot = struct {
     last_user: ?AccountSpec = null,
     users: std.ArrayListUnmanaged(AccountSpec) = .empty,
     plaintext_tokens: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    raw_plaintext_tokens: std.ArrayListUnmanaged(RawTokenEntry) = .empty,
 };
 
 fn extractAccountObject(val: std.json.Value) ?AccountSpec {
@@ -1171,8 +1229,7 @@ fn extractAccountObject(val: std.json.Value) ?AccountSpec {
     const host_v = val.object.get("host") orelse return null;
     const login_v = val.object.get("login") orelse return null;
     if (host_v != .string or login_v != .string) return null;
-    if (host_v.string.len == 0 or login_v.string.len == 0) return null;
-    if (std.mem.indexOfAny(u8, login_v.string, "/ \t\r\n:\x00") != null) return null;
+    if (hasForbiddenControlOrSpace(host_v.string) or !isValidLoginInput(login_v.string)) return null;
     return .{ .host = host_v.string, .login = login_v.string };
 }
 
@@ -1232,9 +1289,17 @@ fn readConfigSnapshotLeaky(a: Allocator, root: std.json.ObjectMap) !ParsedConfig
                             error.OutOfMemory => return error.OutOfMemory,
                             else => continue,
                         };
+                        try snap.raw_plaintext_tokens.append(a, .{
+                            .key = try a.dupe(u8, entry.key_ptr.*),
+                            .token = try a.dupe(u8, tok),
+                        });
                         const norm_key = try formatAccountKeyAlloc(a, norm_host, parsed.login);
                         const tok_copy = try a.dupe(u8, tok);
-                        try snap.plaintext_tokens.put(a, norm_key, tok_copy);
+                        const gop = try snap.plaintext_tokens.getOrPut(a, norm_key);
+                        if (gop.found_existing) {
+                            std.crypto.secureZero(u8, @constCast(gop.value_ptr.*));
+                        }
+                        gop.value_ptr.* = tok_copy;
                         try appendUniqueAccountLeaky(a, &snap.users, .{ .host = norm_host, .login = parsed.login });
                     }
                 }
@@ -1287,29 +1352,57 @@ fn makeAccountJsonValueLeaky(a: Allocator, host: []const u8, login: []const u8) 
     return .{ .object = obj };
 }
 
+fn findSnapshotPlaintextToken(
+    snap: ParsedConfigSnapshot,
+    https_host: []const u8,
+    login: []const u8,
+    exact_key: []const u8,
+) ?[]const u8 {
+    if (snap.plaintext_tokens.get(exact_key)) |pt| return pt;
+    var matched: ?[]const u8 = null;
+    for (snap.raw_plaintext_tokens.items) |rt| {
+        const parsed = parseAccountKey(rt.key) orelse continue;
+        if (sameHost(parsed.host, https_host) and std.ascii.eqlIgnoreCase(parsed.login, login)) {
+            matched = rt.token;
+        }
+    }
+    return matched;
+}
+
 fn hasMatchingExpectedToken(
-    exp_map: *const std.StringArrayHashMapUnmanaged([]const u8),
+    exp_map: ?*const std.StringArrayHashMapUnmanaged([]const u8),
+    exp_raw: []const RawTokenEntry,
     https_host: []const u8,
     login: []const u8,
     current_token: []const u8,
 ) bool {
-    var it = exp_map.iterator();
-    while (it.next()) |entry| {
-        const parsed = parseAccountKey(entry.key_ptr.*) orelse continue;
+    for (exp_raw) |raw_entry| {
+        const parsed = parseAccountKey(raw_entry.key) orelse continue;
         if (sameHost(parsed.host, https_host) and std.ascii.eqlIgnoreCase(parsed.login, login)) {
-            return std.mem.eql(u8, entry.value_ptr.*, current_token);
+            if (std.mem.eql(u8, raw_entry.token, current_token)) return true;
+        }
+    }
+    if (exp_map) |m| {
+        var it = m.iterator();
+        while (it.next()) |entry| {
+            const parsed = parseAccountKey(entry.key_ptr.*) orelse continue;
+            if (sameHost(parsed.host, https_host) and std.ascii.eqlIgnoreCase(parsed.login, login)) {
+                if (std.mem.eql(u8, entry.value_ptr.*, current_token)) return true;
+            }
         }
     }
     return false;
 }
 
-fn scrubPlaintextAccountFromRoot(
+fn scrubPlaintextFromRoot(
     root: *std.json.ObjectMap,
     https_host: []const u8,
-    login: []const u8,
+    maybe_login: ?[]const u8,
     expected_tokens: ?*const std.StringArrayHashMapUnmanaged([]const u8),
+    expected_raw_tokens: []const RawTokenEntry,
 ) bool {
     var changed = false;
+    const has_expected_filter = expected_tokens != null or expected_raw_tokens.len > 0;
     for ([_][]const u8{ "copilotTokens", "copilot_tokens" }) |field_name| {
         if (root.getPtr(field_name)) |tv| {
             if (tv.* == .object) {
@@ -1317,16 +1410,25 @@ fn scrubPlaintextAccountFromRoot(
                 while (idx < tv.object.count()) {
                     const k = tv.object.keys()[idx];
                     const v = tv.object.values()[idx];
-                    const matches_account = if (parseAccountKey(k)) |parsed|
-                        sameHost(parsed.host, https_host) and std.ascii.eqlIgnoreCase(parsed.login, login)
+                    const parsed_opt = parseAccountKey(k);
+                    const matches_target = if (parsed_opt) |parsed|
+                        sameHost(parsed.host, https_host) and
+                            (if (maybe_login) |login| std.ascii.eqlIgnoreCase(parsed.login, login) else true)
                     else
                         false;
-                    const should_remove = if (!matches_account)
+                    const should_remove = if (!matches_target)
                         false
-                    else if (expected_tokens) |exp_map| blk: {
+                    else if (has_expected_filter) blk: {
                         if (v != .string) break :blk false;
                         const cur_tok = std.mem.trim(u8, v.string, " \t");
-                        break :blk hasMatchingExpectedToken(exp_map, https_host, login, cur_tok);
+                        const check_login = maybe_login orelse parsed_opt.?.login;
+                        break :blk hasMatchingExpectedToken(
+                            expected_tokens,
+                            expected_raw_tokens,
+                            https_host,
+                            check_login,
+                            cur_tok,
+                        );
                     } else true;
 
                     if (should_remove) {
@@ -1349,9 +1451,18 @@ fn scrubPlaintextAccountFromRoot(
     return changed;
 }
 
+fn scrubPlaintextAccountFromRoot(
+    root: *std.json.ObjectMap,
+    https_host: []const u8,
+    login: []const u8,
+    expected_tokens: ?*const std.StringArrayHashMapUnmanaged([]const u8),
+) bool {
+    return scrubPlaintextFromRoot(root, https_host, login, expected_tokens, &.{});
+}
+
 fn sameHost(a_host: []const u8, b_host: []const u8) bool {
-    var scratch_buf_a: [256]u8 = undefined;
-    var scratch_buf_b: [256]u8 = undefined;
+    var scratch_buf_a: [1024]u8 = undefined;
+    var scratch_buf_b: [1024]u8 = undefined;
     var fba_a = std.heap.FixedBufferAllocator.init(&scratch_buf_a);
     var fba_b = std.heap.FixedBufferAllocator.init(&scratch_buf_b);
     const norm_a = normalizeCopilotHostUrlAlloc(fba_a.allocator(), a_host) catch a_host;
@@ -1448,6 +1559,9 @@ fn resolveStoredCredential(
     gpa: Allocator,
     opts: LookupOptions,
 ) Error!ResolvedCredential {
+    if (opts.username) |u| {
+        if (!isValidLoginInput(u)) return error.InvalidInput;
+    }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1564,34 +1678,43 @@ fn resolveStoredCredential(
     // 3. Fall back to stored GitHub CLI (`gh:<host>`) keyring credential ONLY when
     //    the platform's native OS store is active (skipping `GH_TOKEN`, plaintext
     //    `hosts.yml`, synthetic `"x-access-token"`, and classic `ghp_` PATs).
-    if (isDefaultNativeStoreActive()) {
-        const bare_host = try extractBareHostAlloc(a, target_https_host);
-        const lookup_user = if (opts.username) |wanted|
-            resolveCanonicalLogin(snap, target_https_host, wanted)
-        else
-            null;
-        if (gh.lookupStoredKeyringCredential(gpa, bare_host, lookup_user)) |maybe_gh_cred| {
-            if (maybe_gh_cred) |gh_cred| {
-                defer gh_cred.deinit(gpa);
-                if (!gh_cred.from_env and
-                    gh_cred.stored_in_keyring and
-                    !std.mem.eql(u8, gh_cred.username, gh.token_username) and
-                    !std.ascii.eqlIgnoreCase(gh_cred.username, gh.token_username) and
-                    !isClassicPat(gh_cred.token))
-                {
-                    return .{
-                        .https_host = try gpa.dupe(u8, target_https_host),
-                        .login = try gpa.dupe(u8, gh_cred.username),
-                        .token = try gpa.dupe(u8, gh_cred.token),
-                        .from_gh_fallback = true,
-                    };
+    if (isDefaultNativeStoreActive() and !saw_locked and !saw_no_access and !saw_storage_failure) {
+        if (preflightLiveSecretBackend(gpa, if (noninteractive_secret_read) .never else .if_available)) |_| {
+            const bare_host = try extractBareHostAlloc(a, target_https_host);
+            const lookup_user = if (opts.username) |wanted|
+                resolveCanonicalLogin(snap, target_https_host, wanted)
+            else
+                null;
+            if (gh.lookupStoredKeyringCredential(gpa, bare_host, lookup_user)) |maybe_gh_cred| {
+                if (maybe_gh_cred) |gh_cred| {
+                    defer gh_cred.deinit(gpa);
+                    if (!gh_cred.from_env and
+                        gh_cred.stored_in_keyring and
+                        isValidLoginInput(gh_cred.username) and
+                        !std.mem.eql(u8, gh_cred.username, gh.token_username) and
+                        !std.ascii.eqlIgnoreCase(gh_cred.username, gh.token_username) and
+                        !isClassicPat(gh_cred.token))
+                    {
+                        return .{
+                            .https_host = try gpa.dupe(u8, target_https_host),
+                            .login = try gpa.dupe(u8, gh_cred.username),
+                            .token = try gpa.dupe(u8, gh_cred.token),
+                            .from_gh_fallback = true,
+                        };
+                    }
                 }
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Locked => saw_locked = true,
+                error.NoStorageAccess => saw_no_access = true,
+                else => {},
             }
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Locked => saw_locked = true,
             error.NoStorageAccess => saw_no_access = true,
-            else => {},
+            error.StorageFailure => saw_storage_failure = true,
+            error.EntryNotFound => {},
         }
     }
 
@@ -1615,15 +1738,30 @@ fn resolveStoredCredential(
     return error.EntryNotFound;
 }
 
+fn writeInvalidHostStderr(stderr: *Io.Writer, subcmd_label: []const u8, raw_host: []const u8) !void {
+    if (hasForbiddenControlOrSpace(raw_host)) {
+        try stderr.print("keyring: copilot {s}: invalid hostname\n", .{subcmd_label});
+    } else {
+        try stderr.print("keyring: copilot {s}: invalid hostname '{s}'\n", .{ subcmd_label, raw_host });
+    }
+    try stderr.flush();
+}
+
 fn runLogin(
     gpa: Allocator,
     opts: LoginOptions,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
 ) !u8 {
-    const canonical_host = gh.normalizeHostnameAlloc(gpa, opts.hostname) catch {
-        try stderr.print("keyring: copilot login: invalid hostname '{s}'\n", .{opts.hostname});
-        try stderr.flush();
+    if (opts.username) |u| {
+        if (!isValidLoginInput(u)) {
+            try stderr.writeAll("keyring: copilot login: invalid username\n");
+            try stderr.flush();
+            return 2;
+        }
+    }
+    const canonical_host = extractBareHostAlloc(gpa, opts.hostname) catch {
+        try writeInvalidHostStderr(stderr, "login", opts.hostname);
         return 2;
     };
     defer gpa.free(canonical_host);
@@ -1638,10 +1776,15 @@ fn runLogin(
     };
     defer gpa.free(config_dir);
 
-    if (secret_store_override == null and keyring_zig.currentBackend() == .null_backend) {
-        try stderr.writeAll("keyring: copilot login: no access to OS keyring (run 'keyring diagnose' for guidance)\n");
-        try stderr.flush();
-        return 4;
+    if (secret_store_override == null) {
+        stored_provider.checkSecureBackendAvailable(gpa) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try stderr.writeAll("keyring: copilot login: no access to OS keyring (run 'keyring diagnose' for guidance)\n");
+                try stderr.flush();
+                return 4;
+            },
+        };
     }
 
     var resolved_user: ?[]u8 = null;
@@ -1734,6 +1877,11 @@ fn runLogin(
         };
         defer cred.deinit(gpa);
 
+        if (!isValidLoginInput(cred.username)) {
+            try stderr.writeAll("keyring: copilot login: authenticated login contains invalid characters\n");
+            try stderr.flush();
+            return 1;
+        }
         if (opts.username) |wanted| {
             if (!std.ascii.eqlIgnoreCase(wanted, cred.username)) {
                 try stderr.print(
@@ -1839,6 +1987,8 @@ fn applyLogoutConfigMutation(a: Allocator, root: *std.json.ObjectMap, ctx: Logou
 
     if (target_user) |tu| {
         if (scrubPlaintextAccountFromRoot(root, target_host, tu, null)) changed = true;
+    } else {
+        if (scrubPlaintextFromRoot(root, target_host, null, null, &.{})) changed = true;
     }
 
     if (changed) {
@@ -1909,18 +2059,29 @@ fn runLogout(
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
+    if (opts.username) |u| {
+        if (!isValidLoginInput(u)) {
+            try stderr.writeAll("keyring: copilot logout: invalid username\n");
+            try stderr.flush();
+            return 2;
+        }
+    }
     const maybe_https_host: ?[]const u8 = if (opts.hostname) |raw_h| blk: {
         break :blk normalizeCopilotHostUrlAlloc(a, raw_h) catch {
-            try stderr.print("keyring: copilot logout: invalid hostname '{s}'\n", .{raw_h});
-            try stderr.flush();
+            try writeInvalidHostStderr(stderr, "logout", raw_h);
             return 2;
         };
     } else null;
 
-    if (secret_store_override == null and keyring_zig.currentBackend() == .null_backend) {
-        try stderr.writeAll("keyring: copilot logout: no access to OS keyring (run 'keyring diagnose' for guidance)\n");
-        try stderr.flush();
-        return 4;
+    if (secret_store_override == null) {
+        stored_provider.checkSecureBackendAvailable(gpa) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try stderr.writeAll("keyring: copilot logout: no access to OS keyring (run 'keyring diagnose' for guidance)\n");
+                try stderr.flush();
+                return 4;
+            },
+        };
     }
 
     var snap: ParsedConfigSnapshot = .{};
@@ -2030,14 +2191,24 @@ fn runToken(
     stdout: *Io.Writer,
     stderr: *Io.Writer,
 ) !u8 {
-    if (opts.hostname) |raw_h| {
-        const check = gh.normalizeHostnameAlloc(gpa, raw_h) catch {
-            try stderr.print("keyring: copilot token: invalid hostname '{s}'\n", .{raw_h});
+    if (opts.username) |u| {
+        if (!isValidLoginInput(u)) {
+            try stderr.writeAll("keyring: copilot token: invalid username\n");
             try stderr.flush();
+            return 2;
+        }
+    }
+    if (opts.hostname) |raw_h| {
+        const check = extractBareHostAlloc(gpa, raw_h) catch {
+            try writeInvalidHostStderr(stderr, "token", raw_h);
             return 2;
         };
         gpa.free(check);
     }
+
+    const prev_ni = noninteractive_secret_read;
+    noninteractive_secret_read = true;
+    defer noninteractive_secret_read = prev_ni;
 
     const cred = resolveStoredCredential(gpa, opts) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -2147,14 +2318,24 @@ fn runEnv(
     stdout: *Io.Writer,
     stderr: *Io.Writer,
 ) !u8 {
-    if (opts.hostname) |raw_h| {
-        const check = gh.normalizeHostnameAlloc(gpa, raw_h) catch {
-            try stderr.print("keyring: copilot env: invalid hostname '{s}'\n", .{raw_h});
+    if (opts.username) |u| {
+        if (!isValidLoginInput(u)) {
+            try stderr.writeAll("keyring: copilot env: invalid username\n");
             try stderr.flush();
+            return 2;
+        }
+    }
+    if (opts.hostname) |raw_h| {
+        const check = extractBareHostAlloc(gpa, raw_h) catch {
+            try writeInvalidHostStderr(stderr, "env", raw_h);
             return 2;
         };
         gpa.free(check);
     }
+
+    const prev_ni = noninteractive_secret_read;
+    noninteractive_secret_read = true;
+    defer noninteractive_secret_read = prev_ni;
 
     const cred = resolveStoredCredential(gpa, .{
         .hostname = opts.hostname,
@@ -2207,6 +2388,7 @@ const ImportMergeCtx = struct {
     accounts: []const AccountSpec,
     last_user: ?AccountSpec,
     expected_tokens: ?*const std.StringArrayHashMapUnmanaged([]const u8) = null,
+    expected_raw_tokens: []const RawTokenEntry = &.{},
 };
 
 fn applyImportMergeMutation(a: Allocator, root: *std.json.ObjectMap, ctx: ImportMergeCtx) Error!bool {
@@ -2222,7 +2404,9 @@ fn applyImportMergeMutation(a: Allocator, root: *std.json.ObjectMap, ctx: Import
         const before = merged.items.len;
         appendUniqueAccountLeaky(a, &merged, inc) catch return error.OutOfMemory;
         if (merged.items.len > before) changed = true;
-        if (scrubPlaintextAccountFromRoot(root, inc.host, inc.login, ctx.expected_tokens)) changed = true;
+        if (scrubPlaintextFromRoot(root, inc.host, inc.login, ctx.expected_tokens, ctx.expected_raw_tokens)) {
+            changed = true;
+        }
     }
 
     var arr = std.json.Array.init(a);
@@ -2326,8 +2510,10 @@ fn runImport(
         const key = entry.key_ptr.*;
         const tok = entry.value_ptr.*;
         const spec = parseAccountKey(key) orelse continue;
+        const canonical_login = resolveCanonicalLogin(snap, spec.host, spec.login);
+        const canonical_key = try formatAccountKeyAlloc(a, spec.host, canonical_login);
 
-        store.set(a, service_name, key, tok) catch |err| return switch (err) {
+        store.set(a, service_name, canonical_key, tok) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.Locked => blk: {
                 try stderr.writeAll("keyring: copilot import: OS keyring is locked (run 'keyring unlock' first)\n");
@@ -2346,13 +2532,14 @@ fn runImport(
             },
         };
 
-        try appendUniqueAccountLeaky(a, &imported_specs, spec);
+        try appendUniqueAccountLeaky(a, &imported_specs, .{ .host = spec.host, .login = canonical_login });
     }
 
     _ = mutateConfigFileWithCas(a, local_config_path, ImportMergeCtx{
         .accounts = imported_specs.items,
         .last_user = snap.last_user,
         .expected_tokens = if (source == null) &snap.plaintext_tokens else null,
+        .expected_raw_tokens = if (source == null) snap.raw_plaintext_tokens.items else &.{},
     }, applyImportMergeMutation) catch {
         try stderr.print("keyring: copilot import: failed to update {s}\n", .{local_config_path});
         try stderr.flush();
@@ -2409,6 +2596,7 @@ fn runExport(
 
     const store = activeSecretStore();
     var exported_users = std.json.Array.init(a);
+    var exported_specs: std.ArrayListUnmanaged(AccountSpec) = .empty;
     var tokens_obj: std.json.ObjectMap = .empty;
     defer {
         for (tokens_obj.values()) |v| {
@@ -2432,16 +2620,17 @@ fn runExport(
         }
 
         if (tok_owned == null) {
-            if (snap.plaintext_tokens.get(key)) |pt| {
+            if (findSnapshotPlaintextToken(snap, u.host, u.login, key)) |pt| {
                 tok_owned = try a.dupe(u8, pt);
             }
         }
-        if (tok_owned == null and isDefaultNativeStoreActive()) {
+        if (tok_owned == null and isDefaultNativeStoreActive() and !saw_locked and !saw_no_access) {
             if (extractBareHostAlloc(a, u.host) catch null) |bare| {
                 if (gh.lookupStoredKeyringCredential(a, bare, u.login) catch null) |gh_cred| {
                     defer gh_cred.deinit(a);
                     if (!gh_cred.from_env and
                         gh_cred.stored_in_keyring and
+                        isValidLoginInput(gh_cred.username) and
                         !std.mem.eql(u8, gh_cred.username, gh.token_username) and
                         !std.ascii.eqlIgnoreCase(gh_cred.username, gh.token_username) and
                         !isClassicPat(gh_cred.token))
@@ -2454,6 +2643,7 @@ fn runExport(
 
         if (tok_owned) |tok| {
             try exported_users.append(try makeAccountJsonValueLeaky(a, u.host, u.login));
+            try exported_specs.append(a, .{ .host = u.host, .login = u.login });
             try tokens_obj.put(a, key, .{ .string = tok });
             exported_count += 1;
         }
@@ -2477,8 +2667,17 @@ fn runExport(
 
     var out_root: std.json.ObjectMap = .empty;
     try out_root.put(a, "loggedInUsers", .{ .array = exported_users });
+    var active_exported: ?AccountSpec = null;
     if (snap.last_user) |lu| {
-        try out_root.put(a, "lastLoggedInUser", try makeAccountJsonValueLeaky(a, lu.host, lu.login));
+        for (exported_specs.items) |eu| {
+            if (sameHost(lu.host, eu.host) and std.ascii.eqlIgnoreCase(lu.login, eu.login)) {
+                active_exported = eu;
+                break;
+            }
+        }
+    }
+    if (active_exported) |eu| {
+        try out_root.put(a, "lastLoggedInUser", try makeAccountJsonValueLeaky(a, eu.host, eu.login));
     } else if (exported_users.items.len > 0) {
         try out_root.put(a, "lastLoggedInUser", exported_users.items[0]);
     }
@@ -2520,6 +2719,10 @@ fn runStatus(
     stdout: *Io.Writer,
     stderr: *Io.Writer,
 ) !u8 {
+    const prev_ni = noninteractive_secret_read;
+    noninteractive_secret_read = true;
+    defer noninteractive_secret_read = prev_ni;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2569,6 +2772,7 @@ fn runStatus(
         const prefix = if (is_active) "* " else "  ";
         const key = try formatAccountKeyAlloc(a, u.host, u.login);
 
+        const has_pt = findSnapshotPlaintextToken(snap, u.host, u.login, key) != null;
         var status_label: []const u8 = "missing";
         if (store.get(a, service_name, key)) |tok| {
             const classic = isClassicPat(tok);
@@ -2577,13 +2781,13 @@ fn runStatus(
         } else |err| switch (err) {
             error.Locked => status_label = "keyring locked",
             error.NoStorageAccess => {
-                status_label = if (snap.plaintext_tokens.contains(key))
+                status_label = if (has_pt)
                     "stored in plaintext config.json (keyring unavailable)"
                 else
                     "keyring unavailable";
             },
             else => {
-                if (snap.plaintext_tokens.contains(key)) {
+                if (has_pt) {
                     status_label = "stored in plaintext config.json";
                 } else if (isDefaultNativeStoreActive()) {
                     if (extractBareHostAlloc(a, u.host) catch null) |bare| {
@@ -2591,6 +2795,7 @@ fn runStatus(
                             defer gh_cred.deinit(a);
                             if (!gh_cred.from_env and
                                 gh_cred.stored_in_keyring and
+                                isValidLoginInput(gh_cred.username) and
                                 !std.mem.eql(u8, gh_cred.username, gh.token_username) and
                                 !std.ascii.eqlIgnoreCase(gh_cred.username, gh.token_username) and
                                 !isClassicPat(gh_cred.token))
@@ -2611,6 +2816,10 @@ fn runStatus(
 }
 
 pub fn diagnose(gpa: Allocator, stdout: *Io.Writer) !void {
+    const prev_ni = noninteractive_secret_read;
+    noninteractive_secret_read = true;
+    defer noninteractive_secret_read = prev_ni;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2637,7 +2846,7 @@ pub fn diagnose(gpa: Allocator, stdout: *Io.Writer) !void {
             std.crypto.secureZero(u8, tok);
             in_keyring += 1;
         } else |_| {}
-        if (snap.plaintext_tokens.contains(key)) {
+        if (findSnapshotPlaintextToken(snap, u.host, u.login, key) != null) {
             in_plaintext += 1;
         }
     }
@@ -3327,6 +3536,218 @@ test "first-time login, login -f, token, and env without config.json surface Loc
     for ([_]Subcommand{
         .{ .login = .{} },
         .{ .login = .{ .force = true } },
+        .{ .token = .{} },
+        .{ .env = .{ .shell = .sh } },
+    }) |subcmd| {
+        out.clearRetainingCapacity();
+        err_out.clearRetainingCapacity();
+        try std.testing.expectEqual(@as(u8, 4), try run(gpa, subcmd, &empty_in, &out.writer, &err_out.writer));
+    }
+}
+
+test "NUL and control bytes are rejected in account keys, config objects, and CLI flags" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try std.testing.expect(parseAccountKey("https://github.com\x00:alice") == null);
+    try std.testing.expect(parseAccountKey("https://github.com:alice\x00evil") == null);
+    try std.testing.expect(parseAccountKey("https://github.com\x1b[2J:alice") == null);
+    try std.testing.expect(parseAccountKey("https://github.com:alice\x7f") == null);
+    try std.testing.expect(parseAccountKey("https://github.com :alice") == null);
+    try std.testing.expect(parseAccountKey("https://github.com: alice") == null);
+
+    try std.testing.expect(parseArgs(&.{ "login", "-u", "alice\x00evil" }) == null);
+    try std.testing.expect(parseArgs(&.{ "login", "-h", "github.com\x00evil" }) == null);
+    try std.testing.expect(parseArgs(&.{ "token", "-u", "alice\x1b" }) == null);
+    try std.testing.expect(parseArgs(&.{ "logout", "--user=alice\x7f" }) == null);
+    try std.testing.expect(parseArgs(&.{ "env", "--hostname=github.com\n" }) == null);
+
+    // Direct Subcommand structs with control bytes also fail closed with exit 2 without echoing control bytes.
+    var empty_in = Io.Reader.fixed("");
+    var out = Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    var err_out = Io.Writer.Allocating.init(gpa);
+    defer err_out.deinit();
+
+    try std.testing.expectEqual(
+        @as(u8, 2),
+        try run(gpa, .{ .token = .{ .username = "alice\x00evil" } }, &empty_in, &out.writer, &err_out.writer),
+    );
+    try std.testing.expectEqual(
+        @as(u8, 2),
+        try run(gpa, .{ .token = .{ .hostname = "github.com\x1b[31m" } }, &empty_in, &out.writer, &err_out.writer),
+    );
+    try std.testing.expect(std.mem.indexOfScalar(u8, err_out.written(), 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, err_out.written(), 0x00) == null);
+
+    // Malicious JSON config entries containing \u0000 / \u001b / \u007f are skipped and never emitted by status/diagnose.
+    const malicious_json =
+        \\{
+        \\  "loggedInUsers": [
+        \\    { "host": "https://github.com\u0000evil", "login": "alice" },
+        \\    { "host": "https://github.com", "login": "bob\u001b[2J" },
+        \\    { "host": "https://github.com", "login": "carol\u007f" },
+        \\    { "host": "https://github.com", "login": "gooduser" }
+        \\  ],
+        \\  "lastLoggedInUser": { "host": "https://github.com", "login": "bad\u0000user" }
+        \\}
+    ;
+    const root = try parseJsoncObjectLeaky(a, malicious_json);
+    const snap = try readConfigSnapshotLeaky(a, root);
+    defer zeroSnapshotSecrets(&snap);
+    try std.testing.expect(snap.last_user == null);
+    try std.testing.expectEqual(@as(usize, 1), snap.users.items.len);
+    try std.testing.expectEqualStrings("gooduser", snap.users.items[0].login);
+}
+
+test "import scrubs all case and host duplicate copilotTokens, export validates lastLoggedInUser, and host logout scrubs copilotTokens" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try testTmpDirPath(&tmp, gpa);
+    defer gpa.free(root_path);
+    const copilot_dir = try std.fs.path.join(gpa, &.{ root_path, "copilot-home" });
+    defer gpa.free(copilot_dir);
+    const export_dir = try std.fs.path.join(gpa, &.{ root_path, "exported" });
+    defer gpa.free(export_dir);
+    const config_path = try std.fs.path.join(gpa, &.{ copilot_dir, config_filename });
+    defer gpa.free(config_path);
+
+    MockStoreState.reset(gpa);
+    defer MockStoreState.deinit();
+    setTestOverrides(MockStoreState.store, copilot_dir, testNoColorEnv);
+    defer setTestOverrides(null, null, null);
+
+    // 1. Case & host-alias duplicate copilotTokens entries (both copilotTokens and copilot_tokens) are all scrubbed on import!
+    const multi_variant_json =
+        \\{
+        \\  "loggedInUsers": [
+        \\    { "host": "https://github.com", "login": "Alice" },
+        \\    { "host": "https://github.com", "login": "ghost" }
+        \\  ],
+        \\  "lastLoggedInUser": { "host": "https://github.com", "login": "ghost" },
+        \\  "copilotTokens": {
+        \\    "https://github.com:Alice": "gho_variant_1",
+        \\    "https://GITHUB.COM:alice": "gho_variant_2",
+        \\    "github.com:alice": "gho_variant_3"
+        \\  },
+        \\  "copilot_tokens": {
+        \\    "https://api.github.com:ALICE": "gho_variant_4"
+        \\  }
+        \\}
+    ;
+    try registry_auth.writeProtectedFileAtomic(gpa, config_path, multi_variant_json);
+
+    var empty_in = Io.Reader.fixed("");
+    var out = Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    var err_out = Io.Writer.Allocating.init(gpa);
+    defer err_out.deinit();
+
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        try run(gpa, .{ .import_cmd = .{ .source = null } }, &empty_in, &out.writer, &err_out.writer),
+    );
+
+    const scrubbed = (try registry_auth.readFileIfExists(gpa, config_path)).?;
+    defer gpa.free(scrubbed);
+    for ([_][]const u8{ "gho_variant_1", "gho_variant_2", "gho_variant_3", "gho_variant_4", "copilotTokens", "copilot_tokens" }) |secret_frag| {
+        try std.testing.expect(std.mem.indexOf(u8, scrubbed, secret_frag) == null);
+    }
+
+    // 2. `export` falls back to exported_users[0] ("Alice") when `lastLoggedInUser` ("ghost") has no token!
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        try run(gpa, .{ .export_cmd = .{ .dir = export_dir } }, &empty_in, &out.writer, &err_out.writer),
+    );
+    const exported_cfg_path = try std.fs.path.join(gpa, &.{ export_dir, config_filename });
+    defer gpa.free(exported_cfg_path);
+    const exported_bytes = (try registry_auth.readFileIfExists(gpa, exported_cfg_path)).?;
+    defer gpa.free(exported_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, exported_bytes, "\"ghost\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, exported_bytes, "\"login\": \"Alice\"") != null);
+
+    // 3. Long RFC-1035 hostname (~240 chars) works cleanly in `sameHost`.
+    const seg_a = &@as([60]u8, @splat('a'));
+    const seg_b = &@as([60]u8, @splat('b'));
+    const seg_c = &@as([60]u8, @splat('c'));
+    const seg_ua = &@as([60]u8, @splat('A'));
+    const seg_ub = &@as([60]u8, @splat('B'));
+    const seg_uc = &@as([60]u8, @splat('C'));
+    const long_host_a = "https://" ++ seg_a ++ "." ++ seg_b ++ "." ++ seg_c ++ ".ghe.com";
+    const long_host_b = "HTTPS://api." ++ seg_ua ++ "." ++ seg_ub ++ "." ++ seg_uc ++ ".ghe.com/";
+    try std.testing.expect(sameHost(long_host_a, long_host_b));
+
+    // 4. Host-wide logout (`logout -h tenant.ghe.com`, `target_user == null`) scrubs all matching `copilotTokens` entries!
+    const host_logout_json =
+        \\{
+        \\  "loggedInUsers": [
+        \\    { "host": "https://github.com", "login": "Alice" }
+        \\  ],
+        \\  "copilotTokens": {
+        \\    "https://tenant.ghe.com:orphan": "   ",
+        \\    "https://TENANT.ghe.com:second": "gho_ghe_tok",
+        \\    "https://github.com:Alice": "gho_keep_dotcom"
+        \\  }
+        \\}
+    ;
+    try registry_auth.writeProtectedFileAtomic(gpa, config_path, host_logout_json);
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        try run(gpa, .{ .logout = .{ .hostname = "tenant.ghe.com" } }, &empty_in, &out.writer, &err_out.writer),
+    );
+    const after_host_logout = (try registry_auth.readFileIfExists(gpa, config_path)).?;
+    defer gpa.free(after_host_logout);
+    try std.testing.expect(std.mem.indexOf(u8, after_host_logout, "tenant.ghe.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after_host_logout, "TENANT.ghe.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after_host_logout, "gho_keep_dotcom") != null);
+}
+
+test "unconfigured file backend fails closed with exit 4 before interactive OAuth" {
+    if (!@hasField(keyring_zig.Backend, "file")) return;
+    const gpa = std.testing.allocator;
+
+    const prev_backend = keyring_zig.currentBackend();
+    defer keyring_zig.setDefaultBackend(prev_backend) catch {};
+    const prev_env = stored_provider.env_override_fn;
+    defer stored_provider.env_override_fn = prev_env;
+    const prev_disallowed = stored_provider.is_app_backend_disallowed_fn;
+    defer stored_provider.is_app_backend_disallowed_fn = prev_disallowed;
+
+    const EmptyEnv = struct {
+        fn get(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    stored_provider.env_override_fn = EmptyEnv.get;
+    stored_provider.is_app_backend_disallowed_fn = null;
+    try keyring_zig.setDefaultBackend(.file);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try testTmpDirPath(&tmp, gpa);
+    defer gpa.free(root_path);
+    const copilot_dir = try std.fs.path.join(gpa, &.{ root_path, "copilot-home" });
+    defer gpa.free(copilot_dir);
+
+    setTestOverrides(null, copilot_dir, testNoColorEnv);
+    defer setTestOverrides(null, null, null);
+
+    var empty_in = Io.Reader.fixed("");
+    var out = Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    var err_out = Io.Writer.Allocating.init(gpa);
+    defer err_out.deinit();
+
+    for ([_]Subcommand{
+        .{ .login = .{} },
+        .{ .login = .{ .force = true } },
+        .{ .logout = .{ .all = true } },
         .{ .token = .{} },
         .{ .env = .{ .shell = .sh } },
     }) |subcmd| {

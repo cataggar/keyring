@@ -664,6 +664,70 @@ fn ensureCredHelpersObject(a: Allocator, root: *std.json.ObjectMap) Error!*std.j
     return &root.getPtr("credHelpers").?.object;
 }
 
+fn zeroAuthEntrySecrets(entry_val: std.json.Value) void {
+    if (entry_val != .object) return;
+    for ([_][]const u8{ "auth", "identitytoken", "password", "registrytoken" }) |secret_key| {
+        if (entry_val.object.get(secret_key)) |sv| {
+            if (sv == .string) {
+                std.crypto.secureZero(u8, @constCast(sv.string));
+            }
+        }
+    }
+}
+
+fn zeroAuthJsonSecrets(root: *const std.json.ObjectMap) void {
+    if (root.get("auths")) |auths_val| {
+        if (auths_val == .object) {
+            for (auths_val.object.values()) |entry_val| {
+                zeroAuthEntrySecrets(entry_val);
+            }
+        }
+    }
+}
+
+fn isBareOrLegacyUrlKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, key, '/') == null) return true;
+    const after_scheme = if (std.ascii.startsWithIgnoreCase(key, "https://"))
+        key["https://".len..]
+    else if (std.ascii.startsWithIgnoreCase(key, "http://"))
+        key["http://".len..]
+    else
+        return false;
+    if (after_scheme.len == 0) return false;
+    const slash_idx = std.mem.indexOfScalar(u8, after_scheme, '/') orelse return true;
+    if (slash_idx == 0) return false;
+    const tail = after_scheme[slash_idx..];
+    return std.mem.eql(u8, tail, "/") or
+        std.ascii.eqlIgnoreCase(tail, "/v1") or
+        std.ascii.eqlIgnoreCase(tail, "/v1/") or
+        std.ascii.eqlIgnoreCase(tail, "/v2") or
+        std.ascii.eqlIgnoreCase(tail, "/v2/");
+}
+
+fn keyMatchesBareServer(a: Allocator, key: []const u8, bare_srv: []const u8) bool {
+    if (std.mem.eql(u8, key, bare_srv)) return true;
+    if (!isBareOrLegacyUrlKey(key)) return false;
+    const norm = registry_auth.normalizeServerAlloc(a, key, .bare_docker_io) catch return false;
+    return std.mem.eql(u8, norm, bare_srv);
+}
+
+fn scrubMatchingAuthsFromObject(a: Allocator, auths_obj: *std.json.ObjectMap, bare_srv: []const u8) bool {
+    var removed = false;
+    var idx: usize = 0;
+    while (idx < auths_obj.count()) {
+        const k = auths_obj.keys()[idx];
+        if (keyMatchesBareServer(a, k, bare_srv)) {
+            zeroAuthEntrySecrets(auths_obj.values()[idx]);
+            _ = auths_obj.orderedRemoveAt(idx);
+            removed = true;
+        } else {
+            idx += 1;
+        }
+    }
+    return removed;
+}
+
 fn mutateAuthFileWithCas(
     gpa: Allocator,
     auth_path: []const u8,
@@ -686,6 +750,7 @@ fn mutateAuthFileWithCas(
         const initial_hash = sha256Bytes(initial_bytes);
 
         var root = try parseAuthJsonRootLeaky(a, initial_bytes);
+        defer zeroAuthJsonSecrets(&root);
         const changed = try mutateFn(a, &root, ctx);
         if (!changed and initial_bytes != null) {
             return false;
@@ -740,7 +805,7 @@ fn applyLoginMutation(a: Allocator, root: *std.json.ObjectMap, ctx: ApplyLoginCt
                 ch_obj.put(a, try a.dupe(u8, rec.server), .{ .string = try a.dupe(u8, helper_value) }) catch return error.OutOfMemory;
             },
             .helper_only => {
-                _ = auths_obj.orderedRemove(rec.server);
+                _ = scrubMatchingAuthsFromObject(a, auths_obj, rec.server);
                 const ch_obj = try ensureCredHelpersObject(a, root);
                 ch_obj.put(a, try a.dupe(u8, rec.server), .{ .string = try a.dupe(u8, helper_value) }) catch return error.OutOfMemory;
             },
@@ -773,6 +838,7 @@ fn putAuthsEntryPreservingFields(
 ) Error!void {
     if (auths_obj.getPtr(server)) |existing| {
         if (existing.* == .object) {
+            zeroAuthEntrySecrets(existing.*);
             existing.object.put(a, "auth", .{ .string = encoded_auth }) catch return error.OutOfMemory;
             _ = existing.object.orderedRemove("identitytoken");
             return;
@@ -808,11 +874,47 @@ fn removeHelpersForAuthsOnlyMutation(_: Allocator, root: *std.json.ObjectMap, ct
     return any_changed;
 }
 
+fn checkExternalHelperConflictInFile(
+    gpa: Allocator,
+    auth_path: []const u8,
+    servers: []const []const u8,
+    force: bool,
+) Error!void {
+    if (force) return;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const bytes = (registry_auth.readFileIfExists(a, auth_path) catch |err| return mapRegistryAuthError(err)) orelse return;
+    defer std.crypto.secureZero(u8, bytes);
+    if (bytes.len == 0) return;
+
+    const root = try parseAuthJsonRootLeaky(a, bytes);
+    defer zeroAuthJsonSecrets(&root);
+    if (root.get("credHelpers")) |ch_val| {
+        if (ch_val != .object) return error.StorageFailure;
+        for (servers) |srv| {
+            if (ch_val.object.get(srv)) |existing_helper| {
+                if (existing_helper == .string and !std.mem.eql(u8, existing_helper.string, helper_value)) {
+                    return error.ExternalHelperConflict;
+                }
+            }
+        }
+    }
+}
+
 const ApplyConfigCtx = struct {
     servers: []const []const u8,
+    scrub_auths: bool = false,
 };
 
 fn applyConfigMutation(a: Allocator, root: *std.json.ObjectMap, ctx: ApplyConfigCtx) Error!bool {
+    if (ctx.scrub_auths) {
+        const auths_obj = &root.getPtr("auths").?.object;
+        for (ctx.servers) |srv| {
+            _ = scrubMatchingAuthsFromObject(a, auths_obj, srv);
+        }
+    }
     const ch_obj = try ensureCredHelpersObject(a, root);
     for (ctx.servers) |srv| {
         ch_obj.put(a, try a.dupe(u8, srv), .{ .string = try a.dupe(u8, helper_value) }) catch return error.OutOfMemory;
@@ -827,7 +929,10 @@ const ApplyLogoutCtx = struct {
     gpa: Allocator,
 };
 
-fn applyLogoutMutation(_: Allocator, root: *std.json.ObjectMap, ctx: ApplyLogoutCtx) Error!bool {
+fn applyLogoutMutation(a: Allocator, root: *std.json.ObjectMap, ctx: ApplyLogoutCtx) Error!bool {
+    for (ctx.removed_servers.items) |s| ctx.gpa.free(s);
+    ctx.removed_servers.clearRetainingCapacity();
+
     var any_removed = false;
     const auths_obj = &root.getPtr("auths").?.object;
 
@@ -836,12 +941,19 @@ fn applyLogoutMutation(_: Allocator, root: *std.json.ObjectMap, ctx: ApplyLogout
         defer auth_keys.deinit(ctx.gpa);
         var it = auths_obj.iterator();
         while (it.next()) |kv| {
-            if (std.mem.indexOfScalar(u8, kv.key_ptr.*, '/') == null) {
+            if (isBareOrLegacyUrlKey(kv.key_ptr.*)) {
                 auth_keys.append(ctx.gpa, kv.key_ptr.*) catch return error.OutOfMemory;
             }
         }
         for (auth_keys.items) |k| {
-            try recordRemovedUnique(ctx.gpa, ctx.removed_servers, k);
+            if (registry_auth.normalizeServerAlloc(a, k, .bare_docker_io) catch null) |norm| {
+                try recordRemovedUnique(ctx.gpa, ctx.removed_servers, norm);
+            } else if (std.mem.indexOfScalar(u8, k, '/') == null) {
+                try recordRemovedUnique(ctx.gpa, ctx.removed_servers, k);
+            } else {
+                continue;
+            }
+            if (auths_obj.get(k)) |ev| zeroAuthEntrySecrets(ev);
             _ = auths_obj.orderedRemove(k);
             any_removed = true;
         }
@@ -857,7 +969,8 @@ fn applyLogoutMutation(_: Allocator, root: *std.json.ObjectMap, ctx: ApplyLogout
                     }
                 }
                 for (ch_keys.items) |k| {
-                    try recordRemovedUnique(ctx.gpa, ctx.removed_servers, k);
+                    const rec_name = registry_auth.normalizeServerAlloc(a, k, .bare_docker_io) catch k;
+                    try recordRemovedUnique(ctx.gpa, ctx.removed_servers, rec_name);
                     _ = ch_val.object.orderedRemove(k);
                     any_removed = true;
                 }
@@ -868,15 +981,20 @@ fn applyLogoutMutation(_: Allocator, root: *std.json.ObjectMap, ctx: ApplyLogout
 
     for (ctx.servers) |srv| {
         var srv_removed = false;
-        if (auths_obj.orderedRemove(srv)) {
+        if (scrubMatchingAuthsFromObject(a, auths_obj, srv)) {
             srv_removed = true;
         }
         if (root.getPtr("credHelpers")) |ch_val| {
             if (ch_val.* == .object) {
-                if (ch_val.object.get(srv)) |v| {
-                    if (v == .string and std.mem.eql(u8, v.string, helper_value)) {
-                        _ = ch_val.object.orderedRemove(srv);
+                var idx: usize = 0;
+                while (idx < ch_val.object.count()) {
+                    const k = ch_val.object.keys()[idx];
+                    const v = ch_val.object.values()[idx];
+                    if (v == .string and std.mem.eql(u8, v.string, helper_value) and keyMatchesBareServer(a, k, srv)) {
+                        _ = ch_val.object.orderedRemoveAt(idx);
                         srv_removed = true;
+                    } else {
+                        idx += 1;
                     }
                 }
             }
@@ -939,6 +1057,44 @@ fn isDirInPathEnv(path_env: []const u8, candidate_dir: []const u8) bool {
     return false;
 }
 
+fn isExecutableRegularFile(path: []const u8) bool {
+    const io = Io.Threaded.global_single_threaded.io();
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    if (st.kind != .file) return false;
+    if (comptime (builtin.os.tag != .windows and builtin.os.tag != .wasi)) {
+        if (effectiveOsTag() != .windows) {
+            return (st.permissions.toMode() & 0o111) != 0;
+        }
+    }
+    return true;
+}
+
+fn ensureExecutablePermissions(io: Io, path: []const u8) bool {
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    if (st.kind != .file) return false;
+    if (comptime (builtin.os.tag != .windows and builtin.os.tag != .wasi)) {
+        if (effectiveOsTag() != .windows and (st.permissions.toMode() & 0o111) == 0) {
+            const f = Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+            defer f.close(io);
+            f.setPermissions(io, .fromMode(0o755)) catch return false;
+            const after = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+            return after.kind == .file and (after.permissions.toMode() & 0o111) != 0;
+        }
+    }
+    return true;
+}
+
+fn warnIfHelperShadowedOnPath(gpa: Allocator, dest_path: []const u8, stderr: *Io.Writer) void {
+    const resolved = findHelperOnPathAlloc(gpa) orelse return;
+    defer gpa.free(resolved);
+    if (!pathsEqualForOs(resolved, dest_path)) {
+        stderr.print(
+            "keyring: warning: {s} earlier on PATH shadows provisioned {s}\n",
+            .{ resolved, dest_path },
+        ) catch {};
+    }
+}
+
 pub fn findHelperOnPathAlloc(gpa: Allocator) ?[]u8 {
     const path_env = getEnvVarOwned(gpa, "PATH") orelse getEnvVarOwned(gpa, "Path") orelse return null;
     defer gpa.free(path_env);
@@ -949,7 +1105,7 @@ pub fn findHelperOnPathAlloc(gpa: Allocator) ?[]u8 {
         const entry = std.mem.trim(u8, raw_entry, " \t\"");
         if (entry.len == 0) continue;
         const candidate = std.fs.path.join(gpa, &.{ entry, helper_name }) catch continue;
-        if (fileExists(candidate)) return candidate;
+        if (isExecutableRegularFile(candidate)) return candidate;
         gpa.free(candidate);
     }
     return null;
@@ -1056,6 +1212,7 @@ pub fn ensureHelperOnPath(gpa: Allocator) Error![]u8 {
     }
 
     const src_stat = Io.Dir.cwd().statFile(io, self_exe, .{}) catch return error.StorageFailure;
+    if (src_stat.kind != .file) return error.StorageFailure;
     var cached_src_hash: ?[32]u8 = null;
 
     const perms: ?Io.File.Permissions = if (builtin.os.tag == .windows or builtin.os.tag == .wasi)
@@ -1065,8 +1222,12 @@ pub fn ensureHelperOnPath(gpa: Allocator) Error![]u8 {
 
     for (candidate_dirs) |target_dir| {
         const dest_path = try std.fs.path.join(gpa, &.{ target_dir, helperBinaryName() });
+        errdefer gpa.free(dest_path);
+
         if (pathsEqualForOs(self_exe, dest_path)) {
-            return dest_path;
+            if (ensureExecutablePermissions(io, dest_path)) {
+                return dest_path;
+            }
         }
 
         if (Io.Dir.cwd().statFile(io, dest_path, .{})) |dst_stat| {
@@ -1077,7 +1238,7 @@ pub fn ensureHelperOnPath(gpa: Allocator) Error![]u8 {
                     break :blk h;
                 };
                 if (hashFileSha256(io, dest_path)) |dst_hash| {
-                    if (std.mem.eql(u8, &src_hash, &dst_hash)) {
+                    if (std.mem.eql(u8, &src_hash, &dst_hash) and ensureExecutablePermissions(io, dest_path)) {
                         return dest_path;
                     }
                 } else |_| {}
@@ -1087,7 +1248,10 @@ pub fn ensureHelperOnPath(gpa: Allocator) Error![]u8 {
         if (Io.Dir.cwd().createDirPathStatus(io, target_dir, .default_dir)) |_| {
             if (!fileExists(dest_path)) {
                 if (Io.Dir.cwd().hardLink(self_exe, Io.Dir.cwd(), dest_path, io, .{})) |_| {
-                    return dest_path;
+                    if (ensureExecutablePermissions(io, dest_path)) {
+                        return dest_path;
+                    }
+                    Io.Dir.cwd().deleteFile(io, dest_path) catch {};
                 } else |_| {}
             }
 
@@ -1096,7 +1260,9 @@ pub fn ensureHelperOnPath(gpa: Allocator) Error![]u8 {
                 .replace = true,
                 .make_path = true,
             })) |_| {
-                return dest_path;
+                if (ensureExecutablePermissions(io, dest_path)) {
+                    return dest_path;
+                }
             } else |_| {}
         } else |_| {}
 
@@ -1125,8 +1291,17 @@ fn readExistingAuthsCredential(
     if (bytes.len == 0) return null;
 
     const root = parseAuthJsonRootLeaky(a, bytes) catch return null;
+    defer zeroAuthJsonSecrets(&root);
     const auths_obj = root.get("auths").?.object;
-    const entry = auths_obj.get(bare_host) orelse return null;
+    const entry = auths_obj.get(bare_host) orelse blk: {
+        var it = auths_obj.iterator();
+        while (it.next()) |kv| {
+            if (keyMatchesBareServer(a, kv.key_ptr.*, bare_host)) {
+                break :blk kv.value_ptr.*;
+            }
+        }
+        return null;
+    };
     if (entry != .object) return null;
     const auth_val = entry.object.get("auth") orelse return null;
     if (auth_val != .string or auth_val.string.len == 0) return null;
@@ -1198,6 +1373,7 @@ fn isKeyringHelperConfiguredInAuthFile(
     if (bytes.len == 0) return false;
 
     const root = parseAuthJsonRootLeaky(a, bytes) catch return false;
+    defer zeroAuthJsonSecrets(&root);
     const ch_val = root.get("credHelpers") orelse return false;
     if (ch_val != .object) return false;
     const hv = ch_val.object.get(bare_host) orelse return false;
@@ -1255,6 +1431,15 @@ fn lookupStoredOrAuthsFallback(
     }
 
     return null;
+}
+
+fn normalizeAcrPodmanCredential(gpa: Allocator, cred: *registry_auth.RegistryCredential) Error!void {
+    if (std.mem.eql(u8, cred.username, registry_auth.identity_token_username)) {
+        const guid_user = try gpa.dupe(u8, registry_auth.acr_token_username);
+        gpa.free(cred.username);
+        cred.username = guid_user;
+    }
+    cred.kind = .basic;
 }
 
 pub fn resolvePodmanCredential(
@@ -1407,21 +1592,38 @@ pub fn resolvePodmanCredentialDetailed(
 
     // 2. Azure Container Registry (`*.azurecr.*`).
     if (registry_auth.isAcrServer(bare_host)) {
-        if (registry_auth.getGenericCredentialDetailedAt(gpa, bare_host, requested_username, hooks.nowSeconds())) |res| {
-            const origin: CredentialOrigin = switch (res.source) {
-                .primary_container_registry => .generic_keyring_primary,
-                .legacy_https_service => .migrated_fallback,
-            };
-            if (res.credential.expires_at) |exp| {
-                const threshold = if (allow_interactive) hooks.nowSeconds() + 300 else hooks.nowSeconds();
-                if (!force and exp > threshold) {
-                    return .{ .credential = res.credential, .origin = origin };
-                }
+        const generic_query_user: ?[]const u8 = if (requested_username) |u|
+            (if (registry_auth.isAcrSentinelUsername(u)) null else u)
+        else
+            null;
+        if (registry_auth.getGenericCredentialDetailedAt(gpa, bare_host, generic_query_user, hooks.nowSeconds())) |res_val| {
+            var res = res_val;
+            const matches_req = requested_username == null or
+                std.mem.eql(u8, res.credential.username, requested_username.?) or
+                (registry_auth.isAcrSentinelUsername(requested_username.?) and
+                    registry_auth.isAcrSentinelUsername(res.credential.username));
+            if (!matches_req) {
                 res.credential.deinit(gpa);
-            } else if (!force or !registry_auth.isAcrSentinelUsername(res.credential.username)) {
-                return .{ .credential = res.credential, .origin = origin };
             } else {
-                res.credential.deinit(gpa);
+                const origin: CredentialOrigin = switch (res.source) {
+                    .primary_container_registry => .generic_keyring_primary,
+                    .legacy_https_service => .migrated_fallback,
+                };
+                if (res.credential.expires_at) |exp| {
+                    const buffer_s: i128 = if (allow_interactive) 300 else 0;
+                    if (!force and @as(i128, exp) > @as(i128, hooks.nowSeconds()) + buffer_s) {
+                        errdefer res.credential.deinit(gpa);
+                        try normalizeAcrPodmanCredential(gpa, &res.credential);
+                        return .{ .credential = res.credential, .origin = origin };
+                    }
+                    res.credential.deinit(gpa);
+                } else if (!force or !registry_auth.isAcrSentinelUsername(res.credential.username)) {
+                    errdefer res.credential.deinit(gpa);
+                    try normalizeAcrPodmanCredential(gpa, &res.credential);
+                    return .{ .credential = res.credential, .origin = origin };
+                } else {
+                    res.credential.deinit(gpa);
+                }
             }
         } else |err| switch (err) {
             error.EntryNotFound, error.NoStorageAccess, error.AuthenticationFailed => {},
@@ -1434,7 +1636,7 @@ pub fn resolvePodmanCredentialDetailed(
                     if (try readExistingAuthsCredential(gpa, auth_path, bare_host)) |existing| {
                         if (std.mem.eql(u8, existing.username, user)) {
                             if (existing.expires_at) |exp| {
-                                if (exp > hooks.nowSeconds() + 300) {
+                                if (@as(i128, exp) > @as(i128, hooks.nowSeconds()) + 300) {
                                     return .{ .credential = existing, .origin = .migrated_fallback };
                                 }
                             } else {
@@ -1449,17 +1651,22 @@ pub fn resolvePodmanCredentialDetailed(
         }
 
         if (!force) {
-            if (try readExistingAuthsCredential(gpa, auth_path, bare_host)) |existing| {
-                if (requested_username == null or std.mem.eql(u8, existing.username, requested_username.?)) {
+            if (try readExistingAuthsCredential(gpa, auth_path, bare_host)) |existing_val| {
+                var existing = existing_val;
+                const matches_req = requested_username == null or
+                    std.mem.eql(u8, existing.username, requested_username.?) or
+                    (registry_auth.isAcrSentinelUsername(requested_username.?) and
+                        registry_auth.isAcrSentinelUsername(existing.username));
+                if (matches_req) {
                     if (existing.expires_at) |exp| {
-                        if (exp > hooks.nowSeconds() + 300) {
-                            return .{
-                                .credential = existing,
-                                .origin = if (registry_auth.isAcrSentinelUsername(existing.username))
-                                    .reused_auths_provider
-                                else
-                                    .migrated_fallback,
-                            };
+                        if (@as(i128, exp) > @as(i128, hooks.nowSeconds()) + 300) {
+                            const origin: CredentialOrigin = if (registry_auth.isAcrSentinelUsername(existing.username))
+                                .reused_auths_provider
+                            else
+                                .migrated_fallback;
+                            errdefer existing.deinit(gpa);
+                            try normalizeAcrPodmanCredential(gpa, &existing);
+                            return .{ .credential = existing, .origin = origin };
                         }
                     } else if (!registry_auth.isAcrSentinelUsername(existing.username)) {
                         return .{ .credential = existing, .origin = .migrated_fallback };
@@ -1599,6 +1806,29 @@ fn runLogin(
 
         try maybeProvisionHelper(a, opts.mode, stderr);
 
+        const srv_list = [_][]const u8{bare_host};
+        if (opts.mode == .auths_only) {
+            checkExternalHelperConflictInFile(a, paths.primary_path, &srv_list, opts.force) catch |err| {
+                return reportError(stderr, "podman login", bare_host, err);
+            };
+            if (paths.persistent_helpers_path) |persist_path| {
+                checkExternalHelperConflictInFile(a, persist_path, &srv_list, opts.force) catch |err| {
+                    return reportError(stderr, "podman login", bare_host, err);
+                };
+                if ((registry_auth.readFileIfExists(a, persist_path) catch |err| {
+                    return reportError(stderr, "podman login", bare_host, mapRegistryAuthError(err));
+                })) |persist_bytes| {
+                    std.crypto.secureZero(u8, persist_bytes);
+                    _ = mutateAuthFileWithCas(a, persist_path, RemoveHelpersForAuthsOnlyCtx{
+                        .servers = &srv_list,
+                        .force = opts.force,
+                    }, removeHelpersForAuthsOnlyMutation) catch |err| {
+                        return reportError(stderr, "podman login", bare_host, err);
+                    };
+                }
+            }
+        }
+
         const recs = [_]LoginRecord{.{ .server = bare_host, .username = user, .secret = secret }};
         _ = mutateAuthFileWithCas(a, paths.primary_path, ApplyLoginCtx{
             .records = &recs,
@@ -1608,20 +1838,12 @@ fn runLogin(
             return reportError(stderr, "podman login", bare_host, err);
         };
 
-        if (paths.persistent_helpers_path) |persist_path| {
-            const srv_list = [_][]const u8{bare_host};
-            if (opts.mode != .auths_only) {
-                _ = mutateAuthFileWithCas(a, persist_path, ApplyConfigCtx{ .servers = &srv_list }, applyConfigMutation) catch |err| {
-                    return reportError(stderr, "podman login", bare_host, err);
-                };
-            } else if ((registry_auth.readFileIfExists(a, persist_path) catch |err| {
-                return reportError(stderr, "podman login", bare_host, mapRegistryAuthError(err));
-            })) |persist_bytes| {
-                std.crypto.secureZero(u8, persist_bytes);
-                _ = mutateAuthFileWithCas(a, persist_path, RemoveHelpersForAuthsOnlyCtx{
+        if (opts.mode != .auths_only) {
+            if (paths.persistent_helpers_path) |persist_path| {
+                _ = mutateAuthFileWithCas(a, persist_path, ApplyConfigCtx{
                     .servers = &srv_list,
-                    .force = opts.force,
-                }, removeHelpersForAuthsOnlyMutation) catch |err| {
+                    .scrub_auths = (opts.mode == .helper_only),
+                }, applyConfigMutation) catch |err| {
                     return reportError(stderr, "podman login", bare_host, err);
                 };
             }
@@ -1704,8 +1926,21 @@ fn runLogin(
             opts.force,
             true,
             stderr,
-        ) catch |err| {
-            return reportError(stderr, "podman login", bare_host, err);
+        ) catch |primary_err| fallback_persist: {
+            if (primary_err == error.EntryNotFound) {
+                if (paths.persistent_helpers_path) |persist_path| {
+                    break :fallback_persist resolvePodmanCredentialDetailed(
+                        a,
+                        bare_host,
+                        persist_path,
+                        opts.username,
+                        opts.force,
+                        true,
+                        stderr,
+                    ) catch |err2| return reportError(stderr, "podman login", bare_host, err2);
+                }
+            }
+            return reportError(stderr, "podman login", bare_host, primary_err);
         };
         if (opts.mode != .helper_only and std.mem.indexOfScalar(u8, res.credential.username, ':') != null) {
             res.credential.deinit(a);
@@ -1748,6 +1983,28 @@ fn runLogin(
 
     try maybeProvisionHelper(a, opts.mode, stderr);
 
+    if (opts.mode == .auths_only) {
+        checkExternalHelperConflictInFile(a, paths.primary_path, target_servers.items, opts.force) catch |err| {
+            return reportError(stderr, "podman login", target_servers.items[0], err);
+        };
+        if (paths.persistent_helpers_path) |persist_path| {
+            checkExternalHelperConflictInFile(a, persist_path, target_servers.items, opts.force) catch |err| {
+                return reportError(stderr, "podman login", target_servers.items[0], err);
+            };
+            if ((registry_auth.readFileIfExists(a, persist_path) catch |err| {
+                return reportError(stderr, "podman login", target_servers.items[0], mapRegistryAuthError(err));
+            })) |persist_bytes| {
+                std.crypto.secureZero(u8, persist_bytes);
+                _ = mutateAuthFileWithCas(a, persist_path, RemoveHelpersForAuthsOnlyCtx{
+                    .servers = target_servers.items,
+                    .force = opts.force,
+                }, removeHelpersForAuthsOnlyMutation) catch |err| {
+                    return reportError(stderr, "podman login", target_servers.items[0], err);
+                };
+            }
+        }
+    }
+
     _ = mutateAuthFileWithCas(a, paths.primary_path, ApplyLoginCtx{
         .records = records.items,
         .mode = opts.mode,
@@ -1756,19 +2013,12 @@ fn runLogin(
         return reportError(stderr, "podman login", target_servers.items[0], err);
     };
 
-    if (paths.persistent_helpers_path) |persist_path| {
-        if (opts.mode != .auths_only) {
-            _ = mutateAuthFileWithCas(a, persist_path, ApplyConfigCtx{ .servers = target_servers.items }, applyConfigMutation) catch |err| {
-                return reportError(stderr, "podman login", target_servers.items[0], err);
-            };
-        } else if ((registry_auth.readFileIfExists(a, persist_path) catch |err| {
-            return reportError(stderr, "podman login", target_servers.items[0], mapRegistryAuthError(err));
-        })) |persist_bytes| {
-            std.crypto.secureZero(u8, persist_bytes);
-            _ = mutateAuthFileWithCas(a, persist_path, RemoveHelpersForAuthsOnlyCtx{
+    if (opts.mode != .auths_only) {
+        if (paths.persistent_helpers_path) |persist_path| {
+            _ = mutateAuthFileWithCas(a, persist_path, ApplyConfigCtx{
                 .servers = target_servers.items,
-                .force = opts.force,
-            }, removeHelpersForAuthsOnlyMutation) catch |err| {
+                .scrub_auths = (opts.mode == .helper_only),
+            }, applyConfigMutation) catch |err| {
                 return reportError(stderr, "podman login", target_servers.items[0], err);
             };
         }
@@ -1785,7 +2035,8 @@ fn runLogin(
 fn maybeProvisionHelper(a: Allocator, mode: LoginMode, stderr: *Io.Writer) Error!void {
     if (mode == .auths_only) return;
     if (ensureHelperOnPath(a)) |helper_path| {
-        a.free(helper_path);
+        defer a.free(helper_path);
+        warnIfHelperShadowedOnPath(a, helper_path, stderr);
         return;
     } else |err| {
         if (mode == .helper_only) return err;
@@ -1816,11 +2067,12 @@ fn collectConfiguredBareServers(
     if (bytes.len == 0) return;
 
     const root = try parseAuthJsonRootLeaky(a, bytes);
+    defer zeroAuthJsonSecrets(&root);
     const auths_obj = root.get("auths").?.object;
     var it = auths_obj.iterator();
     while (it.next()) |kv| {
         const key = kv.key_ptr.*;
-        if (std.mem.indexOfScalar(u8, key, '/') != null) {
+        if (!isBareOrLegacyUrlKey(key)) {
             skipped_scoped.* += 1;
             continue;
         }
@@ -1836,7 +2088,7 @@ fn collectConfiguredBareServers(
             while (ch_it.next()) |kv| {
                 if (kv.value_ptr.* == .string and std.mem.eql(u8, kv.value_ptr.string, helper_value)) {
                     const key = kv.key_ptr.*;
-                    if (std.mem.indexOfScalar(u8, key, '/') != null) continue;
+                    if (!isBareOrLegacyUrlKey(key)) continue;
                     const norm = registry_auth.normalizeServerAlloc(a, key, .bare_docker_io) catch continue;
                     if (!containsString(out.items, norm)) {
                         try out.append(a, norm);
@@ -1878,6 +2130,7 @@ fn runConfig(
         return reportError(stderr, "podman config", null, err);
     };
     defer a.free(helper_path);
+    warnIfHelperShadowedOnPath(a, helper_path, stderr);
 
     _ = mutateAuthFileWithCas(a, paths.primary_path, ApplyConfigCtx{ .servers = servers.items }, applyConfigMutation) catch |err| {
         return reportError(stderr, "podman config", servers.items[0], err);
@@ -1893,7 +2146,40 @@ fn runConfig(
         try stdout.print("Configured Podman credHelpers for {s} -> {s} ({s})\n", .{ srv, helper_value, helper_path });
     }
     try stdout.flush();
+    try stderr.flush();
     return 0;
+}
+
+fn collectLogoutPreviewServers(
+    a: Allocator,
+    auth_path: []const u8,
+    all: bool,
+    servers: []const []const u8,
+    out: *std.ArrayList([]u8),
+    gpa: Allocator,
+) Error!bool {
+    const bytes = (registry_auth.readFileIfExists(a, auth_path) catch |err| return mapRegistryAuthError(err)) orelse return false;
+    defer std.crypto.secureZero(u8, bytes);
+    if (bytes.len == 0) return true;
+
+    var root = try parseAuthJsonRootLeaky(a, bytes);
+    defer zeroAuthJsonSecrets(&root);
+
+    var local_removed = std.ArrayList([]u8).empty;
+    defer {
+        for (local_removed.items) |s| gpa.free(s);
+        local_removed.deinit(gpa);
+    }
+    _ = try applyLogoutMutation(a, &root, .{
+        .servers = servers,
+        .all = all,
+        .removed_servers = &local_removed,
+        .gpa = gpa,
+    });
+    for (local_removed.items) |s| {
+        try recordRemovedUnique(gpa, out, s);
+    }
+    return true;
 }
 
 fn runLogout(
@@ -1925,58 +2211,147 @@ fn runLogout(
         }
     }
 
+    var preview_servers = std.ArrayList([]u8).empty;
+    defer {
+        for (preview_servers.items) |s| gpa.free(s);
+        preview_servers.deinit(gpa);
+    }
+
+    const primary_exists = collectLogoutPreviewServers(
+        a,
+        paths.primary_path,
+        opts.all,
+        servers.items,
+        &preview_servers,
+        gpa,
+    ) catch |err| {
+        return reportError(stderr, "podman logout", null, err);
+    };
+
+    const persist_exists = if (paths.persistent_helpers_path) |persist_path|
+        collectLogoutPreviewServers(
+            a,
+            persist_path,
+            opts.all,
+            servers.items,
+            &preview_servers,
+            gpa,
+        ) catch |err| {
+            try stderr.print("keyring: podman logout: failed reading persistent config {s}: {s}\n", .{ persist_path, @errorName(err) });
+            try stderr.flush();
+            return reportError(stderr, "podman logout", null, err);
+        }
+    else
+        false;
+
+    if (opts.all and !paths.explicit_override) {
+        const idx_entries = registry_auth.listGenericIndexAlloc(a) catch |err| {
+            return reportError(stderr, "podman logout", null, mapRegistryAuthError(err));
+        };
+        for (idx_entries) |e| {
+            try recordRemovedUnique(gpa, &preview_servers, e.server);
+        }
+    }
+
+    // Verify & perform OS keyring deletions BEFORE mutating `auth.json` so `Locked` /
+    // `NoStorageAccess` abort cleanly without modifying `auth.json`!
+    registry_auth.checkGenericStoreAvailable(a, .if_available) catch |err| {
+        const first_srv: ?[]const u8 = if (!opts.all and servers.items.len > 0)
+            servers.items[0]
+        else if (preview_servers.items.len > 0)
+            preview_servers.items[0]
+        else
+            null;
+        return reportError(stderr, "podman logout", first_srv, mapRegistryAuthError(err));
+    };
+
+    var deleted_generic_servers = std.ArrayList([]const u8).empty;
+    if (opts.all) {
+        for (preview_servers.items) |srv| {
+            var deleted = true;
+            registry_auth.deleteGenericCredential(a, srv) catch |err| switch (err) {
+                error.EntryNotFound => deleted = false,
+                else => return reportError(stderr, "podman logout", srv, mapRegistryAuthError(err)),
+            };
+            if (deleted) try deleted_generic_servers.append(a, srv);
+        }
+    } else {
+        for (servers.items) |srv| {
+            var deleted = true;
+            registry_auth.deleteGenericCredential(a, srv) catch |err| switch (err) {
+                error.EntryNotFound => deleted = false,
+                else => return reportError(stderr, "podman logout", srv, mapRegistryAuthError(err)),
+            };
+            if (deleted) try deleted_generic_servers.append(a, srv);
+        }
+    }
+
     var removed_servers = std.ArrayList([]u8).empty;
     defer {
         for (removed_servers.items) |s| gpa.free(s);
         removed_servers.deinit(gpa);
     }
 
-    if ((registry_auth.readFileIfExists(a, paths.primary_path) catch |err| {
-        return reportError(stderr, "podman logout", null, mapRegistryAuthError(err));
-    })) |initial_primary| {
-        std.crypto.secureZero(u8, initial_primary);
+    if (primary_exists) {
+        var primary_removed = std.ArrayList([]u8).empty;
+        defer {
+            for (primary_removed.items) |s| gpa.free(s);
+            primary_removed.deinit(gpa);
+        }
         _ = mutateAuthFileWithCas(a, paths.primary_path, ApplyLogoutCtx{
             .servers = servers.items,
             .all = opts.all,
-            .removed_servers = &removed_servers,
+            .removed_servers = &primary_removed,
             .gpa = gpa,
         }, applyLogoutMutation) catch |err| {
             return reportError(stderr, "podman logout", null, err);
         };
+        for (primary_removed.items) |s| {
+            try recordRemovedUnique(gpa, &removed_servers, s);
+        }
     }
 
-    if (paths.persistent_helpers_path) |persist_path| {
-        if ((registry_auth.readFileIfExists(a, persist_path) catch |err| {
-            try stderr.print("keyring: podman logout: failed reading persistent config {s}: {s}\n", .{ persist_path, @errorName(err) });
-            try stderr.flush();
-            return 1;
-        })) |initial_persist| {
-            std.crypto.secureZero(u8, initial_persist);
+    if (persist_exists) {
+        if (paths.persistent_helpers_path) |persist_path| {
+            var persist_removed = std.ArrayList([]u8).empty;
+            defer {
+                for (persist_removed.items) |s| gpa.free(s);
+                persist_removed.deinit(gpa);
+            }
             _ = mutateAuthFileWithCas(a, persist_path, ApplyLogoutCtx{
                 .servers = servers.items,
                 .all = opts.all,
-                .removed_servers = &removed_servers,
+                .removed_servers = &persist_removed,
                 .gpa = gpa,
             }, applyLogoutMutation) catch |err| {
                 try stderr.print("keyring: podman logout: failed updating persistent config {s}: {s}\n", .{ persist_path, @errorName(err) });
                 try stderr.flush();
                 return reportError(stderr, "podman logout", null, err);
             };
+            for (persist_removed.items) |s| {
+                try recordRemovedUnique(gpa, &removed_servers, s);
+            }
         }
     }
 
     if (opts.all) {
-        if (registry_auth.listGenericIndexAlloc(a)) |idx_entries| {
-            for (idx_entries) |e| {
-                try recordRemovedUnique(gpa, &removed_servers, e.server);
+        // Also delete any server added concurrently to `auth.json` during CAS retry,
+        // and include global index servers when `!paths.explicit_override`.
+        for (removed_servers.items) |srv| {
+            if (!containsString(preview_servers.items, srv)) {
+                registry_auth.deleteGenericCredential(a, srv) catch |err| switch (err) {
+                    error.EntryNotFound => {},
+                    else => return reportError(stderr, "podman logout", srv, mapRegistryAuthError(err)),
+                };
             }
-        } else |_| {}
+        }
+        if (!paths.explicit_override) {
+            for (deleted_generic_servers.items) |srv| {
+                try recordRemovedUnique(gpa, &removed_servers, srv);
+            }
+        }
 
         for (removed_servers.items) |srv| {
-            registry_auth.deleteGenericCredential(a, srv) catch |err| switch (err) {
-                error.EntryNotFound, error.NoStorageAccess => {},
-                else => return reportError(stderr, "podman logout", srv, mapRegistryAuthError(err)),
-            };
             try stdout.print("Removed Podman credentials for {s}\n", .{srv});
         }
         if (removed_servers.items.len == 0) {
@@ -1988,12 +2363,7 @@ fn runLogout(
 
     var any_missing = false;
     for (servers.items) |srv| {
-        var deleted_generic = true;
-        registry_auth.deleteGenericCredential(a, srv) catch |err| switch (err) {
-            error.EntryNotFound, error.NoStorageAccess => deleted_generic = false,
-            else => return reportError(stderr, "podman logout", srv, mapRegistryAuthError(err)),
-        };
-
+        const deleted_generic = containsString(deleted_generic_servers.items, srv);
         const removed_from_auth = containsString(removed_servers.items, srv);
         if (!removed_from_auth and !deleted_generic) {
             try stderr.print("keyring: podman logout: not logged in to {s}\n", .{srv});
@@ -2088,13 +2458,19 @@ fn writeStatusReport(a: Allocator, paths: AuthFilePaths, stdout: *Io.Writer) !vo
         try stdout.writeAll("podman registries: invalid auth.json\n");
         return;
     };
+    defer zeroAuthJsonSecrets(&root);
 
-    const persist_root: ?std.json.ObjectMap = if (maybe_persist_bytes) |pb|
+    var persist_root: ?std.json.ObjectMap = if (maybe_persist_bytes) |pb|
         if (pb.len > 0) parseAuthJsonRootLeaky(a, pb) catch null else null
     else
         null;
+    defer if (persist_root) |*pr| zeroAuthJsonSecrets(pr);
 
     const auths_obj = root.get("auths").?.object;
+    const persist_auths_obj: ?std.json.ObjectMap = if (persist_root) |pr|
+        if (pr.get("auths")) |v| (if (v == .object) v.object else null) else null
+    else
+        null;
     const ch_obj: ?std.json.ObjectMap = if (root.get("credHelpers")) |v|
         if (v == .object) v.object else null
     else
@@ -2109,6 +2485,14 @@ fn writeStatusReport(a: Allocator, paths: AuthFilePaths, stdout: *Io.Writer) !vo
     while (auth_it.next()) |kv| {
         if (!containsString(all_keys.items, kv.key_ptr.*)) {
             try all_keys.append(a, kv.key_ptr.*);
+        }
+    }
+    if (persist_auths_obj) |pa| {
+        var pa_it = pa.iterator();
+        while (pa_it.next()) |kv| {
+            if (!containsString(all_keys.items, kv.key_ptr.*)) {
+                try all_keys.append(a, kv.key_ptr.*);
+            }
         }
     }
     if (ch_obj) |ch| {
@@ -2136,7 +2520,7 @@ fn writeStatusReport(a: Allocator, paths: AuthFilePaths, stdout: *Io.Writer) !vo
     const now = activeProviderHooks().nowSeconds();
     try stdout.print("podman registries ({d}):\n", .{all_keys.items.len});
     for (all_keys.items) |key| {
-        const is_scoped = std.mem.indexOfScalar(u8, key, '/') != null;
+        const is_scoped = !isBareOrLegacyUrlKey(key);
         var helper_name: ?[]const u8 = if (ch_obj) |ch|
             if (ch.get(key)) |hv| (if (hv == .string) hv.string else null) else null
         else
@@ -2163,6 +2547,20 @@ fn writeStatusReport(a: Allocator, paths: AuthFilePaths, stdout: *Io.Writer) !vo
                 }
             }
         }
+        if (!has_auth) {
+            if (persist_auths_obj) |pa| {
+                if (pa.get(key)) |av| {
+                    if (av == .object) {
+                        if (av.object.get("auth")) |astr| {
+                            if (astr == .string and astr.string.len > 0) {
+                                has_auth = true;
+                                decoded_pair = decodeBasicAuthAlloc(a, astr.string) catch null;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         const mode_str = if (is_scoped)
             "scoped-auths"
@@ -2181,7 +2579,7 @@ fn writeStatusReport(a: Allocator, paths: AuthFilePaths, stdout: *Io.Writer) !vo
         if (decoded_pair) |p| {
             if (registry_auth.extractJwtExpiration(a, p.secret)) |exp| {
                 if (exp > now) {
-                    const mins = @divFloor(exp - now, 60);
+                    const mins: i128 = @divFloor(@as(i128, exp) - @as(i128, now), 60);
                     try stdout.print("  {s}: mode={s}, user={s}, auths=valid (expires in {d}m)\n", .{
                         key,
                         mode_str,
@@ -2315,6 +2713,7 @@ fn appendCredHelperListEntries(
     if (bytes.len == 0) return;
 
     const root = parseAuthJsonRootLeaky(a, bytes) catch return;
+    defer zeroAuthJsonSecrets(&root);
     const ch_val = root.get("credHelpers") orelse return;
     if (ch_val != .object) return;
 
@@ -2435,15 +2834,18 @@ fn reportError(stderr: *Io.Writer, cmd_label: []const u8, maybe_server: ?[]const
 const TestGenericBackend = struct {
     var map: ?std.StringHashMap([]u8) = null;
     var fail_access: bool = false;
+    var fail_locked: bool = false;
 
     fn reset(gpa: Allocator) void {
         deinit(gpa);
         map = std.StringHashMap([]u8).init(gpa);
         fail_access = false;
+        fail_locked = false;
     }
 
     fn deinit(gpa: Allocator) void {
         fail_access = false;
+        fail_locked = false;
         if (map) |*m| {
             var it = m.iterator();
             while (it.next()) |kv| {
@@ -2457,6 +2859,7 @@ const TestGenericBackend = struct {
     }
 
     fn get(gpa: Allocator, service: []const u8, account: []const u8) @import("keyring_zig").Error![]u8 {
+        if (fail_locked) return error.Locked;
         if (fail_access) return error.NoStorageAccess;
         const m = &(map orelse return error.EntryNotFound);
         const key = std.fmt.allocPrint(gpa, "{s}|{s}", .{ service, account }) catch return error.OutOfMemory;
@@ -2466,6 +2869,7 @@ const TestGenericBackend = struct {
     }
 
     fn set(_: Allocator, service: []const u8, account: []const u8, password: []const u8) @import("keyring_zig").Error!void {
+        if (fail_locked) return error.Locked;
         if (fail_access) return error.NoStorageAccess;
         var m = &(map orelse return error.PlatformFailure);
         const key = std.fmt.allocPrint(m.allocator, "{s}|{s}", .{ service, account }) catch return error.OutOfMemory;
@@ -2480,6 +2884,7 @@ const TestGenericBackend = struct {
     }
 
     fn delete(gpa: Allocator, service: []const u8, account: []const u8) @import("keyring_zig").Error!void {
+        if (fail_locked) return error.Locked;
         if (fail_access) return error.NoStorageAccess;
         var m = &(map orelse return error.EntryNotFound);
         const key = std.fmt.allocPrint(gpa, "{s}|{s}", .{ service, account }) catch return error.OutOfMemory;
@@ -3126,4 +3531,257 @@ test "expired stored JWT in container-registry is skipped for GHCR and ACR dynam
         "{\"v\":1,\"kind\":\"bearer_token\",\"secret\":\"bad-bearer\",\"cache_policy\":\"eternal\"}",
     );
     try std.testing.expectEqual(@as(u8, 4), try run(gpa, ghcr_login, &empty_in, &out_w.writer, &err_w.writer));
+}
+
+test "podman logout verifies keyring before mutating auth.json, scopes --authfile --all, and cleans legacy URL keys + CAS retries" {
+    const gpa = std.testing.allocator;
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root_dir);
+
+    const state_dir = try std.fs.path.join(gpa, &.{ root_dir, "state" });
+    defer gpa.free(state_dir);
+    registry_auth.state_dir_override = state_dir;
+    defer registry_auth.state_dir_override = null;
+
+    TestGenericBackend.reset(gpa);
+    defer TestGenericBackend.deinit(gpa);
+    registry_auth.generic_store_override = .{
+        .get = TestGenericBackend.get,
+        .set = TestGenericBackend.set,
+        .delete = TestGenericBackend.delete,
+    };
+    defer registry_auth.generic_store_override = null;
+
+    FakeProviders.reset();
+    provider_hooks_override = FakeProviders.hooks;
+    defer provider_hooks_override = null;
+
+    FakeEnv.reset();
+    FakeEnv.home = root_dir;
+    env_override_fn = FakeEnv.get;
+    defer env_override_fn = null;
+
+    // Store two global keyring entries: `docker.io` (inside custom authfile) and `unrelated.example.io` (NOT in custom authfile).
+    try registry_auth.storeGenericCredential(gpa, "docker.io", "hubuser", "hubsecret");
+    try registry_auth.storeGenericCredential(gpa, "unrelated.example.io", "keepuser", "keepsecret");
+
+    const custom_auth = try std.fs.path.join(gpa, &.{ root_dir, "custom-auth.json" });
+    defer gpa.free(custom_auth);
+    const initial_custom_json =
+        \\{
+        \\  "auths": {
+        \\    "https://index.docker.io/v1/": { "auth": "aHVidXNlcjpodWJzZWNyZXQ=" },
+        \\    "https://ghcr.io": { "auth": "b2N0b2NhdDp0b2s=" },
+        \\    "http://localhost:5000": { "auth": "ZGV2OmRldg==" },
+        \\    "quay.io/myorg/app": { "auth": "c2NvcGVkOnNlY3JldA==" }
+        \\  }
+        \\}
+    ;
+    try registry_auth.writeProtectedFileAtomic(gpa, custom_auth, initial_custom_json);
+
+    var empty_in = Io.Reader.fixed("");
+    var out_w = Io.Writer.Allocating.init(gpa);
+    defer out_w.deinit();
+    var err_w = Io.Writer.Allocating.init(gpa);
+    defer err_w.deinit();
+
+    // 1. NoStorageAccess and Locked on keyring MUST fail BEFORE mutating custom_auth!
+    TestGenericBackend.fail_access = true;
+    const logout_all_override = parseArgs(&.{ "logout", "--all", "--authfile", custom_auth }).?;
+    try std.testing.expectEqual(@as(u8, 4), try run(gpa, logout_all_override, &empty_in, &out_w.writer, &err_w.writer));
+    {
+        const unchanged = (try registry_auth.readFileIfExists(gpa, custom_auth)).?;
+        defer gpa.free(unchanged);
+        try std.testing.expectEqualStrings(initial_custom_json, unchanged);
+    }
+    TestGenericBackend.fail_access = false;
+
+    TestGenericBackend.fail_locked = true;
+    out_w.clearRetainingCapacity();
+    err_w.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 1), try run(gpa, logout_all_override, &empty_in, &out_w.writer, &err_w.writer));
+    {
+        const unchanged = (try registry_auth.readFileIfExists(gpa, custom_auth)).?;
+        defer gpa.free(unchanged);
+        try std.testing.expectEqualStrings(initial_custom_json, unchanged);
+    }
+    TestGenericBackend.fail_locked = false;
+
+    // 2. Inject a concurrent CAS race removing `localhost:5000` on attempt 0 so `removed_servers` MUST reset on retry!
+    const CasRace = struct {
+        fn inject(path: []const u8, attempt: usize) void {
+            if (attempt == 0) {
+                registry_auth.writeProtectedFileAtomic(std.testing.allocator, path,
+                    \\{
+                    \\  "auths": {
+                    \\    "https://index.docker.io/v1/": { "auth": "aHVidXNlcjpodWJzZWNyZXQ=" },
+                    \\    "https://ghcr.io": { "auth": "b2N0b2NhdDp0b2s=" },
+                    \\    "quay.io/myorg/app": { "auth": "c2NvcGVkOnNlY3JldA==" }
+                    \\  }
+                    \\}
+                ) catch {};
+            }
+        }
+    };
+    cas_race_inject_fn = CasRace.inject;
+    defer cas_race_inject_fn = null;
+
+    out_w.clearRetainingCapacity();
+    err_w.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try run(gpa, logout_all_override, &empty_in, &out_w.writer, &err_w.writer));
+    cas_race_inject_fn = null;
+
+    // Legacy URL keys (`https://index.docker.io/v1/`, `https://ghcr.io`) are removed, `quay.io/myorg/app` preserved,
+    // `localhost:5000` NOT reported as removed (CAS retry reset), and `unrelated.example.io` is STILL in global keyring!
+    const after_logout = (try registry_auth.readFileIfExists(gpa, custom_auth)).?;
+    defer gpa.free(after_logout);
+    try std.testing.expect(std.mem.indexOf(u8, after_logout, "index.docker.io") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after_logout, "https://ghcr.io") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after_logout, "quay.io/myorg/app") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_w.written(), "localhost:5000") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_w.written(), "docker.io") != null);
+
+    try std.testing.expectError(error.EntryNotFound, registry_auth.getGenericCredential(gpa, "docker.io", null));
+    const kept = try registry_auth.getGenericCredential(gpa, "unrelated.example.io", null);
+    defer kept.deinit(gpa);
+    try std.testing.expectEqualStrings("keepsecret", kept.secret);
+}
+
+test "Linux dual-file login scrubs persistent auths on --helper-only, prechecks ExternalHelperConflict on --auths-only, normalizes ACR <token>, and enforces helper chmod/shadowing" {
+    const gpa = std.testing.allocator;
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root_dir);
+
+    const rt_dir = try std.fs.path.join(gpa, &.{ root_dir, "run-user" });
+    defer gpa.free(rt_dir);
+    const cfg_dir = try std.fs.path.join(gpa, &.{ root_dir, "xdg-config" });
+    defer gpa.free(cfg_dir);
+    const shadow_bin = try std.fs.path.join(gpa, &.{ root_dir, "shadow-bin" });
+    defer gpa.free(shadow_bin);
+    const local_bin = try std.fs.path.join(gpa, &.{ root_dir, ".local", "bin" });
+    defer gpa.free(local_bin);
+    const state_dir = try std.fs.path.join(gpa, &.{ root_dir, "state" });
+    defer gpa.free(state_dir);
+
+    _ = try Io.Dir.cwd().createDirPathStatus(io, rt_dir, .default_dir);
+    _ = try Io.Dir.cwd().createDirPathStatus(io, cfg_dir, .default_dir);
+    _ = try Io.Dir.cwd().createDirPathStatus(io, shadow_bin, .default_dir);
+    _ = try Io.Dir.cwd().createDirPathStatus(io, local_bin, .default_dir);
+
+    os_tag_override = .linux;
+    defer os_tag_override = null;
+
+    const fake_self = try std.fs.path.join(gpa, &.{ local_bin, "keyring" });
+    defer gpa.free(fake_self);
+    try registry_auth.writeProtectedFileAtomic(gpa, fake_self, "elf-keyring-v2");
+    self_exe_override = fake_self;
+    defer self_exe_override = null;
+
+    // Seed an executable helper in `shadow_bin` (earlier on PATH, without `keyring`) and a non-executable 0600 helper in `local_bin`.
+    const shadow_helper = try std.fs.path.join(gpa, &.{ shadow_bin, "docker-credential-keyring" });
+    defer gpa.free(shadow_helper);
+    try registry_auth.writeProtectedFileAtomic(gpa, shadow_helper, "other-helper");
+    if (comptime (builtin.os.tag != .windows and builtin.os.tag != .wasi)) {
+        const sf = try Io.Dir.cwd().openFile(io, shadow_helper, .{});
+        defer sf.close(io);
+        try sf.setPermissions(io, .fromMode(0o755));
+    }
+
+    const local_helper = try std.fs.path.join(gpa, &.{ local_bin, "docker-credential-keyring" });
+    defer gpa.free(local_helper);
+    try registry_auth.writeProtectedFileAtomic(gpa, local_helper, "elf-keyring-v2"); // 0600, same content as fake_self!
+
+    const combined_path = try std.fmt.allocPrint(gpa, "{s}{c}{s}", .{ shadow_bin, pathListDelimiter(), local_bin });
+    defer gpa.free(combined_path);
+
+    TestGenericBackend.reset(gpa);
+    defer TestGenericBackend.deinit(gpa);
+    registry_auth.generic_store_override = .{
+        .get = TestGenericBackend.get,
+        .set = TestGenericBackend.set,
+        .delete = TestGenericBackend.delete,
+    };
+    defer registry_auth.generic_store_override = null;
+
+    registry_auth.state_dir_override = state_dir;
+    defer registry_auth.state_dir_override = null;
+
+    FakeProviders.reset();
+    provider_hooks_override = FakeProviders.hooks;
+    defer provider_hooks_override = null;
+
+    FakeEnv.reset();
+    FakeEnv.home = root_dir;
+    FakeEnv.path_val = combined_path;
+    FakeEnv.xdg_runtime = rt_dir;
+    FakeEnv.xdg_config = cfg_dir;
+    env_override_fn = FakeEnv.get;
+    defer env_override_fn = null;
+
+    const rt_auth_path = try std.fs.path.join(gpa, &.{ rt_dir, "containers", "auth.json" });
+    defer gpa.free(rt_auth_path);
+    const cfg_auth_path = try std.fs.path.join(gpa, &.{ cfg_dir, "containers", "auth.json" });
+    defer gpa.free(cfg_auth_path);
+
+    // Pre-populate persistent `~/.config/containers/auth.json` with plaintext `"auths"` AND an external helper!
+    try registry_auth.writeProtectedFileAtomic(gpa, cfg_auth_path,
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": { "auth": "b2N0b2NhdDpsZWdhY3lfcGVyc2lzdF9zZWNyZXQ=" }
+        \\  },
+        \\  "credHelpers": {
+        \\    "containers.acme.ghe.com": "ecr-login"
+        \\  }
+        \\}
+    );
+
+    var empty_in = Io.Reader.fixed("");
+    var out_w = Io.Writer.Allocating.init(gpa);
+    defer out_w.deinit();
+    var err_w = Io.Writer.Allocating.init(gpa);
+    defer err_w.deinit();
+
+    // 1. `podman status` reports persistent `"auths"` from `~/.config/containers/auth.json`!
+    try std.testing.expectEqual(@as(u8, 0), try run(gpa, .{ .status = .{} }, &empty_in, &out_w.writer, &err_w.writer));
+    try std.testing.expect(std.mem.indexOf(u8, out_w.written(), "ghcr.io: mode=auths-only, user=octocat") != null);
+
+    // 2. `--auths-only` against `containers.acme.ghe.com` fails with ExternalHelperConflict BEFORE creating `rt_auth_path`!
+    out_w.clearRetainingCapacity();
+    err_w.clearRetainingCapacity();
+    const conflict_cmd = parseArgs(&.{ "login", "--auths-only", "containers.acme.ghe.com" }).?;
+    try std.testing.expectEqual(@as(u8, 1), try run(gpa, conflict_cmd, &empty_in, &out_w.writer, &err_w.writer));
+    try std.testing.expect((try registry_auth.readFileIfExists(gpa, rt_auth_path)) == null);
+
+    // 3. `--helper-only` on `ghcr.io` scrubs `"auths"` from persistent `cfg_auth_path`, restores 0755 on `local_helper`,
+    //    and warns on stderr that `shadow_helper` shadows `local_helper`!
+    out_w.clearRetainingCapacity();
+    err_w.clearRetainingCapacity();
+    const helper_only_cmd = parseArgs(&.{ "login", "--helper-only", "ghcr.io" }).?;
+    try std.testing.expectEqual(@as(u8, 0), try run(gpa, helper_only_cmd, &empty_in, &out_w.writer, &err_w.writer));
+
+    const cfg_after_helper = (try registry_auth.readFileIfExists(gpa, cfg_auth_path)).?;
+    defer gpa.free(cfg_after_helper);
+    try std.testing.expect(std.mem.indexOf(u8, cfg_after_helper, "b2N0b2NhdDpsZWdhY3lfcGVyc2lzdF9zZWNyZXQ=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, err_w.written(), "shadows provisioned") != null);
+    if (comptime (builtin.os.tag != .windows and builtin.os.tag != .wasi)) {
+        const st = try Io.Dir.cwd().statFile(io, local_helper, .{});
+        try std.testing.expect((st.permissions.toMode() & 0o111) != 0);
+    }
+
+    // 4. Stored ACR `<token>` identity token normalizes to `.kind = .basic` with `00000000-0000-0000-0000-000000000000`!
+    const valid_acr_jwt = "eyJhbGciOiJub25lIn0.eyJleHAiOjIwMDAwMDAwMDB9.sig";
+    try registry_auth.storeGenericCredential(gpa, "myacr.azurecr.io", registry_auth.identity_token_username, valid_acr_jwt);
+    var acr_resolved = try resolvePodmanCredentialDetailed(gpa, "myacr.azurecr.io", null, null, false, false, &err_w.writer);
+    defer acr_resolved.credential.deinit(gpa);
+    try std.testing.expectEqual(registry_auth.CredentialKind.basic, acr_resolved.credential.kind);
+    try std.testing.expectEqualStrings(registry_auth.acr_token_username, acr_resolved.credential.username);
+    try std.testing.expectEqualStrings(valid_acr_jwt, acr_resolved.credential.secret);
 }

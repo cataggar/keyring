@@ -848,17 +848,30 @@ pub fn formatCanonicalIpv6Alloc(gpa: Allocator, groups: [8]u16) ProviderError![]
     return gpa.dupe(u8, buf[0..pos]);
 }
 
+fn isAllAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
 fn isValidHostName(host: []const u8) bool {
-    if (host.len == 0) return false;
+    if (host.len == 0 or host.len > 253) return false;
     var labels = std.mem.splitScalar(u8, host, '.');
+    var last_label: []const u8 = "";
     while (labels.next()) |label| {
-        if (label.len == 0) return false;
+        if (label.len == 0 or label.len > 63) return false;
         if (label[0] == '-' or label[label.len - 1] == '-') return false;
         for (label) |c| {
             if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') {
                 return false;
             }
         }
+        last_label = label;
+    }
+    if (isAllAsciiDigits(last_label)) {
+        return parseIpv4Tail(host) != null;
     }
     return true;
 }
@@ -1072,6 +1085,13 @@ test "Target.parseAlloc rejects malformed targets and unsafe components" {
         "https://-bad.example.com",
         "https://bad-.example.com",
         "https://bad%2fhost.example.com",
+        "https://192.0.2.256",
+        "https://0177.0.0.1",
+        "https://127.1",
+        "https://2130706433",
+        "https://example.123",
+        "https://" ++ (&@as([64]u8, @splat('a'))) ++ ".example.com",
+        "https://" ++ ((&@as([63]u8, @splat('a')) ++ ".") ++ (&@as([63]u8, @splat('a')) ++ ".") ++ (&@as([63]u8, @splat('a')) ++ ".")) ++ (&@as([62]u8, @splat('b'))),
     };
 
     for (invalid_cases) |raw| {

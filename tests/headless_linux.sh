@@ -17,16 +17,14 @@ else
   BIN="$ROOT_DIR/zig-out/bin/keyring"
 fi
 
-if [ ! -f "$BIN" ]; then
+if [ ! -x "$BIN" ]; then
   echo "FAIL: locate binary"
-  echo "Could not find $ROOT_DIR/zig-out/bin/keyring. Set KEYRING_BIN to a custom path."
+  echo "Could not find executable $BIN. Set KEYRING_BIN to a custom path."
   exit 1
 fi
 
 SUFFIX="$$-$RANDOM"
-TEST_DIR="$ROOT_DIR/.zig-cache/keyring-headless-linux-$SUFFIX"
-STORE_PATH="$TEST_DIR/credentials.dat"
-BAD_BUS_ADDRESS="unix:path=$TEST_DIR/no-session-bus"
+TEST_DIR=""
 SERVICE="keyring-headless-service-$SUFFIX"
 USER="keyring-headless-user-$SUFFIX"
 PASSPHRASE="keyring-headless-passphrase-$SUFFIX"
@@ -46,12 +44,16 @@ pass() {
 }
 
 cleanup() {
-  rm -rf -- "$TEST_DIR"
+  if [ -n "$TEST_DIR" ]; then
+    rm -rf -- "$TEST_DIR"
+  fi
 }
 
 umask 077
-mkdir "$TEST_DIR" || fail "create isolated test directory" "path: $TEST_DIR"
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
+TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/keyring-headless-linux.XXXXXX")" || fail "create isolated test directory"
+STORE_PATH="$TEST_DIR/credentials.dat"
+BAD_BUS_ADDRESS="unix:path=$TEST_DIR/no-session-bus"
 
 # Point D-Bus at a socket within the test directory that cannot have a daemon.
 set +e

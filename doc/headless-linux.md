@@ -154,7 +154,7 @@ On Linux, `tests/headless_linux.sh` points D-Bus at a nonexistent socket and
 checks that `keyring diagnose` exits successfully with the oo7-daemon, GNOME
 under `dbus-run-session`, and file-backend hints. It also performs an isolated
 file-backend set/get/delete round-trip using a disposable path under
-`.zig-cache/`.
+`${TMPDIR:-/tmp}`.
 
 Run it with the default build:
 

@@ -13,7 +13,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BIN="${KEYRING_BIN:-$ROOT_DIR/zig-out/bin/keyring}"
 
 if [ "${KEYRING_WEBAUTHN_ISOLATED_BUS:-0}" != "1" ]; then
-  exec env KEYRING_WEBAUTHN_ISOLATED_BUS=1 dbus-run-session -- "$0" "$@"
+  exec env KEYRING_WEBAUTHN_ISOLATED_BUS=1 dbus-run-session -- bash "$0" "$@"
 fi
 
 [ -x "$BIN" ] || {
@@ -21,8 +21,30 @@ fi
   exit 1
 }
 
-SUFFIX="$$-$RANDOM"
-TEST_DIR="$ROOT_DIR/.zig-cache/webauthn-service-$SUFFIX"
+TEST_DIR=""
+SERVICE_PID=""
+ENROLL_PID=""
+UNLOCK_PID=""
+
+cleanup() {
+  local pid
+  for pid in "$ENROLL_PID" "$UNLOCK_PID" "$SERVICE_PID"; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  ENROLL_PID=""
+  UNLOCK_PID=""
+  SERVICE_PID=""
+  if [ -n "$TEST_DIR" ]; then
+    rm -rf -- "$TEST_DIR"
+  fi
+}
+
+umask 077
+trap cleanup EXIT INT TERM
+TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/keyring-webauthn.XXXXXX")"
 VAULT_PATH="$TEST_DIR/vault.json"
 HELPER="$TEST_DIR/virtual_webauthn.py"
 SERVICE_LOG="$TEST_DIR/service.log"
@@ -30,15 +52,6 @@ ENROLL_OUT="$TEST_DIR/enroll.out"
 ENROLL_ERR="$TEST_DIR/enroll.err"
 UNLOCK_OUT="$TEST_DIR/unlock.out"
 UNLOCK_ERR="$TEST_DIR/unlock.err"
-SERVICE_PID=""
-
-cleanup() {
-  if [ -n "$SERVICE_PID" ] && kill -0 "$SERVICE_PID" 2>/dev/null; then
-    kill "$SERVICE_PID" 2>/dev/null || true
-    wait "$SERVICE_PID" 2>/dev/null || true
-  fi
-  rm -rf -- "$TEST_DIR"
-}
 
 fail() {
   echo "FAIL: $1"
@@ -64,10 +77,6 @@ wait_for_url() {
   done
   return 1
 }
-
-umask 077
-mkdir -p "$TEST_DIR"
-trap cleanup EXIT
 
 cat >"$HELPER" <<'PY'
 import base64
@@ -201,13 +210,20 @@ export KEYRING_BACKEND=secret_service
 
 "$BIN" service >"$SERVICE_LOG" 2>&1 &
 SERVICE_PID=$!
+SERVICE_READY=0
 for _ in $(seq 1 100); do
   if "$BIN" lock >/dev/null 2>&1; then
+    SERVICE_READY=1
+    break
+  fi
+  if ! kill -0 "$SERVICE_PID" 2>/dev/null; then
     break
   fi
   sleep 0.05
 done
-kill -0 "$SERVICE_PID" 2>/dev/null || fail "keyring service did not start"
+if [ "$SERVICE_READY" -ne 1 ] || ! kill -0 "$SERVICE_PID" 2>/dev/null; then
+  fail "keyring service did not start"
+fi
 
 set +e
 LOCKED_OUTPUT="$("$BIN" get test-svc test-user 2>&1)"
@@ -221,6 +237,7 @@ ENROLL_PID=$!
 ENROLL_URL="$(wait_for_url "$ENROLL_ERR")" || fail "enrollment URL was not printed"
 python3 "$HELPER" enroll "$ENROLL_URL" || fail "virtual enrollment ceremony failed"
 wait "$ENROLL_PID" || fail "keyring enroll failed"
+ENROLL_PID=""
 
 RECOVERY_KEY="$(grep -Eo '([0-9A-HJKMNP-TV-Z]{4}-){5}[0-9A-HJKMNP-TV-Z]{4}' "$ENROLL_OUT" | head -1)"
 [ -n "$RECOVERY_KEY" ] || fail "recovery key was not printed"
@@ -247,6 +264,7 @@ UNLOCK_PID=$!
 UNLOCK_URL="$(wait_for_url "$UNLOCK_ERR")" || fail "unlock URL was not printed"
 python3 "$HELPER" unlock "$UNLOCK_URL" || fail "virtual unlock ceremony failed"
 wait "$UNLOCK_PID" || fail "keyring unlock failed"
+UNLOCK_PID=""
 [ "$("$BIN" get test-svc test-user)" = "integration-secret" ] || fail "browser unlock did not restore access"
 
 "$BIN" lock

@@ -67,9 +67,10 @@ keyring copilot status
 # Transfer Copilot CLI credentials to another machine without leaving plaintext tokens in config.json:
 keyring copilot export ./copilot-export
 keyring copilot import ./copilot-export
+ssh vm 'cat ~/.copilot/config.json' | keyring copilot import -
 ```
 
-`keyring copilot import` accepts JSONC comments and preserves unrelated `config.json` fields such as `loggedInUsers`, `lastLoggedInUser`, and `trustedFolders`. `keyring copilot export <dir>` writes `<dir>/config.json` with restricted user-only permissions containing resolved tokens for transfer to another machine (delete `<dir>` once imported).
+`keyring copilot import` accepts JSONC comments, preserves unrelated `config.json` fields such as `loggedInUsers`, `lastLoggedInUser`, and `trustedFolders`, and reads from `stdin` when `-` is passed. `keyring copilot export <dir>` writes `<dir>/config.json` with restricted user-only permissions containing resolved tokens for transfer to another machine (delete `<dir>` once imported).
 
 ## Commands and examples
 
@@ -77,7 +78,7 @@ keyring copilot import ./copilot-export
 # Authenticate and store a Copilot CLI token in the native OS keyring:
 keyring copilot login
 keyring copilot login -h example.ghe.com -u alice --device
-keyring copilot login -f
+keyring copilot login --hostname example.ghe.com --username alice -f
 
 # Inspect config.json accounts and OS vault storage status:
 keyring copilot status
@@ -87,10 +88,11 @@ keyring copilot token
 eval "$(keyring copilot env)"
 keyring copilot env --shell pwsh | Invoke-Expression
 
-# Migrate local plaintext copilotTokens, or export/import across machines:
+# Migrate local plaintext copilotTokens, or export/import across machines (including stdin):
 keyring copilot import
 keyring copilot export ./copilot-export
 keyring copilot import ./copilot-export
+ssh vm 'cat ~/.copilot/config.json' | keyring copilot import -
 
 # Remove stored Copilot CLI credentials for one account or all accounts:
 keyring copilot logout -h github.com -u alice
@@ -99,12 +101,12 @@ keyring copilot logout --all
 
 ### Subcommand reference
 
-- `keyring copilot login [-h|--hostname <host>] [-u|--user <login>] [--web|--device] [-f|--force]` — Resolve or acquire a GitHub token (reusing stored `gh` / `keyring` credentials unless `-f` / `--force` is given, or authenticating via browser `--web` or device flow `--device`), store it in the OS keyring using Copilot CLI's native credential layout, update `loggedInUsers` and `lastLoggedInUser` in `config.json`, and scrub any matching plaintext `copilotTokens` entry.
-- `keyring copilot logout [-h|--hostname <host>] [-u|--user <login> | --all]` — Delete the stored Copilot CLI credential (or `--all` configured accounts) from the OS keyring and `config.json` without revoking shared `gh` tokens.
+- `keyring copilot login [-h|--hostname <host>] [-u|--user|--username <login>] [--web|--device] [-f|--force]` — Resolve or acquire a GitHub token (reusing stored `gh` / `keyring` credentials unless `-f` / `--force` is given, or authenticating via browser `--web` or device flow `--device`), store it in the OS keyring using Copilot CLI's native credential layout, update `loggedInUsers` and `lastLoggedInUser` in `config.json`, and scrub any matching plaintext `copilotTokens` entry.
+- `keyring copilot logout [-h|--hostname <host>] [-u|--user|--username <login> | --all]` — Delete the stored Copilot CLI credential (or `--all` configured accounts) from the OS keyring and `config.json` without revoking shared `gh` tokens.
 - `keyring copilot status` — Report the resolved `config.json` path, active `lastLoggedInUser`, configured `loggedInUsers`, and whether each account's token is stored in the OS keyring or plaintext `copilotTokens`. `keyring diagnose` also summarizes Copilot CLI configuration and vault status when `~/.copilot/config.json` exists.
-- `keyring copilot token [-h|--hostname <host>] [-u|--user <login>]` — Print the stored Copilot CLI token for the selected account (or `lastLoggedInUser` by default).
-- `keyring copilot env [-h|--hostname <host>] [-u|--user <login>] [--shell <sh|pwsh|cmd|fish>]` — Print shell statements setting `COPILOT_GITHUB_TOKEN` from the OS keyring for `sh`, `pwsh`, `cmd`, or `fish`.
-- `keyring copilot import [<dir-or-file>]` — Without arguments, migrate plaintext `copilotTokens` from `config.json` into the OS keyring and scrub `copilotTokens` from `config.json`. With `<dir-or-file>`, import exported Copilot CLI credentials into the OS keyring and update `config.json`.
+- `keyring copilot token [-h|--hostname <host>] [-u|--user|--username <login>]` — Print the stored Copilot CLI token for the selected account (or `lastLoggedInUser` by default).
+- `keyring copilot env [-h|--hostname <host>] [-u|--user|--username <login>] [--shell <sh|pwsh|cmd|fish>]` — Print shell statements setting `COPILOT_GITHUB_TOKEN` from the OS keyring for `sh`, `pwsh`, `cmd`, or `fish`.
+- `keyring copilot import [<dir-or-file|->]` — Without arguments, migrate plaintext `copilotTokens` from `config.json` into the OS keyring and scrub `copilotTokens` from `config.json`. With `<dir-or-file>` (or `-` to read JSON/JSONC from `stdin`), import exported Copilot CLI credentials into the OS keyring and update `config.json`.
 - `keyring copilot export <dir>` — Export resolved Copilot CLI tokens and account metadata to `<dir>/config.json` with restricted user-only permissions for importing on another machine (delete `<dir>` once imported).
 
 ## Configuration path (`$COPILOT_HOME`)

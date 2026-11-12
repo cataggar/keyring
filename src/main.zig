@@ -22,11 +22,14 @@ const stored_provider = @import("stored_provider.zig");
 const credential_provider_test = @import("credential_provider_test.zig");
 
 test {
-    _ = credential_provider;
-    _ = stored_provider;
-    _ = credential_provider_test;
+    _ = ado;
+    _ = msal_cache;
+    _ = az_export;
+    _ = devops_npm;
     _ = gh;
     _ = git_credential;
+    _ = color;
+    _ = term;
     _ = vault;
     _ = webauthn;
     _ = tunnel_http;
@@ -35,6 +38,12 @@ test {
     _ = podman;
     _ = wslc;
     _ = copilot;
+    _ = credential_provider;
+    _ = stored_provider;
+    _ = credential_provider_test;
+    _ = @import("dpapi.zig");
+    _ = @import("keychain.zig");
+    _ = @import("wincred.zig");
 }
 
 var runtime_env_map: ?*std.process.Environ.Map = null;
@@ -54,14 +63,14 @@ const usage =
     \\  service [options]             Run the built-in Secret Service daemon, or install|uninstall|status.
     \\  enroll [options]              Enroll, list, or revoke security keys.
     \\  unlock [options]              Unlock the built-in service.
-    \\  lock                           Lock the built-in service immediately.
+    \\  lock                          Lock the built-in service immediately.
     \\  --disable                     Use the null backend for this process.
     \\  -b <backend>                  Use a backend for this process.
     \\  set <service> <user>          Store a password from stdin.
     \\  get <service> <user>          Read a password to stdout.
     \\  del <service> <user>          Delete a password.
     \\  az export <dir>               Export Azure CLI token cache to a directory.
-    \\  ado login --hostname <host>    Authenticate and verify access to an Azure DevOps organization.
+    \\  ado login --hostname <host>   Authenticate and verify access to an Azure DevOps organization.
     \\  gh login [options]            Authenticate with a GitHub host (github.com, *.ghe.com, GHES).
     \\  gh export <dir>               Export GitHub CLI credentials to <dir>/hosts.yml.
     \\  gh import [<dir-or-file>]     Import GitHub CLI credentials into the keyring.
@@ -220,6 +229,13 @@ fn isDisallowedProviderAppBackend() bool {
     return false;
 }
 
+fn rejectAdoBackend(stderr: *std.Io.Writer, comptime cmd_name: []const u8) !bool {
+    if (!backendEql(currentBackend(), .ado)) return false;
+    try stderr.writeAll("keyring: backend 'ado' does not support '" ++ cmd_name ++ "' commands\n");
+    try stderr.flush();
+    return true;
+}
+
 fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !u8 {
     return switch (command) {
         .help => code: {
@@ -316,6 +332,7 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
             break :code try az_export.run(arena, cmd.dir, stdout, stderr);
         },
         .gh_login => |opts| code: {
+            if (try rejectAdoBackend(stderr, "gh")) break :code 4;
             break :code try gh.runLogin(arena, opts, stdout, stderr);
         },
         .ado_login => |opts| code: {
@@ -341,9 +358,11 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
             break :code 0;
         },
         .gh_export => |cmd| code: {
+            if (try rejectAdoBackend(stderr, "gh")) break :code 4;
             break :code try gh.runExport(arena, cmd.dir, stdout, stderr);
         },
         .gh_import => |cmd| code: {
+            if (try rejectAdoBackend(stderr, "gh")) break :code 4;
             var stdin_buffer: [4096]u8 = undefined;
             var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
             break :code try gh.runImport(arena, cmd.source, &stdin_reader.interface, stdout, stderr);
@@ -360,23 +379,21 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
             break :code try devops_npm.run(arena, io, opts, stdout, stderr);
         },
         .podman => |subcmd| code: {
+            if (try rejectAdoBackend(stderr, "podman")) break :code 4;
             var stdin_buffer: [4096]u8 = undefined;
             defer std.crypto.secureZero(u8, &stdin_buffer);
             var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
             break :code try podman.run(arena, subcmd, &stdin_reader.interface, stdout, stderr);
         },
         .wslc => |subcmd| code: {
+            if (try rejectAdoBackend(stderr, "wslc")) break :code 4;
             var stdin_buffer: [4096]u8 = undefined;
             defer std.crypto.secureZero(u8, &stdin_buffer);
             var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
             break :code try wslc.run(arena, subcmd, &stdin_reader.interface, stdout, stderr);
         },
         .copilot => |subcmd| code: {
-            if (backendEql(currentBackend(), .ado)) {
-                try stderr.writeAll("keyring: backend 'ado' does not support 'copilot' commands\n");
-                try stderr.flush();
-                break :code 4;
-            }
+            if (try rejectAdoBackend(stderr, "copilot")) break :code 4;
             var stdin_buffer: [4096]u8 = undefined;
             defer std.crypto.secureZero(u8, &stdin_buffer);
             var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
@@ -522,7 +539,7 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
             parsed.command = if (gh.parseLoginArgs(rest[1..])) |opts|
                 .{ .gh_login = opts }
             else
-                .{ .usage_error = "usage: keyring gh login [-h|--hostname <host>] [--scopes <scopes>] [--web|--device]" };
+                .{ .usage_error = "usage: keyring gh login [-h|--hostname <host>] [-s|--scopes <scopes>] [-w|--web|--device]" };
         } else if (rest.len == 2 and std.mem.eql(u8, rest[0], "export") and rest[1].len > 0) {
             parsed.command = .{ .gh_export = .{ .dir = rest[1] } };
         } else if (rest.len == 1 and std.mem.eql(u8, rest[0], "import")) {
@@ -559,7 +576,7 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
         parsed.command = if (devops_npm.parseArgs(rest)) |opts|
             .{ .devops_npm = opts }
         else
-            .{ .usage_error = "usage: keyring devops-npm [-c <path>] [-f|--force] [--validate-only]" };
+            .{ .usage_error = "usage: keyring devops-npm [-c|--config-file <path>] [-f|--force] [--validate-only]" };
         return parsed;
     }
 
@@ -1239,7 +1256,12 @@ fn effectiveBackend(service_name: ?[]const u8) Backend {
 
 fn readAppEnvBackend() ?Backend {
     const value = getEnvVar("KEYRING_BACKEND") orelse return null;
-    if (std.mem.eql(u8, value, "ado") or std.mem.eql(u8, value, "azure_devops")) return .ado;
+    const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+    if (std.ascii.eqlIgnoreCase(trimmed, "ado") or
+        std.ascii.eqlIgnoreCase(trimmed, "azure_devops"))
+    {
+        return .ado;
+    }
     return null;
 }
 
@@ -1408,31 +1430,86 @@ test "runCommand dispatches help list-backends diagnose" {
     try expectContains(diagnose_output, "KEYRING_BACKEND env:");
 }
 
-test "runCommand rejects copilot subcommands when backend is ado" {
+test "runCommand rejects unsupported subcommands when backend is ado" {
     const prev_override = app_backend_override;
-    defer app_backend_override = prev_override;
-    app_backend_override = .ado;
+    const prev_env_checked = app_env_backend_checked;
+    const prev_env_backend = app_env_backend;
+    const prev_env_map = runtime_env_map;
+    defer {
+        app_backend_override = prev_override;
+        app_env_backend_checked = prev_env_checked;
+        app_env_backend = prev_env_backend;
+        runtime_env_map = prev_env_map;
+    }
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
 
-    var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer stdout.deinit();
-    var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer stderr.deinit();
+    const cases = [_]struct {
+        cmd: Command,
+        expected_stderr: []const u8,
+    }{
+        .{
+            .cmd = .{ .copilot = .{ .token = .{} } },
+            .expected_stderr = "keyring: backend 'ado' does not support 'copilot' commands\n",
+        },
+        .{
+            .cmd = .{ .podman = .{ .status = .{} } },
+            .expected_stderr = "keyring: backend 'ado' does not support 'podman' commands\n",
+        },
+        .{
+            .cmd = .{ .wslc = .status },
+            .expected_stderr = "keyring: backend 'ado' does not support 'wslc' commands\n",
+        },
+        .{
+            .cmd = .{ .gh_login = .{} },
+            .expected_stderr = "keyring: backend 'ado' does not support 'gh' commands\n",
+        },
+        .{
+            .cmd = .{ .gh_export = .{ .dir = "./gh-out" } },
+            .expected_stderr = "keyring: backend 'ado' does not support 'gh' commands\n",
+        },
+        .{
+            .cmd = .{ .gh_import = .{ .source = null } },
+            .expected_stderr = "keyring: backend 'ado' does not support 'gh' commands\n",
+        },
+    };
 
-    const rc = try runCommand(
-        .{ .copilot = .{ .token = .{} } },
-        arena.allocator(),
-        std.Io.Threaded.global_single_threaded.io(),
-        &stdout.writer,
-        &stderr.writer,
-    );
-    try std.testing.expectEqual(@as(u8, 4), rc);
-    try std.testing.expectEqualStrings(
-        "keyring: backend 'ado' does not support 'copilot' commands\n",
-        stderr.written(),
-    );
+    app_backend_override = .ado;
+    for (cases) |tc| {
+        var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer stderr.deinit();
+
+        const rc = try runCommand(tc.cmd, arena.allocator(), io, &stdout.writer, &stderr.writer);
+        try std.testing.expectEqual(@as(u8, 4), rc);
+        try std.testing.expectEqualStrings(tc.expected_stderr, stderr.written());
+    }
+
+    app_backend_override = null;
+    var env_map = try std.process.Environ.createMap(.empty, std.testing.allocator);
+    defer env_map.deinit();
+    runtime_env_map = &env_map;
+
+    for ([_][]const u8{ "  ADO \t", "Azure_DevOps\n" }) |env_val| {
+        try env_map.put("KEYRING_BACKEND", env_val);
+        app_env_backend_checked = false;
+        app_env_backend = null;
+        try std.testing.expectEqual(@as(?Backend, .ado), readAppEnvBackend());
+
+        for (cases) |tc| {
+            var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer stdout.deinit();
+            var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer stderr.deinit();
+
+            const rc = try runCommand(tc.cmd, arena.allocator(), io, &stdout.writer, &stderr.writer);
+            try std.testing.expectEqual(@as(u8, 4), rc);
+            try std.testing.expectEqualStrings(tc.expected_stderr, stderr.written());
+        }
+    }
 }
 
 test "parseArgs recognizes set get del" {
@@ -1555,9 +1632,11 @@ test "parseArgs recognizes gh login, export, and import" {
     try std.testing.expectEqualStrings("example.ghe.com", login_ghe.command.gh_login.hostname);
     try std.testing.expectEqual(gh.LoginMode.device, login_ghe.command.gh_login.mode);
 
-    const login_short_h = parseArgs(&.{ "keyring", "gh", "login", "-h", "microsoft.ghe.com" });
+    const login_short_h = parseArgs(&.{ "keyring", "gh", "login", "-h", "microsoft.ghe.com", "-s", "repo,read:packages", "-w" });
     try expectCommandTag(.gh_login, login_short_h);
     try std.testing.expectEqualStrings("microsoft.ghe.com", login_short_h.command.gh_login.hostname);
+    try std.testing.expectEqualStrings("repo,read:packages", login_short_h.command.gh_login.scopes);
+    try std.testing.expectEqual(gh.LoginMode.web, login_short_h.command.gh_login.mode);
 
     const exp = parseArgs(&.{ "keyring", "gh", "export", "/tmp/gh-out" });
     try expectCommandTag(.gh_export, exp);
@@ -1572,7 +1651,10 @@ test "parseArgs recognizes gh login, export, and import" {
     try std.testing.expectEqualStrings("/tmp/gh-out", imp_dir.command.gh_import.source.?);
 
     try expectUsage(parseArgs(&.{ "keyring", "gh" }));
-    try expectUsage(parseArgs(&.{ "keyring", "gh", "login", "--web", "--device" }));
+    const bad_gh_login = parseArgs(&.{ "keyring", "gh", "login", "--web", "--device" });
+    try expectUsage(bad_gh_login);
+    try expectContains(bad_gh_login.command.usage_error, "-s|--scopes");
+    try expectContains(bad_gh_login.command.usage_error, "-w|--web");
     try expectUsage(parseArgs(&.{ "keyring", "gh", "export" }));
     try expectUsage(parseArgs(&.{ "keyring", "gh", "export", "/tmp/a", "extra" }));
     try expectUsage(parseArgs(&.{ "keyring", "gh", "import", "/tmp/a", "extra" }));
@@ -1633,8 +1715,79 @@ test "parseArgs recognizes devops-npm" {
     try std.testing.expect(flags.command.devops_npm.validate_only);
     try std.testing.expectEqualStrings("sub/.npmrc", flags.command.devops_npm.config_file.?);
 
-    try expectUsage(parseArgs(&.{ "keyring", "devops-npm", "--bogus" }));
+    const long_cfg = parseArgs(&.{ "keyring", "devops-npm", "--config-file", "other/.npmrc" });
+    try expectCommandTag(.devops_npm, long_cfg);
+    try std.testing.expectEqualStrings("other/.npmrc", long_cfg.command.devops_npm.config_file.?);
+
+    const bad_npm = parseArgs(&.{ "keyring", "devops-npm", "--bogus" });
+    try expectUsage(bad_npm);
+    try expectContains(bad_npm.command.usage_error, "-c|--config-file <path>");
     try expectUsage(parseArgs(&.{ "keyring", "devops-npm", "-c" }));
+}
+
+test "parseArgs recognizes docker-credential-keyring argv0 and podman subcommands" {
+    const argv0_get = parseArgs(&.{ "docker-credential-keyring", "get" });
+    try expectCommandTag(.podman, argv0_get);
+    try std.testing.expectEqual(registry_auth.HelperOperation.get, argv0_get.command.podman.credential);
+
+    const argv0_store = parseArgs(&.{ "/usr/local/bin/docker-credential-keyring", "store" });
+    try expectCommandTag(.podman, argv0_store);
+    try std.testing.expectEqual(registry_auth.HelperOperation.store, argv0_store.command.podman.credential);
+
+    const argv0_win_erase = parseArgs(&.{ "C:\\bin\\docker-credential-keyring.exe", "erase" });
+    try expectCommandTag(.podman, argv0_win_erase);
+    try std.testing.expectEqual(registry_auth.HelperOperation.erase, argv0_win_erase.command.podman.credential);
+
+    const argv0_win_list = parseArgs(&.{ "C:\\bin\\docker-credential-keyring.exe", "list" });
+    try expectCommandTag(.podman, argv0_win_list);
+    try std.testing.expectEqual(registry_auth.HelperOperation.list, argv0_win_list.command.podman.credential);
+
+    const argv0_win_ver = parseArgs(&.{ "C:\\bin\\DOCKER-CREDENTIAL-KEYRING.EXE", "version" });
+    try expectCommandTag(.podman, argv0_win_ver);
+    try std.testing.expectEqual(registry_auth.HelperOperation.version, argv0_win_ver.command.podman.credential);
+
+    try expectUsage(parseArgs(&.{"docker-credential-keyring"}));
+    try expectUsage(parseArgs(&.{ "docker-credential-keyring", "bogus" }));
+    try expectUsage(parseArgs(&.{ "C:\\bin\\docker-credential-keyring.exe", "get", "extra" }));
+
+    const login_cmd = parseArgs(&.{ "keyring", "podman", "login", "ghcr.io", "myacr.azurecr.io", "-f", "--helper-only", "--authfile", "./auth.json" });
+    try expectCommandTag(.podman, login_cmd);
+    try std.testing.expectEqual(@as(usize, 2), login_cmd.command.podman.login.server_count);
+    try std.testing.expect(login_cmd.command.podman.login.force);
+    try std.testing.expectEqual(podman.LoginMode.helper_only, login_cmd.command.podman.login.mode);
+    try std.testing.expectEqualStrings("./auth.json", login_cmd.command.podman.login.authfile.?);
+
+    const login_stdin = parseArgs(&.{ "keyring", "podman", "login", "-u", "alice", "--password-stdin", "registry.example.com" });
+    try expectCommandTag(.podman, login_stdin);
+    try std.testing.expect(login_stdin.command.podman.login.password_stdin);
+    try std.testing.expectEqualStrings("alice", login_stdin.command.podman.login.username.?);
+
+    const config_cmd = parseArgs(&.{ "keyring", "podman", "config", "ghcr.io", "myacr.azurecr.io", "--authfile", "./auth.json" });
+    try expectCommandTag(.podman, config_cmd);
+    try std.testing.expectEqual(@as(usize, 2), config_cmd.command.podman.config.server_count);
+    try std.testing.expectEqualStrings("./auth.json", config_cmd.command.podman.config.authfile.?);
+
+    const logout_all = parseArgs(&.{ "keyring", "podman", "logout", "--all" });
+    try expectCommandTag(.podman, logout_all);
+    try std.testing.expect(logout_all.command.podman.logout.all);
+
+    const status_cmd = parseArgs(&.{ "keyring", "podman", "status", "--authfile", "./auth.json" });
+    try expectCommandTag(.podman, status_cmd);
+    try std.testing.expectEqualStrings("./auth.json", status_cmd.command.podman.status.authfile.?);
+
+    const cred_ver = parseArgs(&.{ "keyring", "podman", "credential", "version" });
+    try expectCommandTag(.podman, cred_ver);
+    try std.testing.expectEqual(registry_auth.HelperOperation.version, cred_ver.command.podman.credential);
+
+    try expectUsage(parseArgs(&.{ "keyring", "podman" }));
+    try expectUsage(parseArgs(&.{ "keyring", "podman", "bogus" }));
+    try expectUsage(parseArgs(&.{ "keyring", "podman", "config" }));
+    try expectUsage(parseArgs(&.{ "keyring", "podman", "logout" }));
+    try expectUsage(parseArgs(&.{ "keyring", "podman", "logout", "--all", "ghcr.io" }));
+    try expectUsage(parseArgs(&.{ "keyring", "podman", "login", "--helper-only", "--auths-only", "ghcr.io" }));
+    try expectUsage(parseArgs(&.{ "keyring", "podman", "login", "--password-stdin", "ghcr.io" }));
+    try expectUsage(parseArgs(&.{ "keyring", "podman", "credential" }));
+    try expectUsage(parseArgs(&.{ "keyring", "podman", "credential", "bogus" }));
 }
 
 test "parseArgs recognizes wslc subcommands" {
@@ -1730,9 +1883,17 @@ test "parseArgs recognizes backend flag" {
     try std.testing.expect(backendEql(.{ .keyring = .file }, parsed_file.backend.?));
     try expectCommandTag(.get, parsed_file);
 
+    const parsed_null_backend = parseArgs(&.{ "keyring", "-b", "null_backend", "get", "svc", "user" });
+    try std.testing.expect(backendEql(.{ .keyring = .null_backend }, parsed_null_backend.backend.?));
+    try expectCommandTag(.get, parsed_null_backend);
+
     const parsed_ado = parseArgs(&.{ "keyring", "-b", "ado", "get", "https://pkgs.dev.azure.com/org/_packaging/feed/pypi/simple/", "VssSessionToken" });
     try std.testing.expect(backendEql(.ado, parsed_ado.backend.?));
     try expectCommandTag(.get, parsed_ado);
+
+    const parsed_azure_devops = parseArgs(&.{ "keyring", "-b", "azure_devops", "get", "https://pkgs.dev.azure.com/org/_packaging/feed/pypi/simple/", "VssSessionToken" });
+    try std.testing.expect(backendEql(.ado, parsed_azure_devops.backend.?));
+    try expectCommandTag(.get, parsed_azure_devops);
 }
 
 test "parseArgs recognizes disable" {
@@ -1758,6 +1919,7 @@ test "parseArgs rejects bad input" {
 test "exit code mapping" {
     try std.testing.expectEqual(@as(u8, 3), exitCodeFor(error.EntryNotFound));
     try std.testing.expectEqual(@as(u8, 4), exitCodeFor(error.NoStorageAccess));
+    try std.testing.expectEqual(@as(u8, 2), exitCodeFor(error.InvalidStoreSelector));
     try std.testing.expectEqual(@as(u8, 1), exitCodeFor(error.Locked));
     try std.testing.expectEqual(@as(u8, 1), exitCodeFor(error.PlatformFailure));
     try std.testing.expectEqual(@as(u8, 1), exitCodeFor(error.Ambiguous));
@@ -1853,15 +2015,4 @@ test "isDisallowedProviderAppBackend fails closed when app backend is ado" {
     app_env_backend = null;
     try std.testing.expect(!isDisallowedProviderAppBackend());
     try stored_provider.checkSecureBackendAvailable(std.testing.allocator);
-}
-
-test {
-    _ = az_export;
-    _ = devops_npm;
-    _ = gh;
-}
-
-test {
-    _ = @import("webauthn.zig");
-    _ = @import("tunnel_http.zig");
 }

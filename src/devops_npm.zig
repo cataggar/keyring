@@ -189,6 +189,12 @@ pub fn run(gpa: Allocator, io: Io, opts: Options, stdout: *Io.Writer, stderr: *I
                 else => 1,
             };
         };
+        if (!isUsableTokenLiteral(token)) {
+            std.crypto.secureZero(u8, token);
+            try stderr.print("keyring: devops-npm: received unsafe or invalid token for organization '{s}'\n", .{spec.org});
+            try stderr.flush();
+            return 1;
+        }
         try org_tokens.put(a, spec.org, token);
     }
 
@@ -215,7 +221,15 @@ pub fn run(gpa: Allocator, io: Io, opts: Options, stdout: *Io.Writer, stderr: *I
         }
     }
 
-    const updated_content = try patchUserNpmrc(a, user_content, updates.items);
+    const updated_content = patchUserNpmrc(a, user_content, updates.items) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try stderr.print("keyring: devops-npm: failed to format {s}: {s}\n", .{ user_npmrc, @errorName(err) });
+            try stderr.flush();
+            return 1;
+        },
+    };
+    defer std.crypto.secureZero(u8, updated_content);
     writeFileAtomic(a, user_npmrc, updated_content) catch |err| {
         try stderr.print("keyring: devops-npm: failed to write {s}: {s}\n", .{ user_npmrc, @errorName(err) });
         try stderr.flush();
@@ -237,8 +251,16 @@ fn putOrUpdateToken(a: Allocator, updates: *std.ArrayList(TokenUpdate), normaliz
     try updates.append(a, .{ .normalized = normalized, .token = token });
 }
 
+fn hasControlChars(s: []const u8) bool {
+    for (s) |c| {
+        if (c < 0x20 or c == 0x7f) return true;
+    }
+    return false;
+}
+
 fn isUsableTokenLiteral(token: []const u8) bool {
-    const trimmed = std.mem.trim(u8, token, " \t\r\n");
+    if (hasControlChars(token)) return false;
+    const trimmed = std.mem.trim(u8, token, " ");
     if (trimmed.len == 0) return false;
     // Reject unexpanded ${VAR} placeholders.
     if (std.mem.indexOf(u8, trimmed, "${") != null) return false;
@@ -322,6 +344,7 @@ pub fn normalizeRegistryUrl(a: Allocator, raw_url: []const u8) ![]const u8 {
         rest = rest["//".len..];
     }
     if (rest.len == 0) return error.InvalidRegistryUrl;
+    if (hasControlChars(rest) or std.mem.indexOfScalar(u8, rest, ' ') != null) return error.InvalidRegistryUrl;
     if (std.mem.indexOfScalar(u8, rest, '/') == null) return error.InvalidRegistryUrl;
 
     if (std.mem.endsWith(u8, rest, "/")) {
@@ -364,8 +387,16 @@ fn parseAuthTokenLine(line: []const u8) ?ParsedAuthLine {
 /// Update or append `//<registry>:_authToken=<token>` lines in `user_content`,
 /// preserving all unrelated settings, comments, and line ordering.
 pub fn patchUserNpmrc(a: Allocator, user_content: []const u8, updates: []const TokenUpdate) ![]u8 {
+    for (updates) |u| {
+        if (u.token.len == 0 or hasControlChars(u.token)) return error.InvalidToken;
+        if (u.normalized.len == 0 or hasControlChars(u.normalized)) return error.InvalidRegistryUrl;
+    }
+
     var out = std.Io.Writer.Allocating.init(a);
-    errdefer out.deinit();
+    errdefer {
+        std.crypto.secureZero(u8, out.written());
+        out.deinit();
+    }
 
     const applied = try a.alloc(bool, updates.len);
     @memset(applied, false);
@@ -425,7 +456,10 @@ pub fn authorizationHeaderForToken(gpa: Allocator, token: []const u8) ![]u8 {
         return std.fmt.allocPrint(gpa, "Bearer {s}", .{token});
     }
     const raw = try std.fmt.allocPrint(gpa, ":{s}", .{token});
-    defer gpa.free(raw);
+    defer {
+        std.crypto.secureZero(u8, raw);
+        gpa.free(raw);
+    }
     const enc_len = std.base64.standard.Encoder.calcSize(raw.len);
     const prefix = "Basic ";
     const out = try gpa.alloc(u8, prefix.len + enc_len);
@@ -441,9 +475,17 @@ fn liveValidateToken(gpa: Allocator, io: Io, org: []const u8, token: []const u8)
         .{org},
     ) catch return false;
     defer gpa.free(url);
+    return validateTokenAtUrl(gpa, io, url, token);
+}
+
+fn validateTokenAtUrl(gpa: Allocator, io: Io, url: []const u8, token: []const u8) bool {
+    if (!isUsableTokenLiteral(token)) return false;
 
     const auth = authorizationHeaderForToken(gpa, token) catch return false;
-    defer gpa.free(auth);
+    defer {
+        std.crypto.secureZero(u8, auth);
+        gpa.free(auth);
+    }
 
     var response = std.Io.Writer.Allocating.init(gpa);
     defer response.deinit();
@@ -457,17 +499,18 @@ fn liveValidateToken(gpa: Allocator, io: Io, org: []const u8, token: []const u8)
     const result = client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
+        .headers = .{ .authorization = .{ .override = auth } },
         .extra_headers = &.{
             .{ .name = "accept", .value = "application/json" },
-            .{ .name = "authorization", .value = auth },
         },
+        .redirect_behavior = .not_allowed,
         .response_writer = &response.writer,
     }) catch return false;
 
     // Matching @microsoft/artifacts-npm-credprovider's makeADORequest: feed ID
     // "1" does not exist, so an authenticated request returns 404 Not Found (or
-    // 200 OK), whereas an invalid/expired token returns 401/403 or 203
-    // Non-Authoritative Information (sign-in redirect).
+    // 200 OK), whereas an invalid/expired token returns 401/403, 302 Found, or
+    // 203 Non-Authoritative Information (sign-in redirect).
     return result.status == .ok or result.status == .not_found;
 }
 
@@ -481,12 +524,17 @@ fn liveAcquireOrgToken(gpa: Allocator, io: Io, stderr: *Io.Writer, registry_url:
     //    npm `_authToken` values against Azure Artifacts feeds.
     for ([_][]const u8{ "SYSTEM_ACCESSTOKEN", "AZURE_DEVOPS_EXT_PAT" }) |env_name| {
         if (getEnvVarOwned(gpa, env_name)) |val| {
-            const trimmed = std.mem.trim(u8, val, " \t\r\n");
-            if (trimmed.len > 0) {
-                defer gpa.free(val);
-                return gpa.dupe(u8, trimmed);
+            defer {
+                std.crypto.secureZero(u8, val);
+                gpa.free(val);
             }
-            gpa.free(val);
+            if (val.len > 0) {
+                if (hasControlChars(val)) return error.AuthenticationFailed;
+                const trimmed = std.mem.trim(u8, val, " ");
+                if (trimmed.len > 0) {
+                    return gpa.dupe(u8, trimmed);
+                }
+            }
         }
     }
 
@@ -497,8 +545,17 @@ fn liveAcquireOrgToken(gpa: Allocator, io: Io, stderr: *Io.Writer, registry_url:
     //    possible, or fall back to the Entra bearer token directly (e.g. for
     //    service principals).
     if (tryAzureCliAccessToken(gpa, io)) |access_token| {
-        defer gpa.free(access_token);
+        defer {
+            std.crypto.secureZero(u8, access_token);
+            gpa.free(access_token);
+        }
+        if (hasControlChars(access_token)) return error.AuthenticationFailed;
         if (ado.exchangeForSessionToken(gpa, access_token, org, bypass_session_cache)) |session_token| {
+            if (hasControlChars(session_token)) {
+                std.crypto.secureZero(u8, session_token);
+                gpa.free(session_token);
+                return error.AuthenticationFailed;
+            }
             return session_token;
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -511,6 +568,11 @@ fn liveAcquireOrgToken(gpa: Allocator, io: Io, stderr: *Io.Writer, registry_url:
     const cred = try ado.getCredentialWithOptions(gpa, stderr, registry_url, .{
         .bypass_session_cache = bypass_session_cache,
     });
+    if (hasControlChars(cred.password)) {
+        std.crypto.secureZero(u8, cred.password);
+        gpa.free(cred.password);
+        return error.AuthenticationFailed;
+    }
     return cred.password;
 }
 
@@ -532,7 +594,10 @@ fn tryAzureCliAccessToken(gpa: Allocator, io: Io) ?[]u8 {
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(256 * 1024),
     }) catch return null;
-    defer gpa.free(result.stdout);
+    defer {
+        std.crypto.secureZero(u8, result.stdout);
+        gpa.free(result.stdout);
+    }
     defer gpa.free(result.stderr);
 
     switch (result.term) {
@@ -551,7 +616,9 @@ pub fn parseAzureCliAccessToken(gpa: Allocator, body: []const u8) ![]u8 {
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
-    if (parsed.value.accessToken.len == 0) return error.InvalidTokenResponse;
+    if (parsed.value.accessToken.len == 0 or hasControlChars(parsed.value.accessToken)) {
+        return error.InvalidTokenResponse;
+    }
     return gpa.dupe(u8, parsed.value.accessToken);
 }
 
@@ -635,19 +702,28 @@ fn writeFileAtomic(gpa: Allocator, path: []const u8, contents: []const u8) !void
         }
     }
     var suffix_bytes: [8]u8 = undefined;
-    io.random(&suffix_bytes);
+    io.randomSecure(&suffix_bytes) catch io.random(&suffix_bytes);
     const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
     const tmp = try std.fmt.allocPrint(gpa, "{s}.{s}.tmp", .{ path, suffix_hex });
     defer gpa.free(tmp);
+
+    var cleanup_tmp = false;
+    defer if (cleanup_tmp) std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
     {
-        var file = std.Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true, .permissions = filePermissions() }) catch return error.WriteFailure;
+        var file = std.Io.Dir.cwd().createFile(io, tmp, .{
+            .truncate = true,
+            .exclusive = true,
+            .permissions = filePermissions(),
+        }) catch return error.WriteFailure;
+        cleanup_tmp = true;
         defer file.close(io);
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            file.setPermissions(io, .fromMode(0o600)) catch return error.WriteFailure;
+        }
         file.writeStreamingAll(io, contents) catch return error.WriteFailure;
     }
-    std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, io) catch {
-        std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
-        return error.WriteFailure;
-    };
+    std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, io) catch return error.WriteFailure;
+    cleanup_tmp = false;
 }
 
 fn dirPermissions() std.Io.File.Permissions {
@@ -883,4 +959,87 @@ test "run authenticates workspace feeds, deduplicates orgs, and honors validate-
     try std.testing.expectEqual(@as(u8, 0), code_force);
     try std.testing.expectEqual(@as(usize, 2), FakeState.acquire_calls);
     try std.testing.expect(FakeState.last_bypass_cache);
+}
+
+test "rejects .npmrc newline/control injection in tokens" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_][]const u8{
+        "tok\nscript-shell=/bin/evil",
+        "tok\rscript-shell=/bin/evil",
+        "tok\x00evil",
+        "tok\x1bevil",
+        "tok\x7fevil",
+        "tok\n",
+    }) |bad_tok| {
+        try std.testing.expect(!isUsableTokenLiteral(bad_tok));
+        const updates = [_]TokenUpdate{.{
+            .normalized = "pkgs.dev.azure.com/org/_packaging/feed/npm/registry/",
+            .token = bad_tok,
+        }};
+        try std.testing.expectError(error.InvalidToken, patchUserNpmrc(a, "", &updates));
+    }
+
+    try std.testing.expectError(
+        error.InvalidTokenResponse,
+        parseAzureCliAccessToken(std.testing.allocator, "{\"accessToken\":\"tok\\nscript-shell=evil\"}"),
+    );
+}
+
+test "validateTokenAtUrl rejects 302 sign-in redirects without following them and accepts 404" {
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var address: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(0) };
+    var server = try Io.net.IpAddress.listen(&address, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const port = server.socket.address.getPort();
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/_apis/packaging/feeds/1", .{port});
+    defer gpa.free(url);
+
+    const ServerThread = struct {
+        fn serve(srv: *Io.net.Server, bound_port: u16) void {
+            const thread_io = std.Io.Threaded.global_single_threaded.io();
+            var redirect_buf: [256]u8 = undefined;
+            const redirect_resp = std.fmt.bufPrint(
+                &redirect_buf,
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/signin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                .{bound_port},
+            ) catch return;
+            const responses = [_][]const u8{
+                redirect_resp,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            };
+            for (responses) |raw_resp| {
+                var stream = srv.accept(thread_io) catch return;
+                defer stream.socket.close(thread_io);
+
+                var read_buf: [2048]u8 = undefined;
+                var reader = stream.reader(thread_io, &read_buf);
+                while (true) {
+                    const line = reader.interface.takeDelimiterExclusive('\n') catch break;
+                    if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
+                }
+
+                var write_buf: [512]u8 = undefined;
+                var writer = stream.writer(thread_io, &write_buf);
+                writer.interface.writeAll(raw_resp) catch {};
+                writer.interface.flush() catch {};
+            }
+        }
+    };
+
+    const thread = try std.Thread.spawn(.{}, ServerThread.serve, .{ &server, port });
+    defer thread.join();
+
+    // 1. 302 Found sign-in redirect must NOT follow Location to a 200 OK page; returns false immediately.
+    try std.testing.expect(!validateTokenAtUrl(gpa, io, url, "expired-pat"));
+    // 2. 404 Not Found on feed 1 means authentication succeeded.
+    try std.testing.expect(validateTokenAtUrl(gpa, io, url, "valid-pat"));
+    // 3. 401 Unauthorized returns false.
+    try std.testing.expect(!validateTokenAtUrl(gpa, io, url, "bad-pat"));
 }

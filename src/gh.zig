@@ -73,6 +73,17 @@ fn activeSecretStore() SecretStore {
     return secret_store_override orelse live_secret_store;
 }
 
+fn isStorageDisabled() bool {
+    return secret_store_override == null and keyring_zig.currentBackend() == .null_backend;
+}
+
+fn hasYamlControlChars(s: []const u8) bool {
+    for (s) |c| {
+        if (c < 0x20 or c == 0x7f) return true;
+    }
+    return false;
+}
+
 pub const KeyValue = struct {
     key: []const u8,
     value: []const u8,
@@ -131,6 +142,12 @@ pub fn runExport(
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
+    if (isStorageDisabled()) {
+        try stderr.writeAll("keyring: gh export: no storage access to OS keyring\n");
+        try stderr.flush();
+        return 4;
+    }
+
     const config_dir = resolveGhConfigDir(a) orelse {
         try stderr.writeAll("keyring: gh export: could not resolve gh config directory (HOME not set)\n");
         try stderr.flush();
@@ -146,6 +163,7 @@ pub fn runExport(
         try stderr.flush();
         return 3;
     };
+    defer std.crypto.secureZero(u8, content);
 
     const hosts = try parseHostsYaml(a, content);
     if (hosts.items.len == 0) {
@@ -225,7 +243,15 @@ pub fn runExport(
         return 3;
     }
 
-    const rendered = try formatHostsYaml(a, hosts.items, .plaintext);
+    const rendered = formatHostsYaml(a, hosts.items, .plaintext) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try stderr.print("keyring: gh export: invalid hosts configuration: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            return 1;
+        },
+    };
+    defer std.crypto.secureZero(u8, rendered);
     const out_path = try std.fs.path.join(a, &.{ dest_dir_path, hosts_filename });
     writePrivateFile(dest_dir_path, hosts_filename, rendered) catch |err| {
         try stderr.print("keyring: gh export: failed to write {s}: {s}\n", .{ out_path, @errorName(err) });
@@ -287,9 +313,16 @@ pub fn runImport(
     };
     const local_hosts_path = try std.fs.path.join(a, &.{ config_dir, hosts_filename });
 
+    if (isStorageDisabled()) {
+        try stderr.writeAll("keyring: gh import: no storage access to OS keyring\n");
+        try stderr.flush();
+        return 4;
+    }
+
     const source_content = try loadImportSource(a, source_arg, local_hosts_path, stdin, stderr) orelse {
         return 3;
     };
+    defer std.crypto.secureZero(u8, source_content);
 
     const imported_hosts = try parseHostsYaml(a, source_content);
     if (imported_hosts.items.len == 0) {
@@ -345,14 +378,22 @@ pub fn runImport(
     }
 
     // Load existing local hosts.yml (if present) and merge imported hosts/users.
-    var merged_hosts = if (readFileIfExists(a, local_hosts_path)) |existing_yaml|
-        try parseHostsYaml(a, existing_yaml)
-    else
-        std.ArrayListUnmanaged(HostConfig).empty;
+    var merged_hosts = if (readFileIfExists(a, local_hosts_path)) |existing_yaml| blk: {
+        defer std.crypto.secureZero(u8, existing_yaml);
+        break :blk try parseHostsYaml(a, existing_yaml);
+    } else std.ArrayListUnmanaged(HostConfig).empty;
 
     try mergeHosts(a, &merged_hosts, imported_hosts.items);
 
-    const rendered = try formatHostsYaml(a, merged_hosts.items, .keyring);
+    const rendered = formatHostsYaml(a, merged_hosts.items, .keyring) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try stderr.print("keyring: gh import: invalid hosts configuration: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            return 1;
+        },
+    };
+    defer std.crypto.secureZero(u8, rendered);
     writePrivateFile(config_dir, hosts_filename, rendered) catch |err| {
         try stderr.print("keyring: gh import: failed to write {s}: {s}\n", .{ local_hosts_path, @errorName(err) });
         try stderr.flush();
@@ -393,14 +434,7 @@ fn loadImportSource(
     };
 
     if (std.mem.eql(u8, arg, "-")) {
-        var writer = Io.Writer.Allocating.init(gpa);
-        errdefer writer.deinit();
-        _ = stdin.streamRemaining(&writer.writer) catch {
-            try stderr.writeAll("keyring: gh import: failed to read stdin\n");
-            try stderr.flush();
-            return null;
-        };
-        return try writer.toOwnedSlice();
+        return try readBoundedImportStdin(gpa, stdin, 4 * 1024 * 1024, stderr);
     }
 
     // Check if `arg/hosts.yml` exists (directory argument).
@@ -413,6 +447,31 @@ fn loadImportSource(
     try stderr.print("keyring: gh import: file not found: {s}\n", .{arg});
     try stderr.flush();
     return null;
+}
+
+fn readBoundedImportStdin(
+    gpa: Allocator,
+    stdin: *Io.Reader,
+    max_bytes: usize,
+    stderr: *Io.Writer,
+) !?[]u8 {
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer {
+        std.crypto.secureZero(u8, buffer.items);
+        buffer.deinit(gpa);
+    }
+    stdin.appendRemaining(gpa, &buffer, .limited(max_bytes)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            std.crypto.secureZero(u8, buffer.items);
+            buffer.deinit(gpa);
+            buffer = .empty;
+            try stderr.writeAll("keyring: gh import: failed to read stdin\n");
+            try stderr.flush();
+            return null;
+        },
+    };
+    return try buffer.toOwnedSlice(gpa);
 }
 
 fn resolveUserToken(
@@ -671,19 +730,30 @@ pub fn mergeHosts(
 /// Serialize `hosts` into `hosts.yml` YAML format.
 pub fn formatHostsYaml(gpa: Allocator, hosts: []const HostConfig, mode: FormatMode) ![]u8 {
     var out = Io.Writer.Allocating.init(gpa);
-    errdefer out.deinit();
+    errdefer {
+        std.crypto.secureZero(u8, out.written());
+        out.deinit();
+    }
 
     for (hosts) |host| {
+        if (host.hostname.len == 0 or hasYamlControlChars(host.hostname) or std.mem.indexOfScalar(u8, host.hostname, ':') != null) {
+            return error.InvalidHostsYaml;
+        }
         try out.writer.print("{s}:\n", .{host.hostname});
         const proto = host.git_protocol orelse "https";
+        if (hasYamlControlChars(proto)) return error.InvalidHostsYaml;
         try out.writer.print("    git_protocol: {s}\n", .{proto});
 
         if (host.users.items.len > 0) {
             try out.writer.writeAll("    users:\n");
             for (host.users.items) |user| {
+                if (user.username.len == 0 or hasYamlControlChars(user.username) or std.mem.indexOfScalar(u8, user.username, ':') != null) {
+                    return error.InvalidHostsYaml;
+                }
                 switch (mode) {
                     .plaintext => {
                         if (user.oauth_token) |tok| {
+                            if (hasYamlControlChars(tok)) return error.InvalidHostsYaml;
                             try out.writer.print(
                                 "        {s}:\n            oauth_token: {s}\n",
                                 .{ user.username, tok },
@@ -700,6 +770,7 @@ pub fn formatHostsYaml(gpa: Allocator, hosts: []const HostConfig, mode: FormatMo
         }
 
         if (host.active_user) |active| {
+            if (hasYamlControlChars(active)) return error.InvalidHostsYaml;
             try out.writer.print("    user: {s}\n", .{active});
         }
 
@@ -713,11 +784,15 @@ pub fn formatHostsYaml(gpa: Allocator, hosts: []const HostConfig, mode: FormatMo
                 break :blk null;
             };
             if (active_tok) |tok| {
+                if (hasYamlControlChars(tok)) return error.InvalidHostsYaml;
                 try out.writer.print("    oauth_token: {s}\n", .{tok});
             }
         }
 
         for (host.extra_fields.items) |extra| {
+            if (extra.key.len == 0 or hasYamlControlChars(extra.key) or std.mem.indexOfScalar(u8, extra.key, ':') != null or hasYamlControlChars(extra.value)) {
+                return error.InvalidHostsYaml;
+            }
             try out.writer.print("    {s}: {s}\n", .{ extra.key, extra.value });
         }
     }
@@ -804,6 +879,8 @@ pub fn resolveGhConfigDir(gpa: Allocator) ?[]u8 {
 }
 
 fn liveSecretGet(gpa: Allocator, service: []const u8, account: []const u8) SecretError![]u8 {
+    if (keyring_zig.currentBackend() == .null_backend) return error.NoStorageAccess;
+
     if (builtin.os.tag == .macos) {
         // Call `/usr/bin/security` first: `zalando/go-keyring` (used by `gh`) and
         // `liveSecretSet` both create `gh:<host>` items via `/usr/bin/security`, so
@@ -854,6 +931,8 @@ fn liveSecretGet(gpa: Allocator, service: []const u8, account: []const u8) Secre
 }
 
 fn liveSecretSet(gpa: Allocator, service: []const u8, account: []const u8, value: []const u8) SecretError!void {
+    if (keyring_zig.currentBackend() == .null_backend) return error.NoStorageAccess;
+
     if (builtin.os.tag == .macos) {
         const encoded = encodeDarwinKeyringSecret(gpa, value) catch return error.OutOfMemory;
         defer gpa.free(encoded);
@@ -886,6 +965,8 @@ fn liveSecretSet(gpa: Allocator, service: []const u8, account: []const u8, value
 }
 
 fn liveSecretDelete(gpa: Allocator, service: []const u8, account: []const u8) SecretError!void {
+    if (keyring_zig.currentBackend() == .null_backend) return error.NoStorageAccess;
+
     if (builtin.os.tag == .macos) {
         if (macosSecurityDelete(gpa, service, account)) return;
         return keychain.delete(service, account) catch |err| switch (err) {
@@ -1051,17 +1132,31 @@ fn writePrivateFile(dir_path: []const u8, filename: []const u8, data: []const u8
     var dir = try Io.Dir.cwd().openDir(io, dir_path, .{});
     defer dir.close(io);
 
-    const file = try dir.createFile(io, filename, .{
-        .truncate = true,
-        .permissions = filePermissions(),
-    });
-    defer file.close(io);
+    var suffix_bytes: [8]u8 = undefined;
+    io.randomSecure(&suffix_bytes) catch io.random(&suffix_bytes);
+    const suffix_hex = std.fmt.bytesToHex(suffix_bytes, .lower);
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_name = try std.fmt.bufPrint(&tmp_buf, ".{s}.{s}.tmp", .{ filename, suffix_hex });
 
-    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-        file.setPermissions(io, filePermissions()) catch {};
+    var cleanup_tmp = false;
+    defer if (cleanup_tmp) dir.deleteFile(io, tmp_name) catch {};
+    {
+        var file = try dir.createFile(io, tmp_name, .{
+            .truncate = true,
+            .exclusive = true,
+            .permissions = filePermissions(),
+        });
+        cleanup_tmp = true;
+        defer file.close(io);
+
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            try file.setPermissions(io, filePermissions());
+        }
+
+        try file.writeStreamingAll(io, data);
     }
-
-    try file.writeStreamingAll(io, data);
+    try dir.rename(tmp_name, dir, filename, io);
+    cleanup_tmp = false;
 }
 
 fn dirPermissions() Io.File.Permissions {
@@ -1203,7 +1298,14 @@ fn activeHttpTransport() HttpTransport {
 /// canonical lowercase hostname used as the key in `hosts.yml` and `gh:<host>`.
 pub fn normalizeHostnameAlloc(gpa: Allocator, raw_input: []const u8) AuthError![]u8 {
     var s = std.mem.trim(u8, raw_input, " \t\r\n/");
+    for (s) |c| {
+        if (c <= 0x20 or c == 0x7f) return error.InvalidHostname;
+    }
     if (std.mem.indexOf(u8, s, "://")) |scheme_idx| {
+        const scheme = s[0..scheme_idx];
+        if (!std.ascii.eqlIgnoreCase(scheme, "https") and !std.ascii.eqlIgnoreCase(scheme, "http")) {
+            return error.InvalidHostname;
+        }
         s = s[scheme_idx + 3 ..];
     }
     if (std.mem.indexOfAny(u8, s, "/?#")) |path_idx| {
@@ -1213,11 +1315,24 @@ pub fn normalizeHostnameAlloc(gpa: Allocator, raw_input: []const u8) AuthError![
         s = s[at_idx + 1 ..];
     }
     if (std.mem.indexOfScalar(u8, s, ':')) |colon_idx| {
+        const port_str = s[colon_idx + 1 ..];
+        if (port_str.len == 0) return error.InvalidHostname;
+        for (port_str) |c| {
+            if (!std.ascii.isDigit(c)) return error.InvalidHostname;
+        }
+        const port = std.fmt.parseUnsigned(u16, port_str, 10) catch return error.InvalidHostname;
+        if (port == 0) return error.InvalidHostname;
         s = s[0..colon_idx];
     }
-    s = std.mem.trim(u8, s, " \t.");
-    if (s.len == 0 or std.mem.indexOfAny(u8, s, " \t\r\n/\\") != null) {
+    s = std.mem.trim(u8, s, ".");
+    if (s.len == 0 or
+        std.mem.indexOfAny(u8, s, "/\\:@[]") != null or
+        std.mem.indexOf(u8, s, "..") != null)
+    {
         return error.InvalidHostname;
+    }
+    for (s) |c| {
+        if (c <= 0x20 or c == 0x7f) return error.InvalidHostname;
     }
 
     const lowered = try gpa.dupe(u8, s);
@@ -1300,7 +1415,10 @@ pub fn isGitHubHost(gpa: Allocator, raw_host: []const u8) bool {
     const hosts_path = std.fs.path.join(gpa, &.{ config_dir, hosts_filename }) catch return false;
     defer gpa.free(hosts_path);
     const yaml = readFileIfExists(gpa, hosts_path) orelse return false;
-    defer gpa.free(yaml);
+    defer {
+        std.crypto.secureZero(u8, yaml);
+        gpa.free(yaml);
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1322,6 +1440,8 @@ pub fn lookupStoredCredential(
     raw_host: []const u8,
     requested_username: ?[]const u8,
 ) AuthError!?GitCredential {
+    if (isStorageDisabled()) return error.NoStorageAccess;
+
     const canonical = try normalizeHostnameAlloc(gpa, raw_host);
     defer gpa.free(canonical);
 
@@ -1369,6 +1489,7 @@ pub fn lookupStoredCredential(
     if (resolveGhConfigDir(a)) |config_dir| {
         const hosts_path = try std.fs.path.join(a, &.{ config_dir, hosts_filename });
         if (readFileIfExists(a, hosts_path)) |yaml| {
+            defer std.crypto.secureZero(u8, yaml);
             const hosts = try parseHostsYaml(a, yaml);
             for (hosts.items) |h| {
                 if (std.ascii.eqlIgnoreCase(h.hostname, canonical)) {
@@ -1464,6 +1585,8 @@ pub fn lookupStoredKeyringCredential(
     raw_host: []const u8,
     requested_username: ?[]const u8,
 ) AuthError!?GitCredential {
+    if (isStorageDisabled()) return error.NoStorageAccess;
+
     const canonical = try normalizeHostnameAlloc(gpa, raw_host);
     defer gpa.free(canonical);
 
@@ -1634,6 +1757,15 @@ pub fn saveUserCredential(
     username: []const u8,
     token: []const u8,
 ) AuthError!bool {
+    if (isStorageDisabled()) return error.NoStorageAccess;
+    if (username.len == 0 or token.len == 0 or
+        hasYamlControlChars(username) or
+        std.mem.indexOfScalar(u8, username, ':') != null or
+        hasYamlControlChars(token))
+    {
+        return error.StorageFailure;
+    }
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1659,10 +1791,10 @@ pub fn saveUserCredential(
     const config_dir = resolveGhConfigDir(a) orelse return error.NoStorageAccess;
     const local_hosts_path = try std.fs.path.join(a, &.{ config_dir, hosts_filename });
 
-    var merged_hosts = if (readFileIfExists(a, local_hosts_path)) |existing_yaml|
-        try parseHostsYaml(a, existing_yaml)
-    else
-        std.ArrayListUnmanaged(HostConfig).empty;
+    var merged_hosts = if (readFileIfExists(a, local_hosts_path)) |existing_yaml| blk: {
+        defer std.crypto.secureZero(u8, existing_yaml);
+        break :blk try parseHostsYaml(a, existing_yaml);
+    } else std.ArrayListUnmanaged(HostConfig).empty;
 
     const yaml_token: ?[]const u8 = if (stored_in_keyring) null else token;
     var incoming_host = HostConfig{
@@ -1686,7 +1818,11 @@ pub fn saveUserCredential(
         }
     }
 
-    const rendered = formatHostsYaml(a, merged_hosts.items, .plaintext) catch return error.OutOfMemory;
+    const rendered = formatHostsYaml(a, merged_hosts.items, .plaintext) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.StorageFailure,
+    };
+    defer std.crypto.secureZero(u8, rendered);
     writePrivateFile(config_dir, hosts_filename, rendered) catch return error.StorageFailure;
     return stored_in_keyring;
 }
@@ -1737,6 +1873,7 @@ fn isCredentialAlreadyStored(
     const config_dir = resolveGhConfigDir(a) orelse return false;
     const local_hosts_path = std.fs.path.join(a, &.{ config_dir, hosts_filename }) catch return false;
     const existing_yaml = readFileIfExists(a, local_hosts_path) orelse return false;
+    defer std.crypto.secureZero(u8, existing_yaml);
     const hosts = parseHostsYaml(a, existing_yaml) catch return false;
 
     for (hosts.items) |h| {
@@ -1776,6 +1913,8 @@ pub fn eraseStoredCredential(
     raw_host: []const u8,
     requested_username: ?[]const u8,
 ) AuthError!bool {
+    if (isStorageDisabled()) return error.NoStorageAccess;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1796,6 +1935,7 @@ pub fn eraseStoredCredential(
     if (resolveGhConfigDir(a)) |config_dir| {
         const local_hosts_path = try std.fs.path.join(a, &.{ config_dir, hosts_filename });
         if (readFileIfExists(a, local_hosts_path)) |existing_yaml| {
+            defer std.crypto.secureZero(u8, existing_yaml);
             const hosts = try parseHostsYaml(a, existing_yaml);
             var yaml_dirty = false;
             for (hosts.items) |*h| {
@@ -1816,7 +1956,11 @@ pub fn eraseStoredCredential(
                 }
             }
             if (yaml_dirty) {
-                const rendered = formatHostsYaml(a, hosts.items, .plaintext) catch return error.OutOfMemory;
+                const rendered = formatHostsYaml(a, hosts.items, .plaintext) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.StorageFailure,
+                };
+                defer std.crypto.secureZero(u8, rendered);
                 writePrivateFile(config_dir, hosts_filename, rendered) catch {};
                 removed = true;
             }
@@ -2163,6 +2307,8 @@ pub fn loginOAuth(
     const endpoints = try resolveEndpoints(gpa, opts.hostname);
     defer endpoints.deinit(gpa);
 
+    if (isStorageDisabled()) return error.NoStorageAccess;
+
     const client_id = getEnvVarOwned(gpa, "KEYRING_GH_CLIENT_ID") orelse
         try gpa.dupe(u8, default_oauth_client_id);
     defer gpa.free(client_id);
@@ -2436,7 +2582,9 @@ pub fn fetchAuthenticatedUser(gpa: Allocator, api_base_url: []const u8, token: [
     defer parsed.deinit();
 
     const login = parsed.value.login orelse return error.AuthenticationFailed;
-    if (login.len == 0) return error.AuthenticationFailed;
+    if (login.len == 0 or hasYamlControlChars(login) or std.mem.indexOfScalar(u8, login, ':') != null) {
+        return error.AuthenticationFailed;
+    }
     return gpa.dupe(u8, login);
 }
 
@@ -2508,6 +2656,7 @@ fn livePostFormJson(gpa: Allocator, url: []const u8, form_body: []const u8) Auth
         .payload = form_body,
         .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
         .extra_headers = &extra_headers,
+        .redirect_behavior = .not_allowed,
         .response_writer = &response.writer,
     }) catch {
         response.deinit();
@@ -2535,10 +2684,12 @@ fn liveGetJsonWithToken(gpa: Allocator, url: []const u8, token: []const u8) Auth
     defer client.deinit();
 
     const auth_header = try std.fmt.allocPrint(gpa, "Bearer {s}", .{token});
-    defer gpa.free(auth_header);
+    defer {
+        std.crypto.secureZero(u8, auth_header);
+        gpa.free(auth_header);
+    }
 
     const extra_headers = [_]std.http.Header{
-        .{ .name = "authorization", .value = auth_header },
         .{ .name = "accept", .value = "application/vnd.github+json" },
         .{ .name = "user-agent", .value = "keyring" },
     };
@@ -2546,7 +2697,9 @@ fn liveGetJsonWithToken(gpa: Allocator, url: []const u8, token: []const u8) Auth
     const result = client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
+        .headers = .{ .authorization = .{ .override = auth_header } },
         .extra_headers = &extra_headers,
+        .redirect_behavior = .not_allowed,
         .response_writer = &response.writer,
     }) catch {
         response.deinit();
@@ -2573,15 +2726,18 @@ fn liveGetUserResponseWithToken(gpa: Allocator, url: []const u8, token: []const 
     defer client.deinit();
 
     const auth_header = try std.fmt.allocPrint(gpa, "Bearer {s}", .{token});
-    defer gpa.free(auth_header);
+    defer {
+        std.crypto.secureZero(u8, auth_header);
+        gpa.free(auth_header);
+    }
 
     const extra_headers = [_]std.http.Header{
-        .{ .name = "authorization", .value = auth_header },
         .{ .name = "accept", .value = "application/vnd.github+json" },
         .{ .name = "user-agent", .value = "keyring" },
     };
 
     var req = client.request(.GET, uri, .{
+        .headers = .{ .authorization = .{ .override = auth_header } },
         .redirect_behavior = .not_allowed,
         .extra_headers = &extra_headers,
     }) catch return error.NetworkFailure;
@@ -2726,8 +2882,12 @@ fn sendOAuthHtml(io: Io, stream: Io.net.Stream, html: []const u8) void {
 
 fn randomHexToken(gpa: Allocator, byte_len: usize) AuthError![]u8 {
     const bytes = try gpa.alloc(u8, byte_len);
-    defer gpa.free(bytes);
-    Io.Threaded.global_single_threaded.io().random(bytes);
+    defer {
+        std.crypto.secureZero(u8, bytes);
+        gpa.free(bytes);
+    }
+    const io = Io.Threaded.global_single_threaded.io();
+    io.randomSecure(bytes) catch io.random(bytes);
     const out = try gpa.alloc(u8, byte_len * 2);
     const hex_chars = "0123456789abcdef";
     for (bytes, 0..) |b, i| {
@@ -2752,6 +2912,7 @@ pub fn diagnoseHosts(gpa: Allocator, stdout: *Io.Writer) !void {
         try stdout.print("gh hosts.yml: absent ({s})\n", .{hosts_path});
         return;
     };
+    defer std.crypto.secureZero(u8, content);
 
     const hosts = parseHostsYaml(a, content) catch {
         try stdout.print("gh hosts.yml: unparseable ({s})\n", .{hosts_path});
@@ -3940,4 +4101,169 @@ test "lookupStoredKeyringCredential ignores GH_TOKEN, plaintext hosts.yml tokens
         try std.testing.expectEqualStrings("Alice", cred.username);
         try std.testing.expectEqualStrings("gho_keyring_secret", cred.token);
     }
+}
+
+test "null_backend (--disable) returns NoStorageAccess / exit 4 across import, export, login, and lookup without wiping hosts.yml" {
+    const gpa = std.testing.allocator;
+    const prev_backend = keyring_zig.currentBackend();
+    defer keyring_zig.setDefaultBackend(prev_backend) catch {};
+    try keyring_zig.setDefaultBackend(.null_backend);
+
+    try std.testing.expectError(error.NoStorageAccess, liveSecretGet(gpa, "gh:github.com", "alice"));
+    try std.testing.expectError(error.NoStorageAccess, liveSecretSet(gpa, "gh:github.com", "alice", "gho_tok"));
+    try std.testing.expectError(error.NoStorageAccess, liveSecretDelete(gpa, "gh:github.com", "alice"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const config_dir = try std.fs.path.join(gpa, &.{ root, "gh-config" });
+    defer gpa.free(config_dir);
+    const export_dir = try std.fs.path.join(gpa, &.{ root, "gh-export" });
+    defer gpa.free(export_dir);
+
+    const initial_hosts =
+        \\github.com:
+        \\    git_protocol: https
+        \\    users:
+        \\        alice:
+        \\            oauth_token: gho_keep_plaintext_safe
+        \\    user: alice
+        \\    oauth_token: gho_keep_plaintext_safe
+        \\
+    ;
+    try writePrivateFile(config_dir, hosts_filename, initial_hosts);
+
+    setTestOverrides(null, config_dir);
+    defer setTestOverrides(null, null);
+    env_override_fn = struct {
+        fn get(_: []const u8) ?[]const u8 {
+            return null;
+        }
+    }.get;
+    defer env_override_fn = null;
+
+    var empty_in = Io.Reader.fixed("");
+    var out = Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    var err_out = Io.Writer.Allocating.init(gpa);
+    defer err_out.deinit();
+
+    // 1. `gh import` must return exit 4 and NOT scrub plaintext oauth_token from hosts.yml!
+    try std.testing.expectEqual(@as(u8, 4), try runImport(gpa, null, &empty_in, &out.writer, &err_out.writer));
+
+    // 2. `gh export` must return exit 4 and NOT export hosts.yml to export_dir!
+    out.clearRetainingCapacity();
+    err_out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 4), try runExport(gpa, export_dir, &out.writer, &err_out.writer));
+    const exported_path = try std.fs.path.join(gpa, &.{ export_dir, hosts_filename });
+    defer gpa.free(exported_path);
+    try std.testing.expect(readFileIfExists(gpa, exported_path) == null);
+
+    // 3. `gh login` must return exit 4 without modifying hosts.yml!
+    out.clearRetainingCapacity();
+    err_out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 4), try runLogin(gpa, .{ .hostname = "github.com", .mode = .device }, &out.writer, &err_out.writer));
+
+    // 4. `saveUserCredential`, `lookupStoredCredential`, and `eraseStoredCredential` return NoStorageAccess!
+    try std.testing.expectError(error.NoStorageAccess, saveUserCredential(gpa, "github.com", "alice", "gho_new"));
+    try std.testing.expectError(error.NoStorageAccess, lookupStoredCredential(gpa, "github.com", null));
+    try std.testing.expectError(error.NoStorageAccess, eraseStoredCredential(gpa, "github.com", null));
+
+    const hosts_path = try std.fs.path.join(gpa, &.{ config_dir, hosts_filename });
+    defer gpa.free(hosts_path);
+    const after_hosts = readFileIfExists(gpa, hosts_path).?;
+    defer gpa.free(after_hosts);
+    try std.testing.expectEqualStrings(initial_hosts, after_hosts);
+}
+
+test "normalizeHostnameAlloc and formatHostsYaml reject control bytes, colons, and YAML injection" {
+    const gpa = std.testing.allocator;
+
+    for ([_][]const u8{
+        "github.com\n    oauth_token: evil",
+        "github.com\x00evil",
+        "github.com\x1bevil",
+        "github.com\x7f",
+        "github.com:notaport",
+        "github.com:",
+        "github.com:443:80",
+        "[::1]",
+        "javascript:alert(1)",
+        "ftp://github.com",
+    }) |bad_host| {
+        try std.testing.expectError(error.InvalidHostname, normalizeHostnameAlloc(gpa, bad_host));
+    }
+
+    var bad_user_host = HostConfig{ .hostname = "github.com", .active_user = "alice\n    oauth_token: evil" };
+    defer bad_user_host.users.deinit(gpa);
+    try bad_user_host.users.append(gpa, .{ .username = "alice\n    oauth_token: evil", .oauth_token = "gho_ok" });
+    try std.testing.expectError(error.InvalidHostsYaml, formatHostsYaml(gpa, &.{bad_user_host}, .plaintext));
+
+    var bad_tok_host = HostConfig{ .hostname = "github.com", .active_user = "alice" };
+    defer bad_tok_host.users.deinit(gpa);
+    try bad_tok_host.users.append(gpa, .{ .username = "alice", .oauth_token = "gho_ok\r\nevil.com:\n    oauth_token: injected" });
+    try std.testing.expectError(error.InvalidHostsYaml, formatHostsYaml(gpa, &.{bad_tok_host}, .plaintext));
+
+    var nul_tok_host = HostConfig{ .hostname = "github.com", .active_user = "alice" };
+    defer nul_tok_host.users.deinit(gpa);
+    try nul_tok_host.users.append(gpa, .{ .username = "alice", .oauth_token = "gho_ok\x00injected" });
+    try std.testing.expectError(error.InvalidHostsYaml, formatHostsYaml(gpa, &.{nul_tok_host}, .plaintext));
+
+    // Bounded stdin rejects streams exceeding max_bytes cleanly.
+    var oversized = Io.Reader.fixed("github.com:\n    user: alice\n");
+    var stderr = Io.Writer.Allocating.init(gpa);
+    defer stderr.deinit();
+    try std.testing.expect((try readBoundedImportStdin(gpa, &oversized, 8, &stderr.writer)) == null);
+}
+
+test "liveGetJsonWithToken and livePostFormJson reject HTTP 302 redirects" {
+    const gpa = std.testing.allocator;
+    const io = Io.Threaded.global_single_threaded.io();
+
+    var address: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(0) };
+    var server = try Io.net.IpAddress.listen(&address, io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const port = server.socket.address.getPort();
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/api", .{port});
+    defer gpa.free(url);
+
+    const ServerThread = struct {
+        fn serve(srv: *Io.net.Server, bound_port: u16) void {
+            const thread_io = Io.Threaded.global_single_threaded.io();
+            var redirect_buf: [256]u8 = undefined;
+            const redirect_resp = std.fmt.bufPrint(
+                &redirect_buf,
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                .{bound_port},
+            ) catch return;
+            for (0..2) |_| {
+                var stream = srv.accept(thread_io) catch return;
+                defer stream.socket.close(thread_io);
+
+                var read_buf: [2048]u8 = undefined;
+                var reader = stream.reader(thread_io, &read_buf);
+                while (true) {
+                    const line = reader.interface.takeDelimiterExclusive('\n') catch break;
+                    if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
+                }
+
+                var write_buf: [512]u8 = undefined;
+                var writer = stream.writer(thread_io, &write_buf);
+                writer.interface.writeAll(redirect_resp) catch {};
+                writer.interface.flush() catch {};
+            }
+        }
+    };
+
+    const thread = try std.Thread.spawn(.{}, ServerThread.serve, .{ &server, port });
+    defer thread.join();
+
+    try std.testing.expectError(error.NetworkFailure, liveGetJsonWithToken(gpa, url, "gho_secret"));
+    try std.testing.expectError(error.NetworkFailure, livePostFormJson(gpa, url, "client_id=abc"));
 }

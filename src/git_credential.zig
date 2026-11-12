@@ -203,7 +203,11 @@ pub fn runCredential(
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    const input = try readCredentialStdin(a, stdin);
+    const input = readCredentialStdin(a, stdin, max_credential_stdin_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return 0,
+    };
+    defer std.crypto.secureZero(u8, input);
     const req = try parseCredentialInput(a, input);
 
     const protocol = req.protocol orelse return 0;
@@ -221,6 +225,7 @@ pub fn runCredential(
                 const cred = (gh.getOrLoginGitCredential(a, host, req.username, true, stderr) catch {
                     return 0;
                 }) orelse return 0;
+                defer cred.deinit(a);
                 try writeCredentialOutput(stdout, host, cred.username, cred.token);
                 return 0;
             },
@@ -248,6 +253,10 @@ pub fn runCredential(
         switch (op) {
             .get => {
                 const cred = ado.getGitCredential(a, stderr, full_url) catch return 0;
+                defer {
+                    std.crypto.secureZero(u8, cred.password);
+                    a.free(cred.password);
+                }
                 const out_user = if (req.username) |u| (if (u.len > 0) u else cred.username) else cred.username;
                 try writeCredentialOutput(stdout, host, out_user, cred.password);
                 return 0;
@@ -261,6 +270,9 @@ pub fn runCredential(
     }
 
     // 3. Generic HTTPS credential stored in the active `keyring` backend.
+    if (generic_store_override == null and keyring_zig.currentBackend() == .null_backend) {
+        return 0;
+    }
     const base_service = try std.fmt.allocPrint(a, "https://{s}", .{host});
     const store = activeGenericStore();
     switch (op) {
@@ -268,6 +280,10 @@ pub fn runCredential(
             const user = req.username orelse return 0;
             if (user.len == 0) return 0;
             const pass = store.get(a, base_service, user) catch return 0;
+            defer {
+                std.crypto.secureZero(u8, pass);
+                a.free(pass);
+            }
             try writeCredentialOutput(stdout, host, user, pass);
             return 0;
         },
@@ -287,11 +303,19 @@ pub fn runCredential(
     }
 }
 
-fn readCredentialStdin(gpa: Allocator, stdin: *Io.Reader) ![]u8 {
-    var writer = Io.Writer.Allocating.init(gpa);
-    errdefer writer.deinit();
-    _ = stdin.streamRemaining(&writer.writer) catch {};
-    return writer.toOwnedSlice();
+const max_credential_stdin_bytes: usize = 4 * 1024 * 1024;
+
+fn readCredentialStdin(gpa: Allocator, stdin: *Io.Reader, max_bytes: usize) ![]u8 {
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer {
+        std.crypto.secureZero(u8, buffer.items);
+        buffer.deinit(gpa);
+    }
+    stdin.appendRemaining(gpa, &buffer, .limited(max_bytes)) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.StreamTooLong,
+    };
+    return buffer.toOwnedSlice(gpa);
 }
 
 fn writeCredentialOutput(
@@ -800,4 +824,68 @@ test "runConfig preserves process environment ($HOME) and writes host-scoped and
     try std.testing.expect(std.mem.indexOf(u8, content, "[credential \"https://example.ghe.com\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "git credential") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "useHttpPath = true") != null);
+}
+
+test "runCredential honors null_backend (--disable) without wiping hosts.yml and bounds oversized stdin" {
+    const gpa = std.testing.allocator;
+    const prev_backend = keyring_zig.currentBackend();
+    defer keyring_zig.setDefaultBackend(prev_backend) catch {};
+    try keyring_zig.setDefaultBackend(.null_backend);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const config_dir = try std.fs.path.join(gpa, &.{ root_buf[0..root_len], "gh-cfg" });
+    defer gpa.free(config_dir);
+
+    const initial_hosts =
+        \\github.com:
+        \\    git_protocol: https
+        \\    users:
+        \\        alice:
+        \\            oauth_token: gho_keep_me
+        \\    user: alice
+        \\    oauth_token: gho_keep_me
+        \\
+    ;
+    try Io.Dir.cwd().createDirPath(io, config_dir);
+    const hosts_path = try std.fs.path.join(gpa, &.{ config_dir, gh.hosts_filename });
+    defer gpa.free(hosts_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = hosts_path, .data = initial_hosts });
+
+    gh.setTestOverrides(null, config_dir);
+    defer gh.setTestOverrides(null, null);
+
+    var stdout = Io.Writer.Allocating.init(gpa);
+    defer stdout.deinit();
+    var stderr = Io.Writer.Allocating.init(gpa);
+    defer stderr.deinit();
+
+    // 1. GitHub get / store / erase under --disable are clean no-ops and preserve hosts.yml.
+    for ([_]Operation{ .get, .store, .erase }) |op| {
+        var stdin = Io.Reader.fixed("protocol=https\nhost=github.com\nusername=alice\npassword=gho_new\n\n");
+        stdout.clearRetainingCapacity();
+        stderr.clearRetainingCapacity();
+        try std.testing.expectEqual(@as(u8, 0), try runCredential(gpa, op, &stdin, &stdout.writer, &stderr.writer));
+        try std.testing.expectEqualStrings("", stdout.written());
+    }
+    const after_hosts = try Io.Dir.cwd().readFileAlloc(io, hosts_path, gpa, .limited(64 * 1024));
+    defer gpa.free(after_hosts);
+    try std.testing.expectEqualStrings(initial_hosts, after_hosts);
+
+    // 2. Generic HTTPS get / store / erase under --disable are skipped cleanly.
+    for ([_]Operation{ .store, .get, .erase }) |op| {
+        var stdin = Io.Reader.fixed("protocol=https\nhost=git.example.org\nusername=deploy\npassword=secret\n\n");
+        stdout.clearRetainingCapacity();
+        stderr.clearRetainingCapacity();
+        try std.testing.expectEqual(@as(u8, 0), try runCredential(gpa, op, &stdin, &stdout.writer, &stderr.writer));
+        try std.testing.expectEqualStrings("", stdout.written());
+    }
+
+    // 3. Oversized stdin stream is bounded and rejected cleanly.
+    var oversized = Io.Reader.fixed("protocol=https\nhost=git.example.org\nusername=deploy\npassword=secret\n\n");
+    try std.testing.expectError(error.StreamTooLong, readCredentialStdin(gpa, &oversized, 16));
 }

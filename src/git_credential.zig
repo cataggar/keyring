@@ -218,6 +218,10 @@ pub fn runCredential(
     const host = req.host orelse return 0;
     if (host.len == 0) return 0;
 
+    if (generic_store_override == null and gh.isStorageDisabled()) {
+        return 0;
+    }
+
     // 1. GitHub (`github.com`, `gist.github.com`, `*.ghe.com`, or GHES in `hosts.yml`).
     if (gh.isGitHubHost(a, host)) {
         switch (op) {

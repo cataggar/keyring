@@ -832,7 +832,9 @@ fn parseDevOpsUrl(input: []const u8, require_https_scheme: bool) ?ParsedDevOpsUr
         "";
 
     if (std.ascii.eqlIgnoreCase(host, "dev.azure.com") or
-        (host.len > ".dev.azure.com".len and std.ascii.endsWithIgnoreCase(host, ".dev.azure.com")))
+        (host.len > ".dev.azure.com".len and std.ascii.endsWithIgnoreCase(host, ".dev.azure.com")) or
+        std.ascii.eqlIgnoreCase(host, "pkgs.codedev.ms") or
+        std.ascii.eqlIgnoreCase(host, "pkgs.vsts.me"))
     {
         return .{ .host = host, .path = path, .kind = .dev_azure_com };
     }
@@ -2387,9 +2389,12 @@ test "extracts Azure DevOps org and rejects unsafe org segments or missing https
     try std.testing.expectEqualStrings("myorg", extractOrg("https://myorg.pkgs.visualstudio.com/_packaging/feed/pypi/simple/").?);
     try std.testing.expectEqualStrings("myorg", extractOrg("https://pkgs.dev.azure.com/myorg/_packaging/feed/pypi/simple/").?);
     try std.testing.expectEqualStrings("contoso", extractOrg("https://dev.azure.com/contoso/_packaging/feed/pypi/simple/").?);
-    try std.testing.expectEqualStrings("pkgs", extractOrg("https://pkgs.codedev.ms/myorg/_packaging/feed/pypi/simple/").?);
-    try std.testing.expectEqualStrings("pkgs", extractOrg("https://pkgs.vsts.me/myorg/_packaging/feed/pypi/simple/").?);
+    try std.testing.expectEqualStrings("myorg", extractOrg("https://pkgs.codedev.ms/myorg/_packaging/feed/pypi/simple/").?);
+    try std.testing.expectEqualStrings("myorg", extractOrg("https://pkgs.vsts.me/myorg/_packaging/feed/pypi/simple/").?);
+    try std.testing.expectEqualStrings("myorg", extractOrg("https://myorg.pkgs.codedev.ms/_packaging/feed/pypi/simple/").?);
+    try std.testing.expectEqualStrings("myorg", extractOrg("https://myorg.pkgs.vsts.me/_packaging/feed/pypi/simple/").?);
     try std.testing.expect(extractOrg("https://dev.azure.com/") == null);
+    try std.testing.expect(extractOrg("https://pkgs.codedev.ms/") == null);
     try std.testing.expect(extractOrg("dev.azure.com/contoso") == null);
     try std.testing.expect(extractOrg("myorg.visualstudio.com") == null);
     try std.testing.expect(extractOrg("https://dev.azure.com/./_packaging") == null);

@@ -746,6 +746,14 @@ fn activeGenericKeyringAdapter() stored_provider.KeyringOpsAdapter {
     };
 }
 
+pub fn isGenericStoreExplicitlyDisabled() bool {
+    if (generic_store_override != null) return false;
+    if (stored_provider.is_app_backend_disallowed_fn) |fn_ptr| {
+        if (fn_ptr()) return true;
+    }
+    return keyring_zig.currentBackend() == .null_backend;
+}
+
 pub fn checkGenericStoreAvailable(
     gpa: Allocator,
     interaction: credential_provider.InteractionPolicy,

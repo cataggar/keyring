@@ -841,6 +841,8 @@ fn putAuthsEntryPreservingFields(
             zeroAuthEntrySecrets(existing.*);
             existing.object.put(a, "auth", .{ .string = encoded_auth }) catch return error.OutOfMemory;
             _ = existing.object.orderedRemove("identitytoken");
+            _ = existing.object.orderedRemove("password");
+            _ = existing.object.orderedRemove("registrytoken");
             return;
         }
     }
@@ -2244,39 +2246,60 @@ fn runLogout(
     else
         false;
 
+    const idx_entries = registry_auth.listGenericIndexAlloc(a) catch |err| {
+        return reportError(stderr, "podman logout", null, mapRegistryAuthError(err));
+    };
+
     if (opts.all and !paths.explicit_override) {
-        const idx_entries = registry_auth.listGenericIndexAlloc(a) catch |err| {
-            return reportError(stderr, "podman logout", null, mapRegistryAuthError(err));
-        };
         for (idx_entries) |e| {
             try recordRemovedUnique(gpa, &preview_servers, e.server);
         }
     }
 
-    // Verify & perform OS keyring deletions BEFORE mutating `auth.json` so `Locked` /
-    // `NoStorageAccess` abort cleanly without modifying `auth.json`!
-    registry_auth.checkGenericStoreAvailable(a, .if_available) catch |err| {
+    if (registry_auth.isGenericStoreExplicitlyDisabled()) {
         const first_srv: ?[]const u8 = if (!opts.all and servers.items.len > 0)
             servers.items[0]
         else if (preview_servers.items.len > 0)
             preview_servers.items[0]
         else
             null;
-        return reportError(stderr, "podman logout", first_srv, mapRegistryAuthError(err));
+        return reportError(stderr, "podman logout", first_srv, error.NoStorageAccess);
+    }
+
+    const target_generic_servers: []const []const u8 = if (opts.all) preview_servers.items else servers.items;
+    var needs_generic_store = false;
+    for (target_generic_servers) |srv| {
+        for (idx_entries) |e| {
+            if (std.mem.eql(u8, e.server, srv)) {
+                needs_generic_store = true;
+                break;
+            }
+        }
+        if (needs_generic_store) break;
+    }
+
+    // Verify & perform OS keyring deletions BEFORE mutating `auth.json` so `Locked`
+    // (or `NoStorageAccess` when generic keyring entries exist) aborts cleanly without
+    // modifying `auth.json`, while still allowing static `--auths-only` / GHCR / ACR
+    // logouts on headless systems without a Secret Service daemon.
+    var generic_store_available = true;
+    registry_auth.checkGenericStoreAvailable(a, .if_available) catch |err| switch (err) {
+        error.NoStorageAccess => {
+            if (needs_generic_store) {
+                const first_srv: ?[]const u8 = if (target_generic_servers.len > 0) target_generic_servers[0] else null;
+                return reportError(stderr, "podman logout", first_srv, error.NoStorageAccess);
+            }
+            generic_store_available = false;
+        },
+        else => {
+            const first_srv: ?[]const u8 = if (target_generic_servers.len > 0) target_generic_servers[0] else null;
+            return reportError(stderr, "podman logout", first_srv, mapRegistryAuthError(err));
+        },
     };
 
     var deleted_generic_servers = std.ArrayList([]const u8).empty;
-    if (opts.all) {
-        for (preview_servers.items) |srv| {
-            var deleted = true;
-            registry_auth.deleteGenericCredential(a, srv) catch |err| switch (err) {
-                error.EntryNotFound => deleted = false,
-                else => return reportError(stderr, "podman logout", srv, mapRegistryAuthError(err)),
-            };
-            if (deleted) try deleted_generic_servers.append(a, srv);
-        }
-    } else {
-        for (servers.items) |srv| {
+    if (generic_store_available) {
+        for (target_generic_servers) |srv| {
             var deleted = true;
             registry_auth.deleteGenericCredential(a, srv) catch |err| switch (err) {
                 error.EntryNotFound => deleted = false,
@@ -2334,7 +2357,7 @@ fn runLogout(
         }
     }
 
-    if (opts.all) {
+    if (opts.all and generic_store_available) {
         // Also delete any server added concurrently to `auth.json` during CAS retry,
         // and include global index servers when `!paths.explicit_override`.
         for (removed_servers.items) |srv| {

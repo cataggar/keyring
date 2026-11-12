@@ -93,6 +93,8 @@ pub fn run(gpa: Allocator, dest_dir: []const u8, stdout: *std.Io.Writer, stderr:
     return 0;
 }
 
+var skip_keychain_for_test: bool = false;
+
 /// Find the local az-cli MSAL token cache content, preferring the plaintext
 /// file (the default on macOS/Linux) and falling back to the macOS Keychain
 /// entry when encryption was explicitly enabled.
@@ -103,18 +105,20 @@ fn resolveTokenCache(gpa: Allocator, azure_dir: []const u8) ResolveError!Resolve
         return .{ .content = content, .source_label = "plaintext file (msal_token_cache.json)" };
     }
 
-    switch (builtin.os.tag) {
-        .macos => {
-            if (keychain.get(gpa, keychain_service, keychain_account)) |content| {
-                return .{ .content = content, .source_label = "macOS Keychain (service \"" ++ keychain_service ++ "\")" };
-            } else |err| switch (err) {
-                error.EntryNotFound => {},
-                error.NoStorageAccess => return error.NoStorageAccess,
-                error.StorageFailure => return error.ReadFailure,
-                error.OutOfMemory => return error.OutOfMemory,
-            }
-        },
-        else => {},
+    if (!skip_keychain_for_test) {
+        switch (builtin.os.tag) {
+            .macos => {
+                if (keychain.get(gpa, keychain_service, keychain_account)) |content| {
+                    return .{ .content = content, .source_label = "macOS Keychain (service \"" ++ keychain_service ++ "\")" };
+                } else |err| switch (err) {
+                    error.EntryNotFound => {},
+                    error.NoStorageAccess => return error.NoStorageAccess,
+                    error.StorageFailure => return error.ReadFailure,
+                    error.OutOfMemory => return error.OutOfMemory,
+                }
+            },
+            else => {},
+        }
     }
 
     const bin_path = try std.fs.path.join(gpa, &.{ azure_dir, "msal_token_cache.bin" });
@@ -221,6 +225,8 @@ test "resolveTokenCache prefers plaintext json over bin" {
 }
 
 test "resolveTokenCache reports NotFound when nothing is present" {
+    skip_keychain_for_test = true;
+    defer skip_keychain_for_test = false;
     const gpa = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
@@ -233,8 +239,9 @@ test "resolveTokenCache reports NotFound when nothing is present" {
     try std.testing.expectError(error.NotFound, resolveTokenCache(gpa, dir_path));
 }
 
-test "resolveTokenCache reports EncryptedUnsupported when only bin is present on non-macOS" {
-    if (builtin.os.tag == .macos) return error.SkipZigTest;
+test "resolveTokenCache reports EncryptedUnsupported when only bin is present" {
+    skip_keychain_for_test = true;
+    defer skip_keychain_for_test = false;
     const gpa = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});

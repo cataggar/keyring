@@ -182,13 +182,24 @@ const CborReader = struct {
 pub fn parseAttestationObject(gpa: Allocator, cbor_bytes: []const u8) (Error || Allocator.Error)![]u8 {
     if (cbor_bytes.len == 0) return error.InvalidAttestationObject;
 
-    const first_major: u3 = @intCast(cbor_bytes[0] >> 5);
-    if (first_major == 5) {
+    if (looksLikeCborAttestationMap(cbor_bytes)) {
         return extractAttestationAuthData(gpa, cbor_bytes);
     }
 
     if (cbor_bytes.len < 37) return error.InvalidAuthenticatorData;
     return gpa.dupe(u8, cbor_bytes);
+}
+
+fn looksLikeCborAttestationMap(cbor_bytes: []const u8) bool {
+    var probe: CborReader = .{ .bytes = cbor_bytes };
+    const map_len = probe.containerLength(5) catch return false;
+    if (map_len == 0 or map_len > 16) return false;
+    const first_key = probe.text() catch return false;
+    if (first_key.len == 0 or first_key.len > 32) return false;
+    for (first_key) |c| {
+        if (!std.ascii.isPrint(c)) return false;
+    }
+    return true;
 }
 
 fn extractAttestationAuthData(gpa: Allocator, cbor_bytes: []const u8) (Error || Allocator.Error)![]u8 {
@@ -838,6 +849,15 @@ test "CBOR skip handles major types 6 and 7 and parseAttestationObject rejects b
     try appendCborText(&bad_map, gpa, "padding");
     try appendCborBytes(&bad_map, gpa, &@as([48]u8, @splat(0x55)));
     try std.testing.expectError(error.InvalidAttestationObject, parseAttestationObject(gpa, bad_map.items));
+
+    // Raw authData whose SHA-256(rpId) starts with 0xa0..0xbf (e.g. "example.com" -> 0xa3)
+    // must still be accepted as raw authData rather than misclassified as a CBOR map.
+    const raw_example = try buildAuthData(gpa, "example.com", 0x01, 0, null, null);
+    defer gpa.free(raw_example);
+    try std.testing.expectEqual(@as(u3, 5), @as(u3, @intCast(raw_example[0] >> 5)));
+    const parsed_example = try parseAttestationObject(gpa, raw_example);
+    defer gpa.free(parsed_example);
+    try std.testing.expectEqualSlices(u8, raw_example, parsed_example);
 }
 
 test "ES256 verifyAssertion accepts 64-byte ASN.1 DER signatures and 64-byte P1363 fallback" {

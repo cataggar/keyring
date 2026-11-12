@@ -73,7 +73,7 @@ fn activeSecretStore() SecretStore {
     return secret_store_override orelse live_secret_store;
 }
 
-fn isStorageDisabled() bool {
+pub fn isStorageDisabled() bool {
     return secret_store_override == null and keyring_zig.currentBackend() == .null_backend;
 }
 

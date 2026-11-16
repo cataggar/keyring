@@ -5,8 +5,8 @@
 | 0 | success |
 | 1 | operation failure, including locked storage, WebAuthn authentication/PRF failure, vault decryption failure, timeout, cloned-authenticator detection, an unavailable built-in service, or failed `devops-npm --validate-only` checks |
 | 2 | invalid usage, malformed hostname/registry target, or invalid configuration selector (such as `KEYRING_ADO_STORE`) |
-| 3 | credential, account, or import/export source not found across `get`, `del`, `az export`, `gh export` / `gh import`, `copilot` (`token`, `env`, `logout`, `import`, `export`), `podman`, and `wslc` |
-| 4 | no storage access or backend unavailable / unsupported for the command (including `-b ado` / `KEYRING_BACKEND=ado` on `gh`, `copilot`, `podman`, or `wslc`) |
+| 3 | credential, account, or import/export source not found across `get`, `del`, `az export`, `gh export` / `gh import`, `copilot` (`token`, `env`, `logout`, `import`, `export`), `cookie` (`import`, `export`, `status`, `delete`, `exec`), `podman`, and `wslc` |
+| 4 | no storage access or backend unavailable / unsupported for the command (including `-b ado` / `KEYRING_BACKEND=ado` on `gh`, `copilot`, `cookie`, `podman`, or `wslc`) |
 
 WebAuthn and built-in service failures use distinct diagnostics on stderr. In particular, `keyring unlock` tells the user whether authentication, PRF support, decryption, the signature counter, approval timeout, or D-Bus service availability caused the failure.
 

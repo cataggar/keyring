@@ -46,6 +46,11 @@ keyring podman status
 # WSL Container CLI (wslc) registry authentication (GHCR, ACR, and generic registries):
 keyring wslc login ghcr.io myregistry.azurecr.io
 keyring wslc status
+
+# Encrypted browser cookie jars for headless automation (CDP, Playwright, Lightpanda, curl):
+keyring cookie import alice cookies.json --domain example.com
+keyring cookie status alice
+keyring cookie exec alice --update -- lightpanda fetch https://app.example.com --cookie "{cookie}" --cookie-jar "{cookie_jar}"
 ```
 
 Use `keyring enroll --add-key`, `--list`, and `--revoke <id>` for multiple authenticators. `keyring unlock --recover` uses the one-time Recovery Key. Set `KEYRING_VAULT_PATH` to override the default encrypted vault path.

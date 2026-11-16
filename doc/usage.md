@@ -94,6 +94,14 @@ ssh vm 'cat ~/.copilot/config.json' | keyring copilot import -
 keyring copilot export /tmp/copilot-export
 keyring copilot logout
 
+# Store and inject encrypted browser cookie jars for headless browsers and HTTP tools.
+keyring cookie import alice storageState.json --domain example.com
+keyring cookie status alice
+keyring cookie export alice --format netscape
+keyring cookie exec alice --update -- lightpanda run script.js --cookie "{cookie}" --cookie-jar "{cookie_jar}"
+keyring cookie exec alice --format netscape -- curl -fsSL -b "{cookie}" https://app.example.com/api/me
+keyring cookie delete alice
+
 # Disable storage for this process.
 keyring --disable
 keyring --disable get my-service alice
@@ -163,6 +171,16 @@ See [Podman Desktop and Podman](podman.md) for Windows WinGet + WSL 2 setup, pla
 - `keyring copilot export <dir>` exports Copilot CLI credentials and account metadata to `<dir>` for transfer to another machine.
 
 See [GitHub Copilot CLI](copilot.md) for platform credential schemas, WSL setup with `ghr link`, headless Linux `keyring service` setup, and migrating plaintext `copilotTokens`.
+
+## Browser cookie jars (`keyring cookie`)
+
+`keyring cookie` stores compressed, SHA-256-verified browser cookie jars in the active `keyring` backend under `browser-cookie://<profile>` (atomically generation-tagged across `"manifest"` and `"chunk-<gen>-0"`..`"chunk-<gen>-{N-1}"`, each `<= 1800` ASCII bytes so multi-kilobyte cookie jars fit within Windows Credential Manager's 2,560-byte blob limit as well as Linux Secret Service, macOS Keychain, and `KEYRING_BACKEND=file`):
+
+- `keyring cookie import <profile> [<file|->] [--domain <suffix>]...` reads cookies from `<file>` or `stdin` (`-` or omitted) and auto-detects Chrome DevTools Protocol (CDP) / Puppeteer JSON arrays, Playwright `storageState` objects (`{ "cookies": [...] }`), and Netscape `cookies.txt` files (including `#HttpOnly_` entries). Repeat `--domain <suffix>` (or pass comma-separated suffixes) to retain only cookies matching `<suffix>` or subdomains `.` + `<suffix>`; any `--domain` scope is saved in `"manifest"` and enforced automatically during future `exec --update` runs. New generation chunks are written before `"manifest"` is updated, and previous generation chunks are deleted afterward.
+- `keyring cookie export <profile> [--format cdp|netscape]` reassembles all chunks, verifies SHA-256 integrity against `"manifest"`, and writes canonical CDP JSON (`cdp`, default) or Netscape `cookies.txt` (`netscape`) to `stdout`.
+- `keyring cookie status <profile>` prints metadata only (profile, chunk count, total cookies, unique domains, active vs. expired cookie counts, and earliest non-session expiry timestamp) without exposing any cookie values.
+- `keyring cookie delete <profile>` deletes `"manifest"` and all chunk entries for `<profile>`.
+- `keyring cookie exec <profile> [--update] [--format cdp|netscape] [--domain <suffix>]... -- <cmd> [args...]` creates an ephemeral directory in `/dev/shm` RAM-backed tmpfs on Linux when available, or a private `0700` temporary directory via `TMPDIR` / `TEMP` / `TMP` on macOS and Windows (and as fallback on Linux), writes `<dir>/cookies.json` (or `cookies.txt` for `--format netscape`) with `0600` permissions, substitutes `{cookie}` and `{cookie_jar}` (`<dir>/cookie-jar.json`) anywhere in `<cmd>` and `[args...]`, sets `KEYRING_COOKIE_FILE` and `KEYRING_COOKIE_JAR_FILE` in the child environment, forwards `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` on POSIX, and zero-overwrites and deletes all temporary files and the directory before returning the child's exit code. When `--update` is passed and `{cookie_jar}` is non-empty after normal exit, updated or newly issued in-scope cookies are merged back into `<profile>` keyed by `(name, domain, path)` (preserving host-only vs. `.domain` cookies and unvisited domains while pruning expired non-session cookies).
 
 See also [Credential provider contract](credential-provider.md),
 [Environment variables](environment-variables.md), and

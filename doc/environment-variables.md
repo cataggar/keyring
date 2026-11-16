@@ -47,6 +47,14 @@
 | `REGISTRY_AUTH_FILE` | Override the container registry `auth.json` path used by `keyring podman` when `--authfile` is not specified. |
 | `WSLC_CONFIG_DIR` | Override the `wslc` configuration directory containing `settings.yaml` and `registry-credentials.json` (defaults to `%LOCALAPPDATA%\wslc` on Windows or `$XDG_CONFIG_HOME/wslc` / `~/.config/wslc`). |
 
+## Browser cookie jars (`keyring cookie exec`)
+
+| Variable | Purpose |
+|---|---|
+| `KEYRING_COOKIE_FILE` | Set in the child process environment by `keyring cookie exec` to the `0600` ephemeral cookie file (`cookies.json` or `cookies.txt`), matching `{cookie}`. |
+| `KEYRING_COOKIE_JAR_FILE` | Set in the child process environment by `keyring cookie exec` to `<ephemeral-dir>/cookie-jar.json`, matching `{cookie_jar}` (merged back into the profile when `--update` is passed). |
+| `TMPDIR`, `TEMP`, `TMP` | Base directory used for the private `0700` ephemeral cookie directory on macOS and Windows (and on Linux when `/dev/shm` RAM-backed tmpfs is unavailable). |
+
 ## XDG base directories
 
 | Variable | Purpose |

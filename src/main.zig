@@ -17,6 +17,7 @@ const registry_auth = @import("registry_auth.zig");
 const podman = @import("podman.zig");
 const wslc = @import("wslc.zig");
 const copilot = @import("copilot.zig");
+const cookie = @import("cookie.zig");
 const credential_provider = @import("credential_provider.zig");
 const stored_provider = @import("stored_provider.zig");
 const credential_provider_test = @import("credential_provider_test.zig");
@@ -38,6 +39,7 @@ test {
     _ = podman;
     _ = wslc;
     _ = copilot;
+    _ = cookie;
     _ = credential_provider;
     _ = stored_provider;
     _ = credential_provider_test;
@@ -93,6 +95,11 @@ const usage =
     \\  copilot env [options]         Print shell export for COPILOT_GITHUB_TOKEN.
     \\  copilot import [<src>]        Migrate plaintext copilotTokens or import into keyring.
     \\  copilot export <dir>          Export Copilot CLI credentials to <dir>/config.json.
+    \\  cookie import <prof> [<src>]  Import browser cookies (CDP/Playwright JSON or Netscape) into keyring.
+    \\  cookie export <prof> [opts]   Export stored browser cookies (cdp or netscape) to stdout.
+    \\  cookie status <prof>          Show cookie count, unique domains, and expiry summary (no values).
+    \\  cookie delete <prof>          Delete stored browser cookie chunks and manifest for <prof>.
+    \\  cookie exec <prof> [opts] --  Run command with ephemeral 0700 cookie dir ({cookie}, {cookie_jar}).
     \\
     \\Backends: secret_service, keychain, win_credential, file, ado, null_backend (or null)
     \\
@@ -147,6 +154,7 @@ pub const Command = union(enum) {
     podman: podman.Subcommand,
     wslc: wslc.Subcommand,
     copilot: copilot.Subcommand,
+    cookie: cookie.Subcommand,
     usage_error: []const u8,
 };
 
@@ -173,6 +181,7 @@ fn backendEql(a: Backend, b: Backend) bool {
 
 pub fn main(init: std.process.Init) !void {
     runtime_env_map = init.environ_map;
+    cookie.setRuntimeEnvMap(init.environ_map);
 
     const arena = init.arena.allocator();
     const raw_args = try init.minimal.args.toSlice(arena);
@@ -399,6 +408,13 @@ fn runCommand(command: Command, arena: std.mem.Allocator, io: std.Io, stdout: *s
             var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
             break :code try copilot.run(arena, subcmd, &stdin_reader.interface, stdout, stderr);
         },
+        .cookie => |subcmd| code: {
+            if (subcmd != .help and try rejectAdoBackend(stderr, "cookie")) break :code 4;
+            var stdin_buffer: [4096]u8 = undefined;
+            defer std.crypto.secureZero(u8, &stdin_buffer);
+            var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+            break :code try cookie.run(arena, io, subcmd, &stdin_reader.interface, stdout, stderr);
+        },
         .usage_error => |message| code: {
             try stderr.print("keyring: {s}\n{s}", .{ message, usage });
             try stderr.flush();
@@ -601,6 +617,14 @@ pub fn parseArgs(args: []const []const u8) ParsedArgs {
             .{ .copilot = subcmd }
         else
             .{ .usage_error = "usage: keyring copilot <login [-h <host>] [-u <user>] [--web|--device] [-f|--force] | logout [-h <host>] [-u <user>|--all] | status | token [-h <host>] [-u <user>] | env [-h <host>] [-u <user>] [--shell <sh|pwsh|cmd|fish>] | import [<dir-or-file>] | export <dir>>" };
+        return parsed;
+    }
+
+    if (std.mem.eql(u8, command, "cookie")) {
+        parsed.command = if (cookie.parseArgs(rest)) |subcmd|
+            .{ .cookie = subcmd }
+        else
+            .{ .usage_error = "usage: keyring cookie <import <profile> [<file|->] [--domain <suffix>]... | export <profile> [--format cdp|netscape] | status <profile> | delete <profile> | exec <profile> [--update] [--format cdp|netscape] [--domain <suffix>]... -- <cmd> [args...]>" };
         return parsed;
     }
 
@@ -1455,6 +1479,10 @@ test "runCommand rejects unsupported subcommands when backend is ado" {
             .expected_stderr = "keyring: backend 'ado' does not support 'copilot' commands\n",
         },
         .{
+            .cmd = .{ .cookie = .{ .status = .{ .profile = "alice" } } },
+            .expected_stderr = "keyring: backend 'ado' does not support 'cookie' commands\n",
+        },
+        .{
             .cmd = .{ .podman = .{ .status = .{} } },
             .expected_stderr = "keyring: backend 'ado' does not support 'podman' commands\n",
         },
@@ -1868,6 +1896,43 @@ test "parseArgs recognizes copilot subcommands" {
     try expectUsage(parseArgs(&.{ "keyring", "copilot", "status", "extra" }));
     try expectUsage(parseArgs(&.{ "keyring", "copilot", "env", "--shell", "bogus" }));
     try expectUsage(parseArgs(&.{ "keyring", "copilot", "export" }));
+}
+
+test "parseArgs recognizes cookie subcommands" {
+    const help_cmd = parseArgs(&.{ "keyring", "cookie", "--help" });
+    try expectCommandTag(.cookie, help_cmd);
+    try std.testing.expectEqual(std.meta.Tag(cookie.Subcommand).help, std.meta.activeTag(help_cmd.command.cookie));
+
+    const imp_cmd = parseArgs(&.{ "keyring", "cookie", "import", "alice", "-", "--domain", "example.com" });
+    try expectCommandTag(.cookie, imp_cmd);
+    try std.testing.expectEqualStrings("alice", imp_cmd.command.cookie.import_cmd.profile);
+    try std.testing.expectEqualStrings("-", imp_cmd.command.cookie.import_cmd.source.?);
+
+    const exp_cmd = parseArgs(&.{ "keyring", "cookie", "export", "alice", "--format", "netscape" });
+    try expectCommandTag(.cookie, exp_cmd);
+    try std.testing.expectEqualStrings("alice", exp_cmd.command.cookie.export_cmd.profile);
+    try std.testing.expectEqual(cookie.Format.netscape, exp_cmd.command.cookie.export_cmd.format);
+
+    const status_cmd = parseArgs(&.{ "keyring", "cookie", "status", "alice" });
+    try expectCommandTag(.cookie, status_cmd);
+    try std.testing.expectEqualStrings("alice", status_cmd.command.cookie.status.profile);
+
+    const del_cmd = parseArgs(&.{ "keyring", "cookie", "delete", "alice" });
+    try expectCommandTag(.cookie, del_cmd);
+    try std.testing.expectEqualStrings("alice", del_cmd.command.cookie.delete.profile);
+
+    const exec_cmd = parseArgs(&.{ "keyring", "cookie", "exec", "alice", "--update", "--format=netscape", "--domain", "example.com", "--", "curl", "-b", "{cookie}" });
+    try expectCommandTag(.cookie, exec_cmd);
+    try std.testing.expectEqualStrings("alice", exec_cmd.command.cookie.exec.profile);
+    try std.testing.expect(exec_cmd.command.cookie.exec.update);
+    try std.testing.expectEqual(cookie.Format.netscape, exec_cmd.command.cookie.exec.format);
+    try std.testing.expectEqual(@as(usize, 3), exec_cmd.command.cookie.exec.argv.len);
+
+    try expectUsage(parseArgs(&.{ "keyring", "cookie" }));
+    try expectUsage(parseArgs(&.{ "keyring", "cookie", "import" }));
+    try expectUsage(parseArgs(&.{ "keyring", "cookie", "export", "alice", "--format", "xml" }));
+    try expectUsage(parseArgs(&.{ "keyring", "cookie", "exec", "alice", "--" }));
+    try expectUsage(parseArgs(&.{ "keyring", "cookie", "exec", "alice", "curl" }));
 }
 
 test "parseArgs recognizes backend flag" {
